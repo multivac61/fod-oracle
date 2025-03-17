@@ -1,8 +1,61 @@
-# direnv
-.direnv/
-
-# nix
+# Ignore the result of nix-build
+/result
 result
-result-*
 
+# Ignore result symlinks created by nix-shell
+/result-*
+/result-bin
+
+# Ignore the nix directories
+/nix
+
+# Ignore log files
+*.log
+
+# Ignore files created by emacs and vim
+*~
+\#*\#
+/.emacs.desktop*
+/.emacs.desktop.lock
+.elc
+auto-save-list
+projectile-bookmarks.eld
+/session.*
+/tags
+/tags-*
+
+# Common directories to ignore
+.cache
+.project
+.settings
+.idea/
+
+# Ignore local configuration
+.local
+
+# Ignore generated files
+/dist
+
+# Ignore specific environment files
+.env
+.env.local
 .envrc.local
+
+# Ignore specific Nix build files
+*.drv
+*.o
+*.hi
+.direnv
+
+.DS_Store
+
+# lazyvim
+tt.*
+.tests
+doc/tags
+debug
+.repro
+*.log
+data
+
+treesitter-rev
