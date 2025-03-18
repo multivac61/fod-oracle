@@ -49,13 +49,20 @@ func initDB() *sql.DB {
 		log.Fatalf("Failed to open database: %v", err)
 	}
 
+	// First set foreign keys explicitly
+	if _, err := db.Exec("PRAGMA foreign_keys = ON;"); err != nil {
+		log.Printf("Error enabling foreign keys: %v", err)
+	}
+
+	// Then verify it was set
 	var fkEnabled int
 	if err := db.QueryRow("PRAGMA foreign_keys").Scan(&fkEnabled); err != nil {
 		log.Printf("Error checking foreign_keys pragma: %v", err)
 	} else {
 		log.Printf("Foreign keys enabled: %v", fkEnabled == 1)
 		if fkEnabled != 1 {
-			log.Println("WARNING: Foreign keys are not enabled despite setting the pragma!")
+			log.Println("WARNING: Foreign keys are not enabled! This will cause referential integrity issues.")
+			log.Println("Try opening a new connection or check your SQLite version.")
 		}
 	}
 
