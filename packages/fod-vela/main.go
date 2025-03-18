@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -421,23 +420,7 @@ func getOrCreateRevision(db *sql.DB, rev string) (int64, error) {
 
 // callNixEvalJobs calls nix-eval-jobs and sends derivation paths to the worker pool
 func callNixEvalJobs(rev string, workQueue chan<- string, visited *sync.Map) error {
-	// First, explicitly fetch and unpack the tarball to ensure it's available
-	log.Printf("Fetching and unpacking nixpkgs repository for revision %s...", rev)
-	fetchCmd := exec.Command("nix-build", "--no-out-link", "-E",
-		fmt.Sprintf("(builtins.fetchTarball \"https://github.com/NixOS/nixpkgs/archive/%s.tar.gz\")", rev))
-
-	// Capture both stdout and stderr
-	fetchOutput, err := fetchCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to fetch nixpkgs tarball: %w\nOutput: %s", err, string(fetchOutput))
-	}
-
-	// Get the path to the unpacked tarball
-	nixpkgsPath := strings.TrimSpace(string(fetchOutput))
-	log.Printf("Successfully unpacked nixpkgs to: %s", nixpkgsPath)
-
-	// Now use the unpacked path directly in the nix-eval-jobs command
-	expr := fmt.Sprintf("import %s { allowAliases = false; }", nixpkgsPath)
+	expr := fmt.Sprintf("import (builtins.fetchTarball \"https://github.com/NixOS/nixpkgs/archive/%s.tar.gz\") { allowAliases = false; }", rev)
 	cmd := exec.Command("nix-eval-jobs", "--expr", expr, "--workers", "8") // Customize arguments as needed
 	cmd.Stderr = os.Stderr
 
