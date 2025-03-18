@@ -1,7 +1,9 @@
 { pkgs }:
 pkgs.mkShell {
   # Add build dependencies
-  packages = [ ];
+  packages = with pkgs; [
+    nix-eval-jobs
+  ];
 
   # Add environment variables
   env = { };
