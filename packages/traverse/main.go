@@ -386,7 +386,7 @@ func (p *WorkerPool) Wait() {
 
 // callNixEvalJobs calls nix-eval-jobs and sends derivation paths to the worker pool
 func callNixEvalJobs(pool *WorkerPool) error {
-	cmd := exec.Command("nix-eval-jobs", "hello.nix") // Customize arguments as needed
+	cmd := exec.Command("nix-eval-jobs", "--workers", "8", "full-nixpkgs.nix") // Customize arguments as needed
 	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()
