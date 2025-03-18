@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,14 +24,12 @@ type FOD struct {
 	OutputPath    string
 	HashAlgorithm string
 	Hash          string
-	RevisionID    int64 // New field to link to revision
 }
 
-// Revision represents a nixpkgs revision
-type Revision struct {
-	ID        int64
-	Rev       string
-	Timestamp time.Time
+// DrvRevision represents a relationship between a derivation path and a revision
+type DrvRevision struct {
+	DrvPath    string
+	RevisionID int64
 }
 
 // initDB initializes the SQLite database
@@ -55,43 +54,6 @@ func initDB() *sql.DB {
 	db.SetMaxIdleConns(runtime.NumCPU())
 	db.SetConnMaxLifetime(time.Hour)
 
-	// Create revisions table first
-	createRevisionsTable := `
-	CREATE TABLE IF NOT EXISTS revisions (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		rev TEXT NOT NULL UNIQUE,
-		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-	CREATE INDEX IF NOT EXISTS idx_rev ON revisions(rev);
-	`
-
-	_, err = db.Exec(createRevisionsTable)
-	if err != nil {
-		log.Fatalf("Failed to create revisions table: %v", err)
-	}
-
-	// Create FODs table with revision_id foreign key
-	createFodsTable := `
-	CREATE TABLE IF NOT EXISTS fods (
-		drv_path TEXT NOT NULL,
-		output_path TEXT NOT NULL,
-		hash_algorithm TEXT NOT NULL,
-		hash TEXT NOT NULL,
-		revision_id INTEGER NOT NULL,
-		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-		PRIMARY KEY (drv_path, revision_id),
-		FOREIGN KEY (revision_id) REFERENCES revisions(id)
-	);
-	CREATE INDEX IF NOT EXISTS idx_hash ON fods(hash);
-	CREATE INDEX IF NOT EXISTS idx_hash_algo ON fods(hash_algorithm);
-	CREATE INDEX IF NOT EXISTS idx_revision_id ON fods(revision_id);
-	`
-
-	_, err = db.Exec(createFodsTable)
-	if err != nil {
-		log.Fatalf("Failed to create fods table: %v", err)
-	}
-
 	// Set pragmas for better performance
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",
@@ -109,49 +71,62 @@ func initDB() *sql.DB {
 		}
 	}
 
+	// Create tables with the new schema
+	createTables := `
+    -- Revisions table
+    CREATE TABLE IF NOT EXISTS revisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rev TEXT NOT NULL UNIQUE,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_rev ON revisions(rev);
+
+    -- FODs table (without revision_id)
+    CREATE TABLE IF NOT EXISTS fods (
+        drv_path TEXT PRIMARY KEY,
+        output_path TEXT NOT NULL,
+        hash_algorithm TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_hash ON fods(hash);
+    CREATE INDEX IF NOT EXISTS idx_hash_algo ON fods(hash_algorithm);
+
+    -- Relation table between drv_paths and revisions
+    CREATE TABLE IF NOT EXISTS drv_revisions (
+        drv_path TEXT NOT NULL,
+        revision_id INTEGER NOT NULL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (drv_path, revision_id),
+        FOREIGN KEY (drv_path) REFERENCES fods(drv_path) ON DELETE CASCADE,
+        FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_drv_path ON drv_revisions(drv_path);
+    CREATE INDEX IF NOT EXISTS idx_revision_id ON drv_revisions(revision_id);
+    `
+
+	_, err = db.Exec(createTables)
+	if err != nil {
+		log.Fatalf("Failed to create tables: %v", err)
+	}
+
 	return db
-}
-
-// getOrCreateRevision gets or creates a revision in the database
-func getOrCreateRevision(db *sql.DB, rev string) (int64, error) {
-	var id int64
-
-	// Check if revision already exists
-	err := db.QueryRow("SELECT id FROM revisions WHERE rev = ?", rev).Scan(&id)
-	if err == nil {
-		// Revision already exists
-		return id, nil
-	} else if err != sql.ErrNoRows {
-		// Unexpected error
-		return 0, fmt.Errorf("error checking for existing revision: %w", err)
-	}
-
-	// Revision doesn't exist, create it
-	result, err := db.Exec("INSERT INTO revisions (rev) VALUES (?)", rev)
-	if err != nil {
-		return 0, fmt.Errorf("failed to insert revision: %w", err)
-	}
-
-	id, err = result.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get last insert ID: %w", err)
-	}
-
-	return id, nil
 }
 
 // DBBatcher handles batched database operations
 type DBBatcher struct {
-	db           *sql.DB
-	batch        []FOD
-	batchSize    int
-	mutex        sync.Mutex
-	commitTicker *time.Ticker
-	wg           sync.WaitGroup
-	done         chan struct{}
-	stmt         *sql.Stmt
-	revisionID   int64 // Store the current revision ID
-	stats        struct {
+	db            *sql.DB
+	fodBatch      []FOD
+	relationBatch []DrvRevision
+	batchSize     int
+	mutex         sync.Mutex
+	commitTicker  *time.Ticker
+	wg            sync.WaitGroup
+	done          chan struct{}
+	fodStmt       *sql.Stmt
+	relStmt       *sql.Stmt
+	revisionID    int64 // Store the current revision ID
+	stats         struct {
 		drvs int
 		fods int
 		sync.Mutex
@@ -160,27 +135,40 @@ type DBBatcher struct {
 
 // NewDBBatcher creates a new database batcher
 func NewDBBatcher(db *sql.DB, batchSize int, commitInterval time.Duration, revisionID int64) (*DBBatcher, error) {
-	// Prepare statement once
-	stmt, err := db.Prepare(`
-		INSERT INTO fods (drv_path, output_path, hash_algorithm, hash, revision_id)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(drv_path, revision_id) DO UPDATE SET 
-		output_path = ?,
-		hash_algorithm = ?,
-		hash = ?
-	`)
+	// Prepare FOD statement
+	fodStmt, err := db.Prepare(`
+        INSERT INTO fods (drv_path, output_path, hash_algorithm, hash)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(drv_path) DO UPDATE SET 
+        output_path = ?,
+        hash_algorithm = ?,
+        hash = ?
+    `)
 	if err != nil {
-		return nil, fmt.Errorf("failed to prepare statement: %w", err)
+		return nil, fmt.Errorf("failed to prepare FOD statement: %w", err)
+	}
+
+	// Prepare relation statement
+	relStmt, err := db.Prepare(`
+        INSERT INTO drv_revisions (drv_path, revision_id)
+        VALUES (?, ?)
+        ON CONFLICT(drv_path, revision_id) DO NOTHING
+    `)
+	if err != nil {
+		fodStmt.Close()
+		return nil, fmt.Errorf("failed to prepare relation statement: %w", err)
 	}
 
 	batcher := &DBBatcher{
-		db:           db,
-		batch:        make([]FOD, 0, batchSize),
-		batchSize:    batchSize,
-		commitTicker: time.NewTicker(commitInterval),
-		done:         make(chan struct{}),
-		stmt:         stmt,
-		revisionID:   revisionID,
+		db:            db,
+		fodBatch:      make([]FOD, 0, batchSize),
+		relationBatch: make([]DrvRevision, 0, batchSize),
+		batchSize:     batchSize,
+		commitTicker:  time.NewTicker(commitInterval),
+		done:          make(chan struct{}),
+		fodStmt:       fodStmt,
+		relStmt:       relStmt,
+		revisionID:    revisionID,
 	}
 
 	batcher.wg.Add(1)
@@ -218,16 +206,20 @@ func (b *DBBatcher) AddFOD(fod FOD) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	// Set the revision ID for this FOD
-	fod.RevisionID = b.revisionID
+	b.fodBatch = append(b.fodBatch, fod)
 
-	b.batch = append(b.batch, fod)
+	// Also add to relation batch
+	relation := DrvRevision{
+		DrvPath:    fod.DrvPath,
+		RevisionID: b.revisionID,
+	}
+	b.relationBatch = append(b.relationBatch, relation)
 
 	b.stats.Lock()
 	b.stats.fods++
 	b.stats.Unlock()
 
-	if len(b.batch) >= b.batchSize {
+	if len(b.fodBatch) >= b.batchSize {
 		b.commitBatch()
 	}
 }
@@ -241,7 +233,7 @@ func (b *DBBatcher) IncrementDrvCount() {
 
 // commitBatch commits the current batch
 func (b *DBBatcher) commitBatch() {
-	if len(b.batch) == 0 {
+	if len(b.fodBatch) == 0 {
 		return
 	}
 
@@ -251,15 +243,25 @@ func (b *DBBatcher) commitBatch() {
 		return
 	}
 
-	stmt := tx.Stmt(b.stmt)
+	fodStmt := tx.Stmt(b.fodStmt)
+	relStmt := tx.Stmt(b.relStmt)
 
-	for _, fod := range b.batch {
-		_, err := stmt.Exec(
-			fod.DrvPath, fod.OutputPath, fod.HashAlgorithm, fod.Hash, fod.RevisionID,
+	// Insert FODs
+	for _, fod := range b.fodBatch {
+		_, err := fodStmt.Exec(
+			fod.DrvPath, fod.OutputPath, fod.HashAlgorithm, fod.Hash,
 			fod.OutputPath, fod.HashAlgorithm, fod.Hash,
 		)
 		if err != nil {
 			log.Printf("Failed to insert FOD %s: %v", fod.DrvPath, err)
+		}
+	}
+
+	// Insert relations
+	for _, rel := range b.relationBatch {
+		_, err := relStmt.Exec(rel.DrvPath, rel.RevisionID)
+		if err != nil {
+			log.Printf("Failed to insert relation for %s: %v", rel.DrvPath, err)
 		}
 	}
 
@@ -269,7 +271,8 @@ func (b *DBBatcher) commitBatch() {
 		return
 	}
 
-	b.batch = b.batch[:0]
+	b.fodBatch = b.fodBatch[:0]
+	b.relationBatch = b.relationBatch[:0]
 }
 
 // Flush commits all pending batches
@@ -286,7 +289,11 @@ func (b *DBBatcher) Close() error {
 	b.commitTicker.Stop()
 	b.wg.Wait()
 
-	if err := b.stmt.Close(); err != nil {
+	if err := b.fodStmt.Close(); err != nil {
+		return err
+	}
+
+	if err := b.relStmt.Close(); err != nil {
 		return err
 	}
 
@@ -320,7 +327,6 @@ func processDerivation(inputFile string, batcher *DBBatcher, visited *sync.Map, 
 				OutputPath:    out.Path,
 				HashAlgorithm: out.HashAlgorithm,
 				Hash:          out.Hash,
-				// RevisionID is set by the batcher
 			}
 			batcher.AddFOD(fod)
 
@@ -350,9 +356,53 @@ func processDerivation(inputFile string, batcher *DBBatcher, visited *sync.Map, 
 	}
 }
 
+// getOrCreateRevision gets or creates a revision in the database
+func getOrCreateRevision(db *sql.DB, rev string) (int64, error) {
+	var id int64
+
+	// Check if revision already exists
+	err := db.QueryRow("SELECT id FROM revisions WHERE rev = ?", rev).Scan(&id)
+	if err == nil {
+		// Revision already exists
+		return id, nil
+	} else if err != sql.ErrNoRows {
+		// Unexpected error
+		return 0, fmt.Errorf("error checking for existing revision: %w", err)
+	}
+
+	// Revision doesn't exist, create it
+	result, err := db.Exec("INSERT INTO revisions (rev) VALUES (?)", rev)
+	if err != nil {
+		return 0, fmt.Errorf("failed to insert revision: %w", err)
+	}
+
+	id, err = result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get last insert ID: %w", err)
+	}
+
+	return id, nil
+}
+
 // callNixEvalJobs calls nix-eval-jobs and sends derivation paths to the worker pool
 func callNixEvalJobs(rev string, workQueue chan<- string, visited *sync.Map) error {
-	expr := fmt.Sprintf("import (builtins.fetchTarball \"https://github.com/NixOS/nixpkgs/archive/%s.tar.gz\") { allowAliases = false; }", rev)
+	// First, explicitly fetch and unpack the tarball to ensure it's available
+	log.Printf("Fetching and unpacking nixpkgs repository for revision %s...", rev)
+	fetchCmd := exec.Command("nix-build", "--no-out-link", "-E",
+		fmt.Sprintf("(builtins.fetchTarball \"https://github.com/NixOS/nixpkgs/archive/%s.tar.gz\")", rev))
+
+	// Capture both stdout and stderr
+	fetchOutput, err := fetchCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to fetch nixpkgs tarball: %w\nOutput: %s", err, string(fetchOutput))
+	}
+
+	// Get the path to the unpacked tarball
+	nixpkgsPath := strings.TrimSpace(string(fetchOutput))
+	log.Printf("Successfully unpacked nixpkgs to: %s", nixpkgsPath)
+
+	// Now use the unpacked path directly in the nix-eval-jobs command
+	expr := fmt.Sprintf("import %s { allowAliases = false; }", nixpkgsPath)
 	cmd := exec.Command("nix-eval-jobs", "--expr", expr, "--workers", "8") // Customize arguments as needed
 	cmd.Stderr = os.Stderr
 
@@ -361,6 +411,7 @@ func callNixEvalJobs(rev string, workQueue chan<- string, visited *sync.Map) err
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
+	log.Printf("Starting nix-eval-jobs with expression: %s", expr)
 	err = cmd.Start()
 	if err != nil {
 		return fmt.Errorf("failed to start nix-eval-jobs: %w", err)
@@ -487,7 +538,9 @@ func main() {
 
 	// Print final statistics
 	var fodCount int
-	if err := db.QueryRow("SELECT COUNT(*) FROM fods WHERE revision_id = ?", revisionID).Scan(&fodCount); err != nil {
+	if err := db.QueryRow(`
+        SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?
+    `, revisionID).Scan(&fodCount); err != nil {
 		log.Printf("Error counting FODs: %v", err)
 	}
 
@@ -497,7 +550,7 @@ func main() {
 
 	// Print some useful queries for analysis
 	log.Println("Useful queries for analysis:")
-	log.Println("- Count FODs by hash algorithm for this revision: SELECT hash_algorithm, COUNT(*) FROM fods WHERE revision_id = ? GROUP BY hash_algorithm ORDER BY COUNT(*) DESC;")
-	log.Println("- Find most common hashes for this revision: SELECT hash, COUNT(*) FROM fods WHERE revision_id = ? GROUP BY hash HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC LIMIT 20;")
-	log.Println("- Compare FODs across revisions: SELECT r1.rev, r2.rev, COUNT(*) FROM fods f1 JOIN fods f2 ON f1.hash = f2.hash JOIN revisions r1 ON f1.revision_id = r1.id JOIN revisions r2 ON f2.revision_id = r2.id WHERE r1.id < r2.id GROUP BY r1.id, r2.id;")
+	log.Println("- Count FODs by hash algorithm for this revision: SELECT f.hash_algorithm, COUNT(*) FROM fods f JOIN drv_revisions dr ON f.drv_path = dr.drv_path WHERE dr.revision_id = ? GROUP BY f.hash_algorithm ORDER BY COUNT(*) DESC;")
+	log.Println("- Find most common hashes for this revision: SELECT f.hash, COUNT(*) FROM fods f JOIN drv_revisions dr ON f.drv_path = dr.drv_path WHERE dr.revision_id = ? GROUP BY f.hash HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC LIMIT 20;")
+	log.Println("- Compare FODs across revisions: SELECT r1.rev, r2.rev, COUNT(*) FROM drv_revisions dr1 JOIN drv_revisions dr2 ON dr1.drv_path = dr2.drv_path JOIN revisions r1 ON dr1.revision_id = r1.id JOIN revisions r2 ON dr2.revision_id = r2.id WHERE r1.id < r2.id GROUP BY r1.id, r2.id;")
 }
