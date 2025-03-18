@@ -342,7 +342,7 @@ func NewWorkerPool(numWorkers int, batcher *DBBatcher) *WorkerPool {
 	}
 
 	// Create and start workers
-	for i := 0; i < numWorkers; i++ {
+	for i := range numWorkers {
 		pool.workers[i] = NewWorker(i, batcher, pool.jobChan, &pool.wg, pool.visited, pool.pendingJobs)
 		pool.workers[i].Start()
 	}
@@ -368,7 +368,7 @@ func (p *WorkerPool) Wait() {
 
 		// Count pending jobs
 		pendingCount := 0
-		p.pendingJobs.Range(func(_, _ interface{}) bool {
+		p.pendingJobs.Range(func(_, _ any) bool {
 			pendingCount++
 			return true
 		})
