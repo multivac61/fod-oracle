@@ -59,3 +59,20 @@ debug
 data
 
 treesitter-rev
+
+db*
+vendor
+# Go
+go.sum
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.a
+*.out
+*.test
+*.prof
+_testmain.go
+.glide/
+.idea/
