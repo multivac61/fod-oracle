@@ -49,6 +49,16 @@ func initDB() *sql.DB {
 		log.Fatalf("Failed to open database: %v", err)
 	}
 
+	var fkEnabled int
+	if err := db.QueryRow("PRAGMA foreign_keys").Scan(&fkEnabled); err != nil {
+		log.Printf("Error checking foreign_keys pragma: %v", err)
+	} else {
+		log.Printf("Foreign keys enabled: %v", fkEnabled == 1)
+		if fkEnabled != 1 {
+			log.Println("WARNING: Foreign keys are not enabled despite setting the pragma!")
+		}
+	}
+
 	// Set connection pool settings
 	db.SetMaxOpenConns(runtime.NumCPU() * 2)
 	db.SetMaxIdleConns(runtime.NumCPU())
@@ -63,6 +73,14 @@ func initDB() *sql.DB {
 		"PRAGMA mmap_size=30000000000",
 		"PRAGMA page_size=32768",
 		"PRAGMA foreign_keys=ON", // Enable foreign key constraints
+	}
+
+	// Platform-specific optimizations
+	if runtime.GOOS == "darwin" {
+		// macOS-specific settings
+		pragmas = append(pragmas, "PRAGMA temp_store=FILE") // Use file instead of memory for temp storage on macOS
+		// Adjust mmap size for macOS
+		pragmas = append(pragmas, "PRAGMA mmap_size=8000000000") // Use a smaller mmap size on macOS
 	}
 
 	for _, pragma := range pragmas {
@@ -243,31 +261,41 @@ func (b *DBBatcher) commitBatch() {
 		return
 	}
 
+	// Prepare for rollback in case of error
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+			log.Printf("Transaction rolled back: %v", err)
+		}
+	}()
+
 	fodStmt := tx.Stmt(b.fodStmt)
 	relStmt := tx.Stmt(b.relStmt)
 
-	// Insert FODs
+	// First, insert all FODs
 	for _, fod := range b.fodBatch {
-		_, err := fodStmt.Exec(
+		_, err = fodStmt.Exec(
 			fod.DrvPath, fod.OutputPath, fod.HashAlgorithm, fod.Hash,
 			fod.OutputPath, fod.HashAlgorithm, fod.Hash,
 		)
 		if err != nil {
 			log.Printf("Failed to insert FOD %s: %v", fod.DrvPath, err)
+			// Continue with other FODs even if one fails
 		}
 	}
 
-	// Insert relations
+	// Then, insert all relations after FODs are inserted
 	for _, rel := range b.relationBatch {
-		_, err := relStmt.Exec(rel.DrvPath, rel.RevisionID)
+		_, err = relStmt.Exec(rel.DrvPath, rel.RevisionID)
 		if err != nil {
 			log.Printf("Failed to insert relation for %s: %v", rel.DrvPath, err)
+			// Continue with other relations even if one fails
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
+	// Commit the transaction
+	if err = tx.Commit(); err != nil {
 		log.Printf("Failed to commit transaction: %v", err)
-		tx.Rollback()
 		return
 	}
 
@@ -450,6 +478,66 @@ func callNixEvalJobs(rev string, workQueue chan<- string, visited *sync.Map) err
 	return nil
 }
 
+// verifyDatabase checks if data was properly inserted
+func verifyDatabase(db *sql.DB, revisionID int64) {
+	// Check FODs table
+	var fodCount int
+	err := db.QueryRow("SELECT COUNT(*) FROM fods").Scan(&fodCount)
+	if err != nil {
+		log.Printf("Error counting FODs: %v", err)
+	} else {
+		log.Printf("Total FODs in database: %d", fodCount)
+	}
+
+	// Check relations table
+	var relCount int
+	err = db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&relCount)
+	if err != nil {
+		log.Printf("Error counting relations: %v", err)
+	} else {
+		log.Printf("Relations for current revision: %d", relCount)
+	}
+
+	// Check if counts match
+	if fodCount != relCount {
+		log.Printf("WARNING: FOD count (%d) doesn't match relation count (%d)", fodCount, relCount)
+
+		// Check for orphaned relations
+		var orphanedCount int
+		err = db.QueryRow(`
+			SELECT COUNT(*) FROM drv_revisions dr 
+			WHERE NOT EXISTS (SELECT 1 FROM fods f WHERE f.drv_path = dr.drv_path)
+		`).Scan(&orphanedCount)
+		if err != nil {
+			log.Printf("Error checking for orphaned relations: %v", err)
+		} else if orphanedCount > 0 {
+			log.Printf("Found %d orphaned relations", orphanedCount)
+		}
+	}
+
+	// Sample some data
+	rows, err := db.Query(`
+		SELECT f.drv_path, f.hash_algorithm, f.hash 
+		FROM fods f JOIN drv_revisions dr ON f.drv_path = dr.drv_path 
+		WHERE dr.revision_id = ? LIMIT 5
+	`, revisionID)
+	if err != nil {
+		log.Printf("Error sampling data: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	log.Println("Sample FODs from database:")
+	for rows.Next() {
+		var drvPath, hashAlgo, hash string
+		if err := rows.Scan(&drvPath, &hashAlgo, &hash); err != nil {
+			log.Printf("Error scanning row: %v", err)
+			continue
+		}
+		log.Printf("  - %s: %s:%s", filepath.Base(drvPath), hashAlgo, hash)
+	}
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Println("Starting FOD finder...")
@@ -553,4 +641,6 @@ func main() {
 	log.Println("- Count FODs by hash algorithm for this revision: SELECT f.hash_algorithm, COUNT(*) FROM fods f JOIN drv_revisions dr ON f.drv_path = dr.drv_path WHERE dr.revision_id = ? GROUP BY f.hash_algorithm ORDER BY COUNT(*) DESC;")
 	log.Println("- Find most common hashes for this revision: SELECT f.hash, COUNT(*) FROM fods f JOIN drv_revisions dr ON f.drv_path = dr.drv_path WHERE dr.revision_id = ? GROUP BY f.hash HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC LIMIT 20;")
 	log.Println("- Compare FODs across revisions: SELECT r1.rev, r2.rev, COUNT(*) FROM drv_revisions dr1 JOIN drv_revisions dr2 ON dr1.drv_path = dr2.drv_path JOIN revisions r1 ON dr1.revision_id = r1.id JOIN revisions r2 ON dr2.revision_id = r2.id WHERE r1.id < r2.id GROUP BY r1.id, r2.id;")
+
+	verifyDatabase(db, revisionID)
 }
