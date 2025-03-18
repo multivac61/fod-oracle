@@ -289,8 +289,9 @@ func processDerivation(inputFile string, batcher *DBBatcher, visited *sync.Map, 
 }
 
 // callNixEvalJobs calls nix-eval-jobs and sends derivation paths to the worker pool
-func callNixEvalJobs(workQueue chan<- string, visited *sync.Map) error {
-	cmd := exec.Command("nix-eval-jobs", "--workers", "8", "full-nixpkgs.nix") // Customize arguments as needed
+func callNixEvalJobs(rev string, workQueue chan<- string, visited *sync.Map) error {
+	expr := fmt.Sprintf("import (builtins.fetchTarball \"https://github.com/NixOS/nixpkgs/archive/%s.tar.gz\") { allowAliases = false; }", rev)
+	cmd := exec.Command("nix-eval-jobs", "--expr", expr, "--workers", "8") // Customize arguments as needed
 	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()
@@ -364,7 +365,7 @@ func main() {
 	log.Printf("Starting %d worker goroutines", numWorkers)
 
 	var wg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
+	for range numWorkers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -376,7 +377,10 @@ func main() {
 
 	// Call nix-eval-jobs to populate the work queue
 	go func() {
-		if err := callNixEvalJobs(workQueue, visited); err != nil {
+		// TODO: Use flag package for command line arguments
+		rev := os.Args[1]
+
+		if err := callNixEvalJobs(rev, workQueue, visited); err != nil {
 			log.Printf("Error calling nix-eval-jobs: %v", err)
 		}
 
