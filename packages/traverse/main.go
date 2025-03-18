@@ -232,45 +232,10 @@ func (b *DBBatcher) Close() error {
 	return nil
 }
 
-// Worker represents a worker that processes derivations
-type Worker struct {
-	id          int
-	batcher     *DBBatcher
-	jobChan     chan string
-	wg          *sync.WaitGroup
-	visited     *sync.Map
-	pendingJobs *sync.Map
-}
-
-// NewWorker creates a new worker
-func NewWorker(id int, batcher *DBBatcher, jobChan chan string, wg *sync.WaitGroup, visited *sync.Map, pendingJobs *sync.Map) *Worker {
-	return &Worker{
-		id:          id,
-		batcher:     batcher,
-		jobChan:     jobChan,
-		wg:          wg,
-		visited:     visited,
-		pendingJobs: pendingJobs,
-	}
-}
-
-// Start starts the worker
-func (w *Worker) Start() {
-	w.wg.Add(1)
-	go func() {
-		defer w.wg.Done()
-		for drvPath := range w.jobChan {
-			w.processDerivation(drvPath)
-			// Mark this job as done
-			w.pendingJobs.Delete(drvPath)
-		}
-	}()
-}
-
 // processDerivation processes a derivation
-func (w *Worker) processDerivation(inputFile string) {
+func processDerivation(inputFile string, batcher *DBBatcher, visited *sync.Map, workQueue chan<- string) {
 	// Increment derivation count for statistics
-	w.batcher.IncrementDrvCount()
+	batcher.IncrementDrvCount()
 
 	file, err := os.Open(inputFile)
 	if err != nil {
@@ -295,7 +260,7 @@ func (w *Worker) processDerivation(inputFile string) {
 				HashAlgorithm: out.HashAlgorithm,
 				Hash:          out.Hash,
 			}
-			w.batcher.AddFOD(fod)
+			batcher.AddFOD(fod)
 
 			// If we're in verbose mode, log the FOD
 			if os.Getenv("VERBOSE") == "1" {
@@ -311,81 +276,20 @@ func (w *Worker) processDerivation(inputFile string) {
 	// Process input derivations
 	for path := range drv.InputDerivations {
 		// Only process if not already visited
-		if _, alreadyVisited := w.visited.LoadOrStore(path, true); !alreadyVisited {
-			// Mark as pending before sending to avoid race conditions
-			if _, alreadyPending := w.pendingJobs.LoadOrStore(path, true); !alreadyPending {
-				// Use a separate goroutine to avoid deadlocks if the channel is full
-				go func(p string) {
-					w.jobChan <- p
-				}(path)
+		if _, alreadyVisited := visited.LoadOrStore(path, true); !alreadyVisited {
+			select {
+			case workQueue <- path:
+				// Successfully added to queue
+			default:
+				// Queue is full, process it directly to avoid deadlock
+				go processDerivation(path, batcher, visited, workQueue)
 			}
 		}
 	}
 }
 
-// WorkerPool manages a pool of workers
-type WorkerPool struct {
-	workers     []*Worker
-	jobChan     chan string
-	wg          sync.WaitGroup
-	visited     *sync.Map
-	pendingJobs *sync.Map
-}
-
-// NewWorkerPool creates a new worker pool
-func NewWorkerPool(numWorkers int, batcher *DBBatcher) *WorkerPool {
-	pool := &WorkerPool{
-		workers:     make([]*Worker, numWorkers),
-		jobChan:     make(chan string, 100000), // Large buffer to avoid blocking
-		visited:     &sync.Map{},
-		pendingJobs: &sync.Map{},
-	}
-
-	// Create and start workers
-	for i := range numWorkers {
-		pool.workers[i] = NewWorker(i, batcher, pool.jobChan, &pool.wg, pool.visited, pool.pendingJobs)
-		pool.workers[i].Start()
-	}
-
-	return pool
-}
-
-// AddJob adds a job to the pool
-func (p *WorkerPool) AddJob(drvPath string) {
-	if _, alreadyVisited := p.visited.LoadOrStore(drvPath, true); !alreadyVisited {
-		if _, alreadyPending := p.pendingJobs.LoadOrStore(drvPath, true); !alreadyPending {
-			p.jobChan <- drvPath
-		}
-	}
-}
-
-// Wait waits for all jobs to complete
-func (p *WorkerPool) Wait() {
-	// Close the job channel when all jobs are done
-	// We need to periodically check if there are pending jobs
-	for {
-		time.Sleep(100 * time.Millisecond)
-
-		// Count pending jobs
-		pendingCount := 0
-		p.pendingJobs.Range(func(_, _ any) bool {
-			pendingCount++
-			return true
-		})
-
-		if pendingCount == 0 {
-			// No more pending jobs, we can close the channel
-			close(p.jobChan)
-			break
-		}
-	}
-
-	// Wait for all workers to finish
-	p.wg.Wait()
-}
-
 // callNixEvalJobs calls nix-eval-jobs and sends derivation paths to the worker pool
-func callNixEvalJobs(pool *WorkerPool) error {
+func callNixEvalJobs(workQueue chan<- string, visited *sync.Map) error {
 	cmd := exec.Command("nix-eval-jobs", "--workers", "8", "full-nixpkgs.nix") // Customize arguments as needed
 	cmd.Stderr = os.Stderr
 
@@ -415,7 +319,9 @@ func callNixEvalJobs(pool *WorkerPool) error {
 			continue
 		}
 		if result.DrvPath != "" {
-			pool.AddJob(result.DrvPath)
+			if _, alreadyVisited := visited.LoadOrStore(result.DrvPath, true); !alreadyVisited {
+				workQueue <- result.DrvPath
+			}
 		}
 	}
 
@@ -449,18 +355,53 @@ func main() {
 	startTime := time.Now()
 	log.Println("Starting to find all FODs...")
 
-	// Create worker pool
+	// Create a shared visited map and work queue
+	visited := &sync.Map{}
+	workQueue := make(chan string, 100000) // Large buffer to avoid blocking
+
+	// Start worker goroutines
 	numWorkers := runtime.NumCPU() * 2
 	log.Printf("Starting %d worker goroutines", numWorkers)
-	pool := NewWorkerPool(numWorkers, batcher)
 
-	// Call nix-eval-jobs
-	if err := callNixEvalJobs(pool); err != nil {
-		log.Fatalf("Error calling nix-eval-jobs: %v", err)
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for drvPath := range workQueue {
+				processDerivation(drvPath, batcher, visited, workQueue)
+			}
+		}()
 	}
 
-	// Wait for all jobs to complete
-	pool.Wait()
+	// Call nix-eval-jobs to populate the work queue
+	go func() {
+		if err := callNixEvalJobs(workQueue, visited); err != nil {
+			log.Printf("Error calling nix-eval-jobs: %v", err)
+		}
+
+		// Wait a bit to ensure all jobs are processed
+		time.Sleep(5 * time.Second)
+
+		// Check if there are still jobs being processed
+		for {
+			time.Sleep(1 * time.Second)
+
+			// Get current stats
+			currentDrvs := batcher.stats.drvs
+			time.Sleep(2 * time.Second)
+			newDrvs := batcher.stats.drvs
+
+			// If no new derivations were processed in 2 seconds, we're done
+			if newDrvs == currentDrvs {
+				close(workQueue)
+				break
+			}
+		}
+	}()
+
+	// Wait for all workers to finish
+	wg.Wait()
 
 	// Ensure all data is written
 	batcher.Flush()
