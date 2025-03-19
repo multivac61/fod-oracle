@@ -60,7 +60,6 @@ treesitter-rev
 db*
 vendor
 # Go
-go.sum
 *.exe
 *.dll
 *.so
