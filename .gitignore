@@ -6,9 +6,6 @@ result
 /result-*
 /result-bin
 
-# Ignore the nix directories
-/nix
-
 # Ignore log files
 *.log
 

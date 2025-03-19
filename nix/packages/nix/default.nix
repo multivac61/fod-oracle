@@ -4,5 +4,5 @@ pkgs.nixVersions.latest.overrideAttrs (_: {
     substituteInPlace src/nix-env/nix-env.cc \
       --replace 'settings.readOnlyMode = true' 'settings.readOnlyMode = false'
   '';
-  patches = [ ./nix.patch ];
+  patches = [ ./primops.patch ];
 })

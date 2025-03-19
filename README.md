@@ -1,10 +1,10 @@
 <div align="center">
 
-# `fod-vela`
+# `fod-oracle`
 
-  <img src="docs/fod-vela.svg" height="150"/>
+  <img src="./docs/sibyl.webp" height="150"/>
 
-**Service watching for [nixpkgs](https://github.com/NixOS/nixpkgs) FOD discrepancies over time**
+**Watching over [nixpkgs](https://github.com/NixOS/nixpkgs) for FOD discrepancies**
 
 <p>
 <img alt="Static Badge" src="https://img.shields.io/badge/Status-experimental-orange">
@@ -12,4 +12,4 @@
 
 </div>
 
-> In some historical contexts, the term "vela" (from the Spanish verb "velar" meaning "to watch" or "to keep vigil over") has been used in relation to earthquake monitoring.
+> Temet Nosce

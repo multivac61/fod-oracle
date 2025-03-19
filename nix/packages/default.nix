@@ -1,7 +1,7 @@
 { pkgs, ... }:
 with pkgs;
 buildGoModule {
-  pname = "fod-vela";
+  pname = "fod-oracle";
   version = "0.0";
   src = ./.;
   vendorHash = "sha256-Z+VxAWb9jnF3L+7e+3zBQJu3pOHaBw3CyPoOTcKiLHI=";
@@ -11,7 +11,7 @@ buildGoModule {
 
   # Wrap the binary to ensure nix-eval-jobs is in PATH
   postFixup = ''
-    wrapProgram $out/bin/fod-vela \
+    wrapProgram $out/bin/fod-oracle \
       --prefix PATH : ${lib.makeBinPath [ pkgs.nix-eval-jobs ]}
   '';
 }

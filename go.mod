@@ -1,4 +1,4 @@
-module github.com/multivac61/fod-vela
+module github.com/multivac61/fod-oracle
 
 go 1.23.0
 

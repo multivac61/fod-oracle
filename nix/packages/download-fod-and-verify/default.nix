@@ -3,7 +3,7 @@
   ...
 }:
 pkgs.writeShellApplication {
-  name = "download-verify";
+  name = "download-fod-and-verify";
   runtimeInputs = with pkgs; [
     jq
     curl
