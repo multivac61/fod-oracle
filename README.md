@@ -1,6 +1,6 @@
 <div align="center">
 
-# `fod-oracle`
+# fod-oracle
 
   <img src="./docs/sibyl.webp" height="150"/>
 
