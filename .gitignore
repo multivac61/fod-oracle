@@ -72,3 +72,6 @@ vendor
 _testmain.go
 .glide/
 .idea/
+
+nixpkgs-repo
+nixpkgs-worktree-*
