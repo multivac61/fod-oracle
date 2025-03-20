@@ -148,16 +148,6 @@ in
         })
       ]);
 
-      # Configure environment variables for Cloudflare DNS
-      globalConfig = {
-        admin = {
-          disabled = false;
-          config = {
-            persist = true;
-          };
-        };
-      };
-
       # Setup Caddy with Cloudflare DNS and your domain - API only
       virtualHosts = {
         ${cfg.domain} = {
@@ -219,4 +209,3 @@ in
     };
   };
 }
-
