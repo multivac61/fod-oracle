@@ -393,7 +393,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	}()
 
 	// Create processing context with semaphore to limit concurrency
-	maxConcurrency := 1000
+	maxConcurrency := 5000
 	ctx := &ProcessingContext{
 		batcher:   batcher,
 		visited:   visited,
@@ -402,7 +402,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	}
 
 	// Create a channel to receive derivation paths from nix-eval-jobs
-	drvPathChan := make(chan string, 10000)
+	drvPathChan := make(chan string, 50000)
 
 	// Start a goroutine to process derivation paths as they come in
 	done := make(chan struct{})
