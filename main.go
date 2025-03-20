@@ -419,96 +419,167 @@ func getOrCreateRevision(db *sql.DB, rev string) (int64, error) {
 	return id, nil
 }
 
-// Enhanced version using Git worktrees for multiple simultaneous revisions
-func callNixEvalJobsWithGitWorktree(rev string, workQueue chan<- string, visited *sync.Map) error {
-	// Main repository directory
-	mainRepoDir := "./nixpkgs-repo"
+func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
+	revStartTime := time.Now()
+	log.Printf("[%s] Starting to find all FODs...", rev)
 
-	// Worktree directory for this specific revision
-	worktreeDir := fmt.Sprintf("./nixpkgs-worktree-%s", rev)
-
-	// Create a mutex for Git operations to prevent concurrent Git commands from interfering
-	gitMutex := &sync.Mutex{}
-
-	// Acquire the mutex for Git operations
-	gitMutex.Lock()
-	defer gitMutex.Unlock()
-
-	// Check if the main repo directory already exists
-	if _, err := os.Stat(mainRepoDir); os.IsNotExist(err) {
-		// Create a fresh shallow clone with bare repository
-		log.Printf("Creating shallow bare clone of nixpkgs repository...")
-		cmd := exec.Command("git", "clone", "--depth=1", "--bare", "https://github.com/NixOS/nixpkgs.git", mainRepoDir)
-
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to clone bare repository: %w", err)
-		}
+	// Create batcher for this revision with smaller batch size
+	batcher, err := NewDBBatcher(db, 1000, 3*time.Second, revisionID)
+	if err != nil {
+		return fmt.Errorf("failed to create database batcher: %w", err)
 	}
+	defer batcher.Close()
 
-	// Fetch the specific revision if it's not already available
-	log.Printf("Fetching revision %s...", rev)
-	cmd := exec.Command("git", "-C", mainRepoDir, "fetch", "--depth=1", "origin", rev)
-	if err := cmd.Run(); err != nil {
-		log.Fatal("git fetch failed")
+	// Create a shared visited map and work queue for this revision
+	visited := &sync.Map{}
+	workQueue := make(chan string, 100000) // Large buffer to avoid blocking
+
+	// Prepare the worktree first
+	log.Printf("[%s] Preparing worktree...", rev)
+	worktreeDir, err := prepareNixpkgsWorktree(rev)
+	if err != nil {
+		return fmt.Errorf("failed to prepare worktree: %w", err)
 	}
+	defer func() {
+		// Clean up the worktree
+		log.Printf("[%s] Cleaning up worktree at %s", rev, worktreeDir)
 
-	// Remove existing worktree if it exists
-	if _, err := os.Stat(worktreeDir); err == nil {
-		log.Printf("Removing existing worktree at %s", worktreeDir)
-
-		// First try to remove it via git worktree
-		pruneCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "prune")
-		pruneCmd.Run() // Ignore errors, just try to clean up
+		// First prune the worktree reference
+		pruneCmd := exec.Command("git", "-C", "./nixpkgs-repo", "worktree", "prune")
+		pruneCmd.Run() // Ignore errors
 
 		// Then remove the directory
 		if err := os.RemoveAll(worktreeDir); err != nil {
-			return fmt.Errorf("failed to remove existing worktree directory: %w", err)
+			log.Printf("[%s] Warning: Failed to remove worktree directory: %v", rev, err)
+		}
+	}()
+
+	// Verify the worktree is ready by checking for critical files
+	log.Printf("[%s] Verifying worktree is ready...", rev)
+	criticalFiles := []string{
+		"default.nix",
+		"pkgs/top-level/all-packages.nix",
+		"lib/default.nix",
+	}
+	for _, file := range criticalFiles {
+		path := filepath.Join(worktreeDir, file)
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("critical file %s not found in worktree: %w", file, err)
+		}
+		log.Printf("[%s] Verified file exists: %s", rev, file)
+	}
+
+	// FIRST: Run nix-eval-jobs to populate the work queue
+	log.Printf("[%s] Running nix-eval-jobs to populate work queue", rev)
+	if err := callNixEvalJobsWithGitWorktree(rev, worktreeDir, workQueue, visited); err != nil {
+		return fmt.Errorf("failed to run nix-eval-jobs: %w", err)
+	}
+
+	// Close the queue after nix-eval-jobs completes
+	log.Printf("[%s] Closing work queue", rev)
+	close(workQueue)
+
+	// THEN: Process the populated queue
+	log.Printf("[%s] Starting single-threaded derivation processing", rev)
+	derivationCount := 0
+	for drvPath := range workQueue {
+		processDerivation(drvPath, batcher, visited, workQueue)
+
+		// Add periodic reporting
+		derivationCount++
+		if derivationCount%1000 == 0 {
+			log.Printf("[%s] Processed %d derivations from queue", rev, derivationCount)
+
+			// Periodically flush to avoid large batches
+			batcher.Flush()
+
+			// Force garbage collection periodically
+			if derivationCount%5000 == 0 {
+				runtime.GC()
+			}
 		}
 	}
 
-	// Create a new worktree for this revision
-	log.Printf("Creating worktree for revision %s at %s", rev, worktreeDir)
-	cmd = exec.Command("git", "-C", mainRepoDir, "worktree", "add", "--detach", worktreeDir, rev)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to create worktree: %w", err)
+	log.Printf("[%s] Completed processing %d derivations from queue", rev, derivationCount)
+
+	// Ensure all data is written
+	log.Printf("[%s] Flushing database...", rev)
+	batcher.Flush()
+
+	// Print final statistics
+	revElapsed := time.Since(revStartTime)
+	log.Printf("[%s] Process completed in %v", rev, revElapsed)
+
+	var fodCount int
+	if err := db.QueryRow(`
+        SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?
+    `, revisionID).Scan(&fodCount); err != nil {
+		log.Printf("[%s] Error counting FODs: %v", rev, err)
 	}
 
-	// Release the mutex before the long-running nix-eval-jobs operation
-	gitMutex.Unlock()
+	log.Printf("[%s] Final database stats: %d FODs", rev, fodCount)
+	log.Printf("[%s] Average processing rate: %.2f derivations/second",
+		rev, float64(batcher.stats.drvs)/revElapsed.Seconds())
+
+	return nil
+}
+
+// Update callNixEvalJobsWithGitWorktree to use the existing worktree
+func callNixEvalJobsWithGitWorktree(rev string, worktreeDir string, workQueue chan<- string, visited *sync.Map) error {
+	// No need to create a worktree - use the one passed in
 
 	// Now run nix-eval-jobs with the worktree
+	log.Printf("[%s] Running nix-eval-jobs with worktree at %s", rev, worktreeDir)
 	expr := fmt.Sprintf("import %s { allowAliases = false; }", worktreeDir)
-	cmd = exec.Command("nix-eval-jobs", "--expr", expr, "--workers", "8")
+	cmd := exec.Command("nix-eval-jobs",
+		"--expr", expr,
+		"--workers", fmt.Sprintf("%d", runtime.NumCPU()/2), // Reduce workers
+		"--max-memory-size", "4096", // Reduce from 8192
+		"--option", "allow-import-from-derivation", "false") // Important optimization
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
-	log.Printf("Starting nix-eval-jobs with nixpkgs worktree for revision %s", rev)
+	cmd.Stderr = os.Stderr
+
+	log.Printf("[%s] Starting nix-eval-jobs process...", rev)
 	err = cmd.Start()
 	if err != nil {
 		return fmt.Errorf("failed to start nix-eval-jobs: %w", err)
 	}
 
 	// Process the output
+	log.Printf("[%s] Processing nix-eval-jobs output...", rev)
 	scanner := bufio.NewScanner(stdout)
 	const maxScannerSize = 10 * 1024 * 1024 // 10MB
 	buf := make([]byte, maxScannerSize)
 	scanner.Buffer(buf, maxScannerSize)
 
+	jobCount := 0
 	for scanner.Scan() {
 		line := scanner.Text()
 		var result struct {
 			DrvPath string `json:"drvPath"`
 		}
 		if err := json.Unmarshal([]byte(line), &result); err != nil {
-			log.Printf("Failed to parse JSON: %v", err)
+			log.Printf("[%s] Failed to parse JSON: %v", rev, err)
 			continue
 		}
 		if result.DrvPath != "" {
+			jobCount++
+			if jobCount%1000 == 0 {
+				log.Printf("[%s] Processed %d jobs from nix-eval-jobs", rev, jobCount)
+			}
 			if _, alreadyVisited := visited.LoadOrStore(result.DrvPath, true); !alreadyVisited {
-				workQueue <- result.DrvPath
+				select {
+				case workQueue <- result.DrvPath:
+					// Successfully added to queue
+				default:
+					// Queue is full, log and continue
+					log.Printf("[%s] Warning: Work queue full, skipping derivation %s", rev, result.DrvPath)
+				}
 			}
 		}
 	}
@@ -517,6 +588,7 @@ func callNixEvalJobsWithGitWorktree(rev string, workQueue chan<- string, visited
 		return fmt.Errorf("error reading stdout: %w", err)
 	}
 
+	log.Printf("[%s] nix-eval-jobs completed with %d jobs", rev, jobCount)
 	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("nix-eval-jobs command failed: %w", err)
 	}
@@ -794,194 +866,6 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 	}
 
 	return worktreeDir, nil
-}
-
-// findFODsForRevision processes a revision to find all FODs
-// findFODsForRevision processes a revision to find all FODs
-func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
-	revStartTime := time.Now()
-	log.Printf("[%s] Starting to find all FODs...", rev)
-
-	// Create batcher for this revision
-	batcher, err := NewDBBatcher(db, 5000, 3*time.Second, revisionID)
-	if err != nil {
-		return fmt.Errorf("failed to create database batcher: %w", err)
-	}
-	defer batcher.Close()
-
-	// Create a shared visited map and work queue for this revision
-	visited := &sync.Map{}
-	workQueue := make(chan string, 100000) // Large buffer to avoid blocking
-
-	// Prepare the worktree first, before starting any workers
-	log.Printf("[%s] Preparing worktree...", rev)
-	worktreeDir, err := prepareNixpkgsWorktree(rev)
-	if err != nil {
-		return fmt.Errorf("failed to prepare worktree: %w", err)
-	}
-	defer func() {
-		// Clean up the worktree
-		log.Printf("[%s] Cleaning up worktree at %s", rev, worktreeDir)
-
-		// First prune the worktree reference
-		pruneCmd := exec.Command("git", "-C", "./nixpkgs-repo", "worktree", "prune")
-		pruneCmd.Run() // Ignore errors
-
-		// Then remove the directory
-		if err := os.RemoveAll(worktreeDir); err != nil {
-			log.Printf("[%s] Warning: Failed to remove worktree directory: %v", rev, err)
-		}
-	}()
-
-	// Verify the worktree is ready by checking for critical files
-	log.Printf("[%s] Verifying worktree is ready...", rev)
-	criticalFiles := []string{
-		"default.nix",
-		"pkgs/top-level/all-packages.nix",
-		"lib/default.nix",
-	}
-	for _, file := range criticalFiles {
-		path := filepath.Join(worktreeDir, file)
-		if _, err := os.Stat(path); err != nil {
-			return fmt.Errorf("critical file %s not found in worktree: %w", file, err)
-		}
-		log.Printf("[%s] Verified file exists: %s", rev, file)
-	}
-
-	// Now that the worktree is ready, start worker goroutines
-	numWorkers := runtime.NumCPU()
-	log.Printf("[%s] Starting %d worker goroutines", rev, numWorkers)
-
-	var workerWg sync.WaitGroup
-	for i := 0; i < numWorkers; i++ {
-		workerWg.Add(1)
-		go func(workerID int) {
-			defer workerWg.Done()
-			log.Printf("[%s] Worker %d started", rev, workerID)
-			for drvPath := range workQueue {
-				processDerivation(drvPath, batcher, visited, workQueue)
-			}
-			log.Printf("[%s] Worker %d finished", rev, workerID)
-		}(i)
-	}
-
-	// Run nix-eval-jobs with the worktree
-	log.Printf("[%s] Running nix-eval-jobs with worktree at %s", rev, worktreeDir)
-	expr := fmt.Sprintf("import %s { allowAliases = false; }", worktreeDir)
-	cmd := exec.Command("nix-eval-jobs",
-		"--expr", expr,
-		"--workers", fmt.Sprintf("%d", runtime.NumCPU()),
-		"--max-memory-size", "8192")
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-
-	cmd.Stderr = os.Stderr
-
-	log.Printf("[%s] Starting nix-eval-jobs process...", rev)
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start nix-eval-jobs: %w", err)
-	}
-
-	// Process the output
-	log.Printf("[%s] Processing nix-eval-jobs output...", rev)
-	scanner := bufio.NewScanner(stdout)
-	const maxScannerSize = 10 * 1024 * 1024 // 10MB
-	buf := make([]byte, maxScannerSize)
-	scanner.Buffer(buf, maxScannerSize)
-
-	jobCount := 0
-	for scanner.Scan() {
-		line := scanner.Text()
-		var result struct {
-			DrvPath string `json:"drvPath"`
-		}
-		if err := json.Unmarshal([]byte(line), &result); err != nil {
-			log.Printf("[%s] Failed to parse JSON: %v", rev, err)
-			continue
-		}
-		if result.DrvPath != "" {
-			jobCount++
-			if jobCount%1000 == 0 {
-				log.Printf("[%s] Processed %d jobs from nix-eval-jobs", rev, jobCount)
-			}
-			if _, alreadyVisited := visited.LoadOrStore(result.DrvPath, true); !alreadyVisited {
-				select {
-				case workQueue <- result.DrvPath:
-					// Successfully added to queue
-				default:
-					// Queue is full, log and continue
-					log.Printf("[%s] Warning: Work queue full, skipping derivation %s", rev, result.DrvPath)
-				}
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading stdout: %w", err)
-	}
-
-	log.Printf("[%s] nix-eval-jobs completed with %d jobs, waiting for command to exit...", rev, jobCount)
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("nix-eval-jobs command failed: %w", err)
-	}
-
-	// Wait a bit to ensure all jobs are processed
-	log.Printf("[%s] Waiting for workers to finish processing...", rev)
-
-	// Check if there are still jobs being processed
-	for {
-		time.Sleep(1 * time.Second)
-
-		// Get current stats
-		batcher.stats.Lock()
-		currentDrvs := batcher.stats.drvs
-		currentFods := batcher.stats.fods
-		batcher.stats.Unlock()
-
-		log.Printf("[%s] Current progress: processed %d derivations, found %d FODs",
-			rev, currentDrvs, currentFods)
-
-		time.Sleep(2 * time.Second)
-
-		batcher.stats.Lock()
-		newDrvs := batcher.stats.drvs
-		batcher.stats.Unlock()
-
-		// If no new derivations were processed in 2 seconds, we're done
-		if newDrvs == currentDrvs {
-			log.Printf("[%s] No new derivations processed in 2 seconds, closing work queue", rev)
-			close(workQueue)
-			break
-		}
-	}
-
-	// Wait for all workers to finish
-	log.Printf("[%s] Waiting for all workers to complete...", rev)
-	workerWg.Wait()
-
-	// Ensure all data is written
-	log.Printf("[%s] Flushing database...", rev)
-	batcher.Flush()
-
-	// Print final statistics
-	revElapsed := time.Since(revStartTime)
-	log.Printf("[%s] Process completed in %v", rev, revElapsed)
-
-	var fodCount int
-	if err := db.QueryRow(`
-        SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?
-    `, revisionID).Scan(&fodCount); err != nil {
-		log.Printf("[%s] Error counting FODs: %v", rev, err)
-	}
-
-	log.Printf("[%s] Final database stats: %d FODs", rev, fodCount)
-	log.Printf("[%s] Average processing rate: %.2f derivations/second",
-		rev, float64(batcher.stats.drvs)/revElapsed.Seconds())
-
-	return nil
 }
 
 func main() {
