@@ -278,8 +278,8 @@ func (b *DBBatcher) Close() error {
 type ProcessingContext struct {
 	batcher   *DBBatcher
 	visited   *sync.Map
-	workQueue chan string
 	wg        *sync.WaitGroup
+	semaphore chan struct{} // Limit concurrency
 }
 
 func processDerivation(inputFile string, ctx *ProcessingContext) {
@@ -318,11 +318,20 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 	// Queue input derivations to process
 	for path := range drv.InputDerivations {
 		if _, loaded := ctx.visited.LoadOrStore(path, true); !loaded {
-			ctx.wg.Add(1)
-			go func(drvPath string) {
-				defer ctx.wg.Done()
-				processDerivation(drvPath, ctx)
-			}(path)
+			// Acquire semaphore to limit concurrency
+			select {
+			case ctx.semaphore <- struct{}{}:
+				// We got a slot, process in a new goroutine
+				ctx.wg.Add(1)
+				go func(drvPath string) {
+					defer ctx.wg.Done()
+					defer func() { <-ctx.semaphore }() // Release semaphore when done
+					processDerivation(drvPath, ctx)
+				}(path)
+			default:
+				// No slots available, process in current goroutine
+				processDerivation(path, ctx)
+			}
 		}
 	}
 }
@@ -383,47 +392,61 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		}
 	}()
 
-	// Create processing context
+	// Determine optimal number of worker goroutines
+	numWorkers := 8 // Adjust as needed
+
+	// Create a channel for derivation paths
+	drvPathChan := make(chan string, 1000) // Buffer size can be adjusted
+
+	// Create processing context with semaphore to limit concurrency
+	maxConcurrency := 1000
 	ctx := &ProcessingContext{
 		batcher:   batcher,
 		visited:   visited,
-		workQueue: make(chan string, 100),
 		wg:        &wg,
+		semaphore: make(chan struct{}, maxConcurrency),
 	}
 
-	// Run nix-eval-jobs to get initial derivations
-	log.Printf("[%s] Running nix-eval-jobs to populate work queue", rev)
-	initialDrvs, err := callNixEvalJobs(rev, worktreeDir, 8) // Use 8 workers
-	if err != nil {
-		return fmt.Errorf("failed to run nix-eval-jobs: %w", err)
+	// Start worker goroutines to process derivations
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for drvPath := range drvPathChan {
+				if _, loaded := visited.LoadOrStore(drvPath, true); !loaded {
+					// Process the derivation in the current goroutine
+					processDerivation(drvPath, ctx)
+				}
+			}
+		}()
 	}
 
-	// Process initial derivations in parallel
-	log.Printf("[%s] Starting to process %d initial derivations", rev, len(initialDrvs))
+	// Run nix-eval-jobs in a separate goroutine and feed the channel
+	evalJobsErr := make(chan error, 1)
+	go func() {
+		defer close(drvPathChan) // Close the channel when done
 
-	// Set a timeout
+		// Run nix-eval-jobs and stream results to the channel
+		err := streamNixEvalJobs(rev, worktreeDir, 8, drvPathChan)
+		evalJobsErr <- err
+	}()
+
+	// Wait for completion or timeout
 	done := make(chan struct{})
 	timeout := time.After(1 * time.Hour)
 
-	// Start processing
-	for _, drvPath := range initialDrvs {
-		if _, loaded := visited.LoadOrStore(drvPath, true); !loaded {
-			wg.Add(1)
-			go func(path string) {
-				defer wg.Done()
-				processDerivation(path, ctx)
-			}(drvPath)
-		}
-	}
-
-	// Wait for completion in a goroutine
+	// Start a goroutine to wait for workers to finish
 	go func() {
 		wg.Wait()
 		close(done)
 	}()
 
-	// Wait for completion or timeout
+	// Wait for completion, timeout, or error
 	select {
+	case err := <-evalJobsErr:
+		if err != nil {
+			return fmt.Errorf("nix-eval-jobs failed: %w", err)
+		}
 	case <-done:
 		log.Printf("[%s] All derivations processed", rev)
 	case <-timeout:
@@ -439,6 +462,82 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		log.Printf("[%s] Error counting FODs: %v", rev, err)
 	}
 	log.Printf("[%s] Final stats: %d FODs", rev, fodCount)
+	return nil
+}
+
+// streamNixEvalJobs runs nix-eval-jobs and streams results to the provided channel
+func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan chan<- string) error {
+	log.Printf("[%s] Running nix-eval-jobs with nixpkgs at %s", rev, nixpkgsDir)
+
+	// Use the proper Nixpkgs import pattern
+	expr := fmt.Sprintf(`
+      let
+        pkgs = import %s {
+          config = { allowAliases = false; };
+          overlays = [];
+        };
+      in pkgs
+    `, nixpkgsDir)
+
+	cmd := exec.Command("nix-eval-jobs",
+		"--expr", expr,
+		"--workers", fmt.Sprintf("%d", workers),
+		"--max-memory-size", "4096",
+		"--option", "allow-import-from-derivation", "false")
+
+	// Capture stdout
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	// Redirect stderr to /dev/null
+	nullFile, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("failed to open null device: %w", err)
+	}
+	defer nullFile.Close()
+	cmd.Stderr = nullFile
+
+	err = cmd.Start()
+	if err != nil {
+		return fmt.Errorf("failed to start nix-eval-jobs: %w", err)
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	const maxScannerSize = 10 * 1024 * 1024
+	buf := make([]byte, maxScannerSize)
+	scanner.Buffer(buf, maxScannerSize)
+
+	jobCount := 0
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		var result struct {
+			DrvPath string `json:"drvPath"`
+		}
+		if err := json.Unmarshal([]byte(line), &result); err != nil {
+			log.Printf("[%s] Failed to parse JSON: %v", rev, err)
+			continue
+		}
+		if result.DrvPath != "" {
+			jobCount++
+			if jobCount%1000 == 0 {
+				log.Printf("[%s] Processed %d jobs from nix-eval-jobs", rev, jobCount)
+			}
+			drvPathChan <- result.DrvPath
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading stdout: %w", err)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("nix-eval-jobs command failed: %w", err)
+	}
+
+	log.Printf("[%s] nix-eval-jobs completed with %d jobs", rev, jobCount)
 	return nil
 }
 
@@ -601,6 +700,11 @@ func callNixEvalJobs(rev string, nixpkgsDir string, workers int) ([]string, erro
 	return drvPaths, nil
 }
 
+// isWorktreeDir checks if a directory is a nixpkgs worktree directory
+func isWorktreeDir(name string) bool {
+	return strings.HasPrefix(name, "nixpkgs-worktree-")
+}
+
 func cleanupWorktrees() error {
 	scriptDir, err := os.Getwd()
 	if err != nil {
@@ -628,7 +732,7 @@ func cleanupWorktrees() error {
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() && strings.HasPrefix(entry.Name(), "nixpkgs-worktree-") {
+		if entry.IsDir() && isWorktreeDir(entry.Name()) {
 			worktreePath := filepath.Join(scriptDir, entry.Name())
 			log.Printf("Removing leftover worktree directory: %s", worktreePath)
 			if err := os.RemoveAll(worktreePath); err != nil {
