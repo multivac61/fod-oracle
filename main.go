@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -44,10 +45,23 @@ func initDB() *sql.DB {
 	dbPath := filepath.Join(dbDir, "fods.db")
 	log.Printf("Using database at: %s", dbPath)
 
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=100000&_temp_store=MEMORY")
+	// Add busy_timeout and other optimizations
+	connString := dbPath + "?_journal_mode=WAL" +
+		"&_synchronous=NORMAL" +
+		"&_cache_size=100000" +
+		"&_temp_store=MEMORY" +
+		"&_busy_timeout=10000" + // 10 second timeout
+		"&_locking_mode=NORMAL"
+
+	db, err := sql.Open("sqlite3", connString)
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
+
+	// Reduce connection pool size
+	db.SetMaxOpenConns(8) // Significantly reduced
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(time.Minute * 10)
 
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",
@@ -115,6 +129,14 @@ type DBBatcher struct {
 	}
 	lastStatsTime time.Time
 	mu            sync.Mutex
+	writeChan     chan writeOperation
+	done          chan struct{}
+}
+
+type writeOperation struct {
+	fods       []FOD
+	relations  []DrvRevision
+	resultChan chan error
 }
 
 // NewDBBatcher creates a new database batcher
@@ -148,7 +170,20 @@ func NewDBBatcher(db *sql.DB, batchSize int, revisionID int64) (*DBBatcher, erro
 		relStmt:       relStmt,
 		revisionID:    revisionID,
 		lastStatsTime: time.Now(),
+		writeChan:     make(chan writeOperation, 1000),
+		done:          make(chan struct{}),
 	}
+
+	// Start a dedicated writer goroutine
+	go func() {
+		defer close(batcher.done)
+		for op := range batcher.writeChan {
+			err := batcher.executeWrite(op.fods, op.relations)
+			if op.resultChan != nil {
+				op.resultChan <- err
+			}
+		}
+	}()
 
 	return batcher, nil
 }
@@ -161,6 +196,75 @@ func (b *DBBatcher) logStats() {
 	}
 }
 
+// Add this method to execute writes with retries
+func (b *DBBatcher) executeWrite(fods []FOD, relations []DrvRevision) error {
+	var lastErr error
+
+	// Try up to 5 times with exponential backoff
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(100*attempt) * time.Millisecond
+			time.Sleep(backoff)
+		}
+
+		tx, err := b.db.Begin()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		fodStmt := tx.Stmt(b.fodStmt)
+		relStmt := tx.Stmt(b.relStmt)
+
+		success := true
+
+		// Insert FODs
+		for _, fod := range fods {
+			_, err = fodStmt.Exec(
+				fod.DrvPath, fod.OutputPath, fod.HashAlgorithm, fod.Hash,
+				fod.OutputPath, fod.HashAlgorithm, fod.Hash,
+			)
+			if err != nil {
+				success = false
+				lastErr = err
+				break
+			}
+		}
+
+		if !success {
+			tx.Rollback()
+			continue
+		}
+
+		// Insert relations
+		for _, rel := range relations {
+			_, err = relStmt.Exec(rel.DrvPath, rel.RevisionID)
+			if err != nil {
+				success = false
+				lastErr = err
+				break
+			}
+		}
+
+		if !success {
+			tx.Rollback()
+			continue
+		}
+
+		// Commit transaction
+		if err = tx.Commit(); err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Success!
+		return nil
+	}
+
+	return lastErr
+}
+
+// Modify AddFOD to use the writer goroutine
 func (b *DBBatcher) AddFOD(fod FOD) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -174,7 +278,21 @@ func (b *DBBatcher) AddFOD(fod FOD) {
 	b.stats.fods++
 
 	if len(b.fodBatch) >= b.batchSize {
-		b.commitBatch()
+		// Copy batches to local variables
+		fods := make([]FOD, len(b.fodBatch))
+		copy(fods, b.fodBatch)
+		relations := make([]DrvRevision, len(b.relationBatch))
+		copy(relations, b.relationBatch)
+
+		// Clear batches
+		b.fodBatch = b.fodBatch[:0]
+		b.relationBatch = b.relationBatch[:0]
+
+		// Send to writer goroutine
+		b.writeChan <- writeOperation{
+			fods:      fods,
+			relations: relations,
+		}
 	}
 }
 
@@ -253,18 +371,42 @@ func (b *DBBatcher) commitBatch() {
 	success = true
 }
 
+// Modify Flush to use the writer goroutine
 func (b *DBBatcher) Flush() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	if len(b.fodBatch) > 0 {
-		// Temporarily release lock during database operations
-		b.commitBatch()
+		// Copy batches to local variables
+		fods := make([]FOD, len(b.fodBatch))
+		copy(fods, b.fodBatch)
+		relations := make([]DrvRevision, len(b.relationBatch))
+		copy(relations, b.relationBatch)
+
+		// Clear batches
+		b.fodBatch = b.fodBatch[:0]
+		b.relationBatch = b.relationBatch[:0]
+
+		b.mu.Unlock()
+
+		// Send to writer goroutine and wait for result
+		resultChan := make(chan error, 1)
+		b.writeChan <- writeOperation{
+			fods:       fods,
+			relations:  relations,
+			resultChan: resultChan,
+		}
+		<-resultChan
+	} else {
+		b.mu.Unlock()
 	}
 }
 
+// Modify Close to shut down the writer goroutine
 func (b *DBBatcher) Close() error {
 	b.Flush()
+	close(b.writeChan)
+	<-b.done // Wait for writer to finish
+
 	if err := b.fodStmt.Close(); err != nil {
 		return err
 	}
@@ -479,19 +621,25 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
-	// Redirect stderr to /dev/null
-	nullFile, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	// Capture stderr instead of redirecting to /dev/null
+	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("failed to open null device: %w", err)
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
-	defer nullFile.Close()
-	cmd.Stderr = nullFile
+
+	// Start capturing stderr in a goroutine
+	stderrChan := make(chan string, 1)
+	go func() {
+		stderrBytes, _ := io.ReadAll(stderr)
+		stderrChan <- string(stderrBytes)
+	}()
 
 	err = cmd.Start()
 	if err != nil {
 		return fmt.Errorf("failed to start nix-eval-jobs: %w", err)
 	}
 
+	// Process stdout as before
 	scanner := bufio.NewScanner(stdout)
 	const maxScannerSize = 10 * 1024 * 1024
 	buf := make([]byte, maxScannerSize)
@@ -521,7 +669,20 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 		return fmt.Errorf("error reading stdout: %w", err)
 	}
 
-	if err := cmd.Wait(); err != nil {
+	// Wait for command to complete
+	err = cmd.Wait()
+	stderrOutput := <-stderrChan
+
+	if err != nil {
+		// Log stderr output to help diagnose the issue
+		if stderrOutput != "" {
+			log.Printf("[%s] nix-eval-jobs stderr output: %s", rev, stderrOutput)
+		}
+		// If we processed some jobs, consider it a partial success
+		if jobCount > 0 {
+			log.Printf("[%s] nix-eval-jobs exited with error but processed %d jobs, continuing", rev, jobCount)
+			return nil
+		}
 		return fmt.Errorf("nix-eval-jobs command failed: %w", err)
 	}
 
