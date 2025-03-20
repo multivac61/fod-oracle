@@ -49,10 +49,6 @@ func initDB() *sql.DB {
 		log.Fatalf("Failed to open database: %v", err)
 	}
 
-	// Optimize database connection settings
-	db.SetMaxOpenConns(workers)
-	db.SetMaxIdleConns(workers)
-
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=NORMAL",
