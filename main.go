@@ -163,7 +163,7 @@ func NewDBBatcher(db *sql.DB, batchSize int, commitInterval time.Duration, revis
 	fodStmt, err := db.Prepare(`
         INSERT INTO fods (drv_path, output_path, hash_algorithm, hash)
         VALUES (?, ?, ?, ?)
-        ON CONFLICT(drv_path) DO UPDATE SET 
+        ON CONFLICT(drv_path) DO UPDATE SET
         output_path = ?,
         hash_algorithm = ?,
         hash = ?
@@ -495,7 +495,7 @@ func verifyDatabase(db *sql.DB, revisionID int64) {
 		// Check for orphaned relations
 		var orphanedCount int
 		err = db.QueryRow(`
-			SELECT COUNT(*) FROM drv_revisions dr 
+			SELECT COUNT(*) FROM drv_revisions dr
 			WHERE NOT EXISTS (SELECT 1 FROM fods f WHERE f.drv_path = dr.drv_path)
 		`).Scan(&orphanedCount)
 		if err != nil {
@@ -507,8 +507,8 @@ func verifyDatabase(db *sql.DB, revisionID int64) {
 
 	// Sample some data
 	rows, err := db.Query(`
-		SELECT f.drv_path, f.hash_algorithm, f.hash 
-		FROM fods f JOIN drv_revisions dr ON f.drv_path = dr.drv_path 
+		SELECT f.drv_path, f.hash_algorithm, f.hash
+		FROM fods f JOIN drv_revisions dr ON f.drv_path = dr.drv_path
 		WHERE dr.revision_id = ? LIMIT 5
 	`, revisionID)
 	if err != nil {
@@ -625,12 +625,6 @@ func main() {
 	log.Printf("Final database stats for revision %s: %d FODs", rev, fodCount)
 	log.Printf("Average processing rate: %.2f derivations/second",
 		float64(batcher.stats.drvs)/elapsed.Seconds())
-
-	// Print some useful queries for analysis
-	log.Println("Useful queries for analysis:")
-	log.Println("- Count FODs by hash algorithm for this revision: SELECT f.hash_algorithm, COUNT(*) FROM fods f JOIN drv_revisions dr ON f.drv_path = dr.drv_path WHERE dr.revision_id = ? GROUP BY f.hash_algorithm ORDER BY COUNT(*) DESC;")
-	log.Println("- Find most common hashes for this revision: SELECT f.hash, COUNT(*) FROM fods f JOIN drv_revisions dr ON f.drv_path = dr.drv_path WHERE dr.revision_id = ? GROUP BY f.hash HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC LIMIT 20;")
-	log.Println("- Compare FODs across revisions: SELECT r1.rev, r2.rev, COUNT(*) FROM drv_revisions dr1 JOIN drv_revisions dr2 ON dr1.drv_path = dr2.drv_path JOIN revisions r1 ON dr1.revision_id = r1.id JOIN revisions r2 ON dr2.revision_id = r2.id WHERE r1.id < r2.id GROUP BY r1.id, r2.id;")
 
 	verifyDatabase(db, revisionID)
 }
