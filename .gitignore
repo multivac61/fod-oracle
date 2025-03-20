@@ -74,3 +74,4 @@ _testmain.go
 .idea/
 
 nixpkgs-*
+bin/

@@ -4,7 +4,7 @@ buildGoModule {
   pname = "fod-oracle";
   version = "0.0";
   src = flake;
-  vendorHash = "sha256-Z+VxAWb9jnF3L+7e+3zBQJu3pOHaBw3CyPoOTcKiLHI=";
+  vendorHash = "sha256-LELvkZBeqcqoRjF7kjy+8lLBjghHTXo53N6VrDpH/XE=";
 
   nativeBuildInputs = [ makeWrapper ];
   postFixup = ''

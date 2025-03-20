@@ -1,8 +1,13 @@
 module github.com/multivac61/fod-oracle
 
-go 1.23.0
+go 1.21
 
 require (
-	github.com/mattn/go-sqlite3 v1.14.23
+	github.com/docker/docker v28.0.2+incompatible
+	github.com/go-chi/chi/v5 v5.0.11
+	github.com/go-chi/cors v1.2.1
+	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/nix-community/go-nix v0.0.0-20250101154619-4bdde671e0a1
 )
+
+require gotest.tools/v3 v3.5.2 // indirect
