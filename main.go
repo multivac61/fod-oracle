@@ -32,6 +32,8 @@ type DrvRevision struct {
 	RevisionID int64
 }
 
+var workers = 32
+
 // initDB initializes the SQLite database
 func initDB() *sql.DB {
 	dbDir := "./db"
@@ -48,8 +50,8 @@ func initDB() *sql.DB {
 	}
 
 	// Optimize database connection settings
-	db.SetMaxOpenConns(16)
-	db.SetMaxIdleConns(16)
+	db.SetMaxOpenConns(workers)
+	db.SetMaxIdleConns(workers)
 
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",
@@ -433,7 +435,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 
 	// Run nix-eval-jobs and stream results to the channel
 	log.Printf("[%s] Running nix-eval-jobs to populate work queue", rev)
-	if err := streamNixEvalJobs(rev, worktreeDir, 32, drvPathChan); err != nil {
+	if err := streamNixEvalJobs(rev, worktreeDir, workers, drvPathChan); err != nil {
 		close(drvPathChan)
 		return fmt.Errorf("failed to run nix-eval-jobs: %w", err)
 	}
