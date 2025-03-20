@@ -349,6 +349,16 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	revStartTime := time.Now()
 	log.Printf("[%s] Starting to find all FODs...", rev)
 
+	worktreeDir, err := prepareNixpkgsWorktree(rev)
+	if err != nil {
+		return fmt.Errorf("failed to prepare worktree: %w", err)
+	}
+	defer func() {
+		log.Printf("[%s] Cleaning up worktree at %s", rev, worktreeDir)
+		os.RemoveAll(worktreeDir)
+	}()
+
+	// Initialize the batcher only after Git setup is complete
 	batcher, err := NewDBBatcher(db, 1000, 3*time.Second, revisionID)
 	if err != nil {
 		return fmt.Errorf("failed to create database batcher: %w", err)
@@ -358,15 +368,6 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	workQueue := make(chan string, 100000)
 	visited := &sync.Map{}
 	var wg sync.WaitGroup
-
-	worktreeDir, err := prepareNixpkgsWorktree(rev)
-	if err != nil {
-		return fmt.Errorf("failed to prepare worktree: %w", err)
-	}
-	defer func() {
-		log.Printf("[%s] Cleaning up worktree at %s", rev, worktreeDir)
-		os.RemoveAll(worktreeDir)
-	}()
 
 	log.Printf("[%s] Running nix-eval-jobs to populate work queue", rev)
 	if err := callNixEvalJobsWithGitWorktree(rev, worktreeDir, workQueue, visited); err != nil {
@@ -427,18 +428,36 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 
 func callNixEvalJobsWithGitWorktree(rev string, worktreeDir string, workQueue chan<- string, visited *sync.Map) error {
 	log.Printf("[%s] Running nix-eval-jobs with worktree at %s", rev, worktreeDir)
-	expr := fmt.Sprintf("import %s { allowAliases = false; }", worktreeDir)
+
+	// Use the proper Nixpkgs import pattern
+	expr := fmt.Sprintf(`
+      let
+        pkgs = import %s {
+          config = { allowAliases = false; };
+          overlays = [];
+        };
+      in pkgs
+    `, worktreeDir)
+
 	cmd := exec.Command("nix-eval-jobs",
 		"--expr", expr,
 		"--workers", fmt.Sprintf("%d", runtime.NumCPU()/2),
 		"--max-memory-size", "4096",
 		"--option", "allow-import-from-derivation", "false")
 
+	// Capture stdout
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
-	cmd.Stderr = os.Stderr
+
+	// Redirect stderr to /dev/null instead of capturing it
+	nullFile, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("failed to open null device: %w", err)
+	}
+	defer nullFile.Close()
+	cmd.Stderr = nullFile
 
 	err = cmd.Start()
 	if err != nil {
@@ -479,10 +498,11 @@ func callNixEvalJobsWithGitWorktree(rev string, worktreeDir string, workQueue ch
 		return fmt.Errorf("error reading stdout: %w", err)
 	}
 
-	log.Printf("[%s] nix-eval-jobs completed with %d jobs", rev, jobCount)
 	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("nix-eval-jobs command failed: %w", err)
 	}
+
+	log.Printf("[%s] nix-eval-jobs completed with %d jobs", rev, jobCount)
 	return nil
 }
 
@@ -500,49 +520,64 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 	worktreeDir := filepath.Join(scriptDir, fmt.Sprintf("nixpkgs-worktree-%s", rev))
 	repoURL := "https://github.com/NixOS/nixpkgs.git"
 
+	// Clean up Git worktree registry first
+	pruneCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "prune")
+	pruneCmd.Stdout = os.Stdout
+	pruneCmd.Stderr = os.Stderr
+	if err := pruneCmd.Run(); err != nil {
+		log.Printf("Warning: Failed to prune worktrees: %v", err)
+	}
+
+	// Remove existing worktree directory if it exists
 	if _, err := os.Stat(worktreeDir); err == nil {
-		os.RemoveAll(worktreeDir)
-	}
-
-	repoExists := false
-	if _, err := os.Stat(mainRepoDir); err == nil {
-		checkCmd := exec.Command("git", "-C", mainRepoDir, "rev-parse", "--is-bare-repository")
-		if output, err := checkCmd.Output(); err == nil && string(output) == "true\n" {
-			repoExists = true
+		removeCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "remove", "--force", worktreeDir)
+		removeCmd.Stdout = os.Stdout
+		removeCmd.Stderr = os.Stderr
+		if err := removeCmd.Run(); err != nil {
+			log.Printf("Warning: Failed to remove worktree %s: %v", worktreeDir, err)
+		}
+		// Ensure directory is gone
+		if err := os.RemoveAll(worktreeDir); err != nil {
+			log.Printf("Warning: Failed to delete worktree directory %s: %v", worktreeDir, err)
 		}
 	}
 
-	if !repoExists {
-		if _, err := os.Stat(mainRepoDir); err == nil {
-			os.RemoveAll(mainRepoDir)
+	// Initialize or update the main repository
+	if _, err := os.Stat(mainRepoDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Dir(mainRepoDir), 0755); err != nil {
+			return "", fmt.Errorf("failed to create parent directory: %w", err)
 		}
-		cmd := exec.Command("git", "clone", "--bare", "--filter=blob:none", repoURL, mainRepoDir)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return "", fmt.Errorf("failed to clone bare repository: %w", err)
+		cloneCmd := exec.Command("git", "clone", "--mirror", repoURL, mainRepoDir)
+		cloneCmd.Stdout = os.Stdout
+		cloneCmd.Stderr = os.Stderr
+		if err := cloneCmd.Run(); err != nil {
+			return "", fmt.Errorf("failed to clone repository: %w", err)
 		}
 	}
 
-	fetchCmd := exec.Command("git", "-C", mainRepoDir, "fetch", "--depth=1", "origin", rev)
+	// Fetch the specific revision
+	fetchCmd := exec.Command("git", "-C", mainRepoDir, "fetch", "origin", rev)
 	fetchCmd.Stdout = os.Stdout
 	fetchCmd.Stderr = os.Stderr
 	if err := fetchCmd.Run(); err != nil {
-		fetchCmd = exec.Command("git", "-C", mainRepoDir, "fetch", "origin", rev)
-		fetchCmd.Stdout = os.Stdout
-		fetchCmd.Stderr = os.Stderr
-		if err := fetchCmd.Run(); err != nil {
-			return "", fmt.Errorf("failed to fetch revision: %w", err)
-		}
+		return "", fmt.Errorf("failed to fetch revision: %w", err)
 	}
 
-	worktreeCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "add", "--detach", worktreeDir, rev)
-	worktreeCmd.Stdout = os.Stdout
-	worktreeCmd.Stderr = os.Stderr
-	if err := worktreeCmd.Run(); err != nil {
+	// Create the worktree
+	addCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "add", "--force", worktreeDir, rev)
+	addCmd.Stdout = os.Stdout
+	addCmd.Stderr = os.Stderr
+	if err := addCmd.Run(); err != nil {
 		return "", fmt.Errorf("failed to create worktree: %w", err)
 	}
 
+	// Verify worktree
+	minverPath := filepath.Join(worktreeDir, "lib", "minver.nix")
+	if _, err := os.Stat(minverPath); os.IsNotExist(err) {
+		log.Printf("Warning: Could not find %s, structure may have changed", minverPath)
+	}
+
+	log.Printf("Prepared worktree for revision %s at %s", rev, worktreeDir)
 	return worktreeDir, nil
 }
 
