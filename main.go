@@ -33,8 +33,7 @@ type DrvRevision struct {
 	RevisionID int64
 }
 
-// Rule of thumb: nix-eval-jobs uses around 4GB RAM per worker
-var workers = 24
+var workers = 16
 
 // initDB initializes the SQLite database
 func initDB() *sql.DB {
