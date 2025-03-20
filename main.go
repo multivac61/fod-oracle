@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,9 +48,6 @@ func initDB() *sql.DB {
 	}
 
 	db.Exec("PRAGMA foreign_keys = ON;")
-	db.SetMaxOpenConns(runtime.NumCPU() * 2)
-	db.SetMaxIdleConns(runtime.NumCPU())
-	db.SetConnMaxLifetime(time.Hour)
 
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",
@@ -108,22 +106,19 @@ type DBBatcher struct {
 	fodBatch      []FOD
 	relationBatch []DrvRevision
 	batchSize     int
-	mutex         sync.Mutex
-	commitTicker  *time.Ticker
-	wg            sync.WaitGroup
-	done          chan struct{}
 	fodStmt       *sql.Stmt
 	relStmt       *sql.Stmt
 	revisionID    int64
 	stats         struct {
 		drvs int
 		fods int
-		sync.Mutex
 	}
+	lastStatsTime time.Time
+	mu            sync.Mutex
 }
 
 // NewDBBatcher creates a new database batcher
-func NewDBBatcher(db *sql.DB, batchSize int, commitInterval time.Duration, revisionID int64) (*DBBatcher, error) {
+func NewDBBatcher(db *sql.DB, batchSize int, revisionID int64) (*DBBatcher, error) {
 	fodStmt, err := db.Prepare(`
         INSERT INTO fods (drv_path, output_path, hash_algorithm, hash)
         VALUES (?, ?, ?, ?)
@@ -149,43 +144,26 @@ func NewDBBatcher(db *sql.DB, batchSize int, commitInterval time.Duration, revis
 		fodBatch:      make([]FOD, 0, batchSize),
 		relationBatch: make([]DrvRevision, 0, batchSize),
 		batchSize:     batchSize,
-		commitTicker:  time.NewTicker(commitInterval),
-		done:          make(chan struct{}),
 		fodStmt:       fodStmt,
 		relStmt:       relStmt,
 		revisionID:    revisionID,
+		lastStatsTime: time.Now(),
 	}
-
-	batcher.wg.Add(1)
-	go batcher.periodicCommit()
 
 	return batcher, nil
 }
 
-func (b *DBBatcher) periodicCommit() {
-	defer b.wg.Done()
-	for {
-		select {
-		case <-b.commitTicker.C:
-			b.Flush()
-			b.logStats()
-		case <-b.done:
-			b.Flush()
-			b.logStats()
-			return
-		}
+func (b *DBBatcher) logStats() {
+	// Only log stats every 3 seconds
+	if time.Since(b.lastStatsTime) >= 3*time.Second {
+		log.Printf("Stats: processed %d derivations, found %d FODs", b.stats.drvs, b.stats.fods)
+		b.lastStatsTime = time.Now()
 	}
 }
 
-func (b *DBBatcher) logStats() {
-	b.stats.Lock()
-	defer b.stats.Unlock()
-	log.Printf("Stats: processed %d derivations, found %d FODs", b.stats.drvs, b.stats.fods)
-}
-
 func (b *DBBatcher) AddFOD(fod FOD) {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
 	b.fodBatch = append(b.fodBatch, fod)
 	relation := DrvRevision{
@@ -193,10 +171,7 @@ func (b *DBBatcher) AddFOD(fod FOD) {
 		RevisionID: b.revisionID,
 	}
 	b.relationBatch = append(b.relationBatch, relation)
-
-	b.stats.Lock()
 	b.stats.fods++
-	b.stats.Unlock()
 
 	if len(b.fodBatch) >= b.batchSize {
 		b.commitBatch()
@@ -204,15 +179,37 @@ func (b *DBBatcher) AddFOD(fod FOD) {
 }
 
 func (b *DBBatcher) IncrementDrvCount() {
-	b.stats.Lock()
+	b.mu.Lock()
 	b.stats.drvs++
-	b.stats.Unlock()
+	shouldLog := time.Since(b.lastStatsTime) >= 3*time.Second
+	b.mu.Unlock()
+
+	if shouldLog {
+		b.mu.Lock()
+		b.logStats()
+		b.mu.Unlock()
+	}
 }
 
 func (b *DBBatcher) commitBatch() {
+	// Already locked by caller
 	if len(b.fodBatch) == 0 {
 		return
 	}
+
+	// Copy the batches to local variables
+	fodBatch := make([]FOD, len(b.fodBatch))
+	copy(fodBatch, b.fodBatch)
+	relationBatch := make([]DrvRevision, len(b.relationBatch))
+	copy(relationBatch, b.relationBatch)
+
+	// Clear the batches
+	b.fodBatch = b.fodBatch[:0]
+	b.relationBatch = b.relationBatch[:0]
+
+	// Release the lock before database operations
+	b.mu.Unlock()
+	defer b.mu.Lock()
 
 	tx, err := b.db.Begin()
 	if err != nil {
@@ -232,7 +229,7 @@ func (b *DBBatcher) commitBatch() {
 	fodStmt := tx.Stmt(b.fodStmt)
 	relStmt := tx.Stmt(b.relStmt)
 
-	for _, fod := range b.fodBatch {
+	for _, fod := range fodBatch {
 		_, err = fodStmt.Exec(
 			fod.DrvPath, fod.OutputPath, fod.HashAlgorithm, fod.Hash,
 			fod.OutputPath, fod.HashAlgorithm, fod.Hash,
@@ -242,7 +239,7 @@ func (b *DBBatcher) commitBatch() {
 		}
 	}
 
-	for _, rel := range b.relationBatch {
+	for _, rel := range relationBatch {
 		_, err = relStmt.Exec(rel.DrvPath, rel.RevisionID)
 		if err != nil {
 			log.Printf("Failed to insert relation for %s: %v", rel.DrvPath, err)
@@ -254,22 +251,20 @@ func (b *DBBatcher) commitBatch() {
 		return
 	}
 	success = true
-
-	b.fodBatch = b.fodBatch[:0]
-	b.relationBatch = b.relationBatch[:0]
 }
 
 func (b *DBBatcher) Flush() {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-	b.commitBatch()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.fodBatch) > 0 {
+		// Temporarily release lock during database operations
+		b.commitBatch()
+	}
 }
 
 func (b *DBBatcher) Close() error {
-	close(b.done)
-	b.commitTicker.Stop()
-	b.wg.Wait()
-
+	b.Flush()
 	if err := b.fodStmt.Close(); err != nil {
 		return err
 	}
@@ -279,8 +274,16 @@ func (b *DBBatcher) Close() error {
 	return nil
 }
 
-func processDerivation(inputFile string, batcher *DBBatcher, visited *sync.Map, workQueue chan<- string) {
-	batcher.IncrementDrvCount()
+// ProcessingContext holds the context for processing derivations
+type ProcessingContext struct {
+	batcher   *DBBatcher
+	visited   *sync.Map
+	workQueue chan string
+	wg        *sync.WaitGroup
+}
+
+func processDerivation(inputFile string, ctx *ProcessingContext) {
+	ctx.batcher.IncrementDrvCount()
 
 	file, err := os.Open(inputFile)
 	if err != nil {
@@ -303,7 +306,7 @@ func processDerivation(inputFile string, batcher *DBBatcher, visited *sync.Map, 
 				HashAlgorithm: out.HashAlgorithm,
 				Hash:          out.Hash,
 			}
-			batcher.AddFOD(fod)
+			ctx.batcher.AddFOD(fod)
 			if os.Getenv("VERBOSE") == "1" {
 				log.Printf("Found FOD: %s (output: %s, hash: %s)",
 					filepath.Base(inputFile), name, out.Hash)
@@ -312,14 +315,14 @@ func processDerivation(inputFile string, batcher *DBBatcher, visited *sync.Map, 
 		}
 	}
 
+	// Queue input derivations to process
 	for path := range drv.InputDerivations {
-		if _, alreadyVisited := visited.LoadOrStore(path, true); !alreadyVisited {
-			select {
-			case workQueue <- path:
-			default:
-				log.Printf("Warning: Queue full for %s, processing directly", path)
-				go processDerivation(path, batcher, visited, workQueue)
-			}
+		if _, loaded := ctx.visited.LoadOrStore(path, true); !loaded {
+			ctx.wg.Add(1)
+			go func(drvPath string) {
+				defer ctx.wg.Done()
+				processDerivation(drvPath, ctx)
+			}(path)
 		}
 	}
 }
@@ -358,35 +361,17 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		os.RemoveAll(worktreeDir)
 	}()
 
-	// Initialize the batcher only after Git setup is complete
-	batcher, err := NewDBBatcher(db, 1000, 3*time.Second, revisionID)
+	// Initialize the batcher
+	batcher, err := NewDBBatcher(db, 1000, revisionID)
 	if err != nil {
 		return fmt.Errorf("failed to create database batcher: %w", err)
 	}
 	defer batcher.Close()
 
-	workQueue := make(chan string, 100000)
 	visited := &sync.Map{}
 	var wg sync.WaitGroup
 
-	log.Printf("[%s] Running nix-eval-jobs to populate work queue", rev)
-	if err := callNixEvalJobsWithGitWorktree(rev, worktreeDir, workQueue, visited); err != nil {
-		return fmt.Errorf("failed to run nix-eval-jobs: %w", err)
-	}
-
-	numWorkers := runtime.NumCPU()
-	log.Printf("[%s] Starting %d workers to process derivations", rev, numWorkers)
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for drvPath := range workQueue {
-				processDerivation(drvPath, batcher, visited, workQueue)
-			}
-		}()
-	}
-
-	// Monitor memory usage
+	// Start memory monitoring
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
@@ -398,20 +383,51 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		}
 	}()
 
-	// Wait for processing with timeout
+	// Create processing context
+	ctx := &ProcessingContext{
+		batcher:   batcher,
+		visited:   visited,
+		workQueue: make(chan string, 100),
+		wg:        &wg,
+	}
+
+	// Run nix-eval-jobs to get initial derivations
+	log.Printf("[%s] Running nix-eval-jobs to populate work queue", rev)
+	initialDrvs, err := callNixEvalJobs(rev, worktreeDir, 8) // Use 8 workers
+	if err != nil {
+		return fmt.Errorf("failed to run nix-eval-jobs: %w", err)
+	}
+
+	// Process initial derivations in parallel
+	log.Printf("[%s] Starting to process %d initial derivations", rev, len(initialDrvs))
+
+	// Set a timeout
 	done := make(chan struct{})
+	timeout := time.After(1 * time.Hour)
+
+	// Start processing
+	for _, drvPath := range initialDrvs {
+		if _, loaded := visited.LoadOrStore(drvPath, true); !loaded {
+			wg.Add(1)
+			go func(path string) {
+				defer wg.Done()
+				processDerivation(path, ctx)
+			}(drvPath)
+		}
+	}
+
+	// Wait for completion in a goroutine
 	go func() {
 		wg.Wait()
 		close(done)
 	}()
 
+	// Wait for completion or timeout
 	select {
-	case <-time.After(1 * time.Hour):
-		log.Printf("[%s] Processing timed out after 1 hour", rev)
-		close(workQueue)
 	case <-done:
 		log.Printf("[%s] All derivations processed", rev)
-		close(workQueue)
+	case <-timeout:
+		log.Printf("[%s] Processing timed out after 1 hour", rev)
 	}
 
 	batcher.Flush()
@@ -426,86 +442,6 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	return nil
 }
 
-func callNixEvalJobsWithGitWorktree(rev string, worktreeDir string, workQueue chan<- string, visited *sync.Map) error {
-	log.Printf("[%s] Running nix-eval-jobs with worktree at %s", rev, worktreeDir)
-
-	// Use the proper Nixpkgs import pattern
-	expr := fmt.Sprintf(`
-      let
-        pkgs = import %s {
-          config = { allowAliases = false; };
-          overlays = [];
-        };
-      in pkgs
-    `, worktreeDir)
-
-	cmd := exec.Command("nix-eval-jobs",
-		"--expr", expr,
-		"--workers", fmt.Sprintf("%d", runtime.NumCPU()/2),
-		"--max-memory-size", "4096",
-		"--option", "allow-import-from-derivation", "false")
-
-	// Capture stdout
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-
-	// Redirect stderr to /dev/null instead of capturing it
-	nullFile, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	if err != nil {
-		return fmt.Errorf("failed to open null device: %w", err)
-	}
-	defer nullFile.Close()
-	cmd.Stderr = nullFile
-
-	err = cmd.Start()
-	if err != nil {
-		return fmt.Errorf("failed to start nix-eval-jobs: %w", err)
-	}
-
-	scanner := bufio.NewScanner(stdout)
-	const maxScannerSize = 10 * 1024 * 1024
-	buf := make([]byte, maxScannerSize)
-	scanner.Buffer(buf, maxScannerSize)
-
-	jobCount := 0
-	for scanner.Scan() {
-		line := scanner.Text()
-		var result struct {
-			DrvPath string `json:"drvPath"`
-		}
-		if err := json.Unmarshal([]byte(line), &result); err != nil {
-			log.Printf("[%s] Failed to parse JSON: %v", rev, err)
-			continue
-		}
-		if result.DrvPath != "" {
-			jobCount++
-			if jobCount%1000 == 0 {
-				log.Printf("[%s] Processed %d jobs from nix-eval-jobs", rev, jobCount)
-			}
-			if _, alreadyVisited := visited.LoadOrStore(result.DrvPath, true); !alreadyVisited {
-				select {
-				case workQueue <- result.DrvPath:
-				default:
-					log.Printf("[%s] Warning: Work queue full, skipping %s", rev, result.DrvPath)
-				}
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading stdout: %w", err)
-	}
-
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("nix-eval-jobs command failed: %w", err)
-	}
-
-	log.Printf("[%s] nix-eval-jobs completed with %d jobs", rev, jobCount)
-	return nil
-}
-
 func prepareNixpkgsWorktree(rev string) (string, error) {
 	if len(rev) != 40 {
 		return "", fmt.Errorf("invalid commit hash length: %s", rev)
@@ -516,11 +452,44 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 		return "", fmt.Errorf("failed to get current directory: %w", err)
 	}
 
+	// Create a main repository directory if it doesn't exist
 	mainRepoDir := filepath.Join(scriptDir, "nixpkgs-repo")
 	worktreeDir := filepath.Join(scriptDir, fmt.Sprintf("nixpkgs-worktree-%s", rev))
 	repoURL := "https://github.com/NixOS/nixpkgs.git"
 
-	// Clean up Git worktree registry first
+	// Clean up existing worktree if it exists
+	if _, err := os.Stat(worktreeDir); err == nil {
+		log.Printf("Removing existing worktree directory: %s", worktreeDir)
+		if err := os.RemoveAll(worktreeDir); err != nil {
+			return "", fmt.Errorf("failed to remove existing worktree directory: %w", err)
+		}
+	}
+
+	// Initialize or update the main repository with minimal history
+	if _, err := os.Stat(mainRepoDir); os.IsNotExist(err) {
+		log.Printf("Initializing shallow clone of nixpkgs repository")
+		if err := os.MkdirAll(filepath.Dir(mainRepoDir), 0755); err != nil {
+			return "", fmt.Errorf("failed to create parent directory: %w", err)
+		}
+
+		// Initialize a bare repository
+		initCmd := exec.Command("git", "init", "--bare", mainRepoDir)
+		initCmd.Stdout = os.Stdout
+		initCmd.Stderr = os.Stderr
+		if err := initCmd.Run(); err != nil {
+			return "", fmt.Errorf("failed to initialize bare repository: %w", err)
+		}
+
+		// Add the remote
+		remoteCmd := exec.Command("git", "-C", mainRepoDir, "remote", "add", "origin", repoURL)
+		remoteCmd.Stdout = os.Stdout
+		remoteCmd.Stderr = os.Stderr
+		if err := remoteCmd.Run(); err != nil {
+			return "", fmt.Errorf("failed to add remote: %w", err)
+		}
+	}
+
+	// Prune any stale worktrees first
 	pruneCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "prune")
 	pruneCmd.Stdout = os.Stdout
 	pruneCmd.Stderr = os.Stderr
@@ -528,43 +497,18 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 		log.Printf("Warning: Failed to prune worktrees: %v", err)
 	}
 
-	// Remove existing worktree directory if it exists
-	if _, err := os.Stat(worktreeDir); err == nil {
-		removeCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "remove", "--force", worktreeDir)
-		removeCmd.Stdout = os.Stdout
-		removeCmd.Stderr = os.Stderr
-		if err := removeCmd.Run(); err != nil {
-			log.Printf("Warning: Failed to remove worktree %s: %v", worktreeDir, err)
-		}
-		// Ensure directory is gone
-		if err := os.RemoveAll(worktreeDir); err != nil {
-			log.Printf("Warning: Failed to delete worktree directory %s: %v", worktreeDir, err)
-		}
-	}
-
-	// Initialize or update the main repository
-	if _, err := os.Stat(mainRepoDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(mainRepoDir), 0755); err != nil {
-			return "", fmt.Errorf("failed to create parent directory: %w", err)
-		}
-		cloneCmd := exec.Command("git", "clone", "--mirror", repoURL, mainRepoDir)
-		cloneCmd.Stdout = os.Stdout
-		cloneCmd.Stderr = os.Stderr
-		if err := cloneCmd.Run(); err != nil {
-			return "", fmt.Errorf("failed to clone repository: %w", err)
-		}
-	}
-
-	// Fetch the specific revision
-	fetchCmd := exec.Command("git", "-C", mainRepoDir, "fetch", "origin", rev)
+	// Fetch only the specific revision
+	log.Printf("Fetching only commit %s from repository", rev)
+	fetchCmd := exec.Command("git", "-C", mainRepoDir, "fetch", "--depth=1", "origin", rev)
 	fetchCmd.Stdout = os.Stdout
 	fetchCmd.Stderr = os.Stderr
 	if err := fetchCmd.Run(); err != nil {
 		return "", fmt.Errorf("failed to fetch revision: %w", err)
 	}
 
-	// Create the worktree
-	addCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "add", "--force", worktreeDir, rev)
+	// Create the worktree with force flag
+	log.Printf("Creating worktree for revision %s", rev)
+	addCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "add", "--force", "--detach", worktreeDir, rev)
 	addCmd.Stdout = os.Stdout
 	addCmd.Stderr = os.Stderr
 	if err := addCmd.Run(); err != nil {
@@ -581,9 +525,129 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 	return worktreeDir, nil
 }
 
+func callNixEvalJobs(rev string, nixpkgsDir string, workers int) ([]string, error) {
+	log.Printf("[%s] Running nix-eval-jobs with nixpkgs at %s", rev, nixpkgsDir)
+
+	// Use the proper Nixpkgs import pattern
+	expr := fmt.Sprintf(`
+      let
+        pkgs = import %s {
+          config = { allowAliases = false; };
+          overlays = [];
+        };
+      in pkgs
+    `, nixpkgsDir)
+
+	cmd := exec.Command("nix-eval-jobs",
+		"--expr", expr,
+		"--workers", fmt.Sprintf("%d", workers),
+		"--max-memory-size", "4096",
+		"--option", "allow-import-from-derivation", "false")
+
+	// Capture stdout
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	// Redirect stderr to /dev/null
+	nullFile, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open null device: %w", err)
+	}
+	defer nullFile.Close()
+	cmd.Stderr = nullFile
+
+	err = cmd.Start()
+	if err != nil {
+		return nil, fmt.Errorf("failed to start nix-eval-jobs: %w", err)
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	const maxScannerSize = 10 * 1024 * 1024
+	buf := make([]byte, maxScannerSize)
+	scanner.Buffer(buf, maxScannerSize)
+
+	var drvPaths []string
+	jobCount := 0
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		var result struct {
+			DrvPath string `json:"drvPath"`
+		}
+		if err := json.Unmarshal([]byte(line), &result); err != nil {
+			log.Printf("[%s] Failed to parse JSON: %v", rev, err)
+			continue
+		}
+		if result.DrvPath != "" {
+			jobCount++
+			if jobCount%1000 == 0 {
+				log.Printf("[%s] Processed %d jobs from nix-eval-jobs", rev, jobCount)
+			}
+			drvPaths = append(drvPaths, result.DrvPath)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading stdout: %w", err)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("nix-eval-jobs command failed: %w", err)
+	}
+
+	log.Printf("[%s] nix-eval-jobs completed with %d jobs", rev, jobCount)
+	return drvPaths, nil
+}
+
+func cleanupWorktrees() error {
+	scriptDir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to get current directory: %w", err)
+	}
+
+	mainRepoDir := filepath.Join(scriptDir, "nixpkgs-repo")
+	if _, err := os.Stat(mainRepoDir); os.IsNotExist(err) {
+		// No repository to clean up
+		return nil
+	}
+
+	// Prune worktrees
+	pruneCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "prune")
+	pruneCmd.Stdout = os.Stdout
+	pruneCmd.Stderr = os.Stderr
+	if err := pruneCmd.Run(); err != nil {
+		return fmt.Errorf("failed to prune worktrees: %w", err)
+	}
+
+	// Find and remove any leftover worktree directories
+	entries, err := os.ReadDir(scriptDir)
+	if err != nil {
+		return fmt.Errorf("failed to read directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "nixpkgs-worktree-") {
+			worktreePath := filepath.Join(scriptDir, entry.Name())
+			log.Printf("Removing leftover worktree directory: %s", worktreePath)
+			if err := os.RemoveAll(worktreePath); err != nil {
+				log.Printf("Warning: Failed to remove directory %s: %v", worktreePath, err)
+			}
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Println("Starting FOD finder...")
+
+	// Clean up any leftover worktrees from previous runs
+	if err := cleanupWorktrees(); err != nil {
+		log.Printf("Warning: Failed to clean up worktrees: %v", err)
+	}
 
 	db := initDB()
 	defer db.Close()
@@ -595,26 +659,21 @@ func main() {
 	log.Printf("Processing %d nixpkgs revisions: %v", len(revisions), revisions)
 
 	startTime := time.Now()
-	var wg sync.WaitGroup
+
+	// Process revisions sequentially
 	for _, rev := range revisions {
-		wg.Add(1)
-		go func(revision string) {
-			defer wg.Done()
+		revisionID, err := getOrCreateRevision(db, rev)
+		if err != nil {
+			log.Printf("Failed to get or create revision %s: %v", rev, err)
+			continue
+		}
+		log.Printf("Using nixpkgs revision: %s (ID: %d)", rev, revisionID)
 
-			revisionID, err := getOrCreateRevision(db, revision)
-			if err != nil {
-				log.Printf("Failed to get or create revision %s: %v", revision, err)
-				return
-			}
-			log.Printf("Using nixpkgs revision: %s (ID: %d)", revision, revisionID)
-
-			if err := findFODsForRevision(revision, revisionID, db); err != nil {
-				log.Printf("Error finding FODs for revision %s: %v", revision, err)
-			}
-		}(rev)
+		if err := findFODsForRevision(rev, revisionID, db); err != nil {
+			log.Printf("Error finding FODs for revision %s: %v", rev, err)
+		}
 	}
 
-	wg.Wait()
 	totalElapsed := time.Since(startTime)
 	log.Printf("All revisions processed in %v", totalElapsed)
 
@@ -623,6 +682,11 @@ func main() {
 		if _, err := db.Exec(opt); err != nil {
 			log.Printf("Warning: Failed to execute %s: %v", opt, err)
 		}
+	}
+
+	// Final cleanup
+	if err := cleanupWorktrees(); err != nil {
+		log.Printf("Warning: Failed to clean up worktrees: %v", err)
 	}
 
 	log.Println("FOD finder completed successfully")
