@@ -393,13 +393,13 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	}()
 
 	// Determine optimal number of worker goroutines
-	numWorkers := 8 // Adjust as needed
+	numWorkers := 32 // Adjust as needed
 
 	// Create a channel for derivation paths
-	drvPathChan := make(chan string, 1000) // Buffer size can be adjusted
+	drvPathChan := make(chan string, 5000) // Buffer size can be adjusted
 
 	// Create processing context with semaphore to limit concurrency
-	maxConcurrency := 1000
+	maxConcurrency := 2000
 	ctx := &ProcessingContext{
 		batcher:   batcher,
 		visited:   visited,
@@ -408,7 +408,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	}
 
 	// Start worker goroutines to process derivations
-	for i := 0; i < numWorkers; i++ {
+	for range numWorkers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
