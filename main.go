@@ -469,18 +469,13 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan chan<- string) error {
 	log.Printf("[%s] Running nix-eval-jobs with nixpkgs at %s", rev, nixpkgsDir)
 
-	// Use the proper Nixpkgs import pattern
-	expr := fmt.Sprintf(`
-      let
-        pkgs = import %s {
-          config = { allowAliases = false; };
-          overlays = [];
-        };
-      in pkgs
-    `, nixpkgsDir)
+	// Path to the release-outpaths.nix file
+	releasePath := filepath.Join(nixpkgsDir, "pkgs/top-level/release-outpaths.nix")
 
+	// Build the command with the specific Nix expression path and arguments
 	cmd := exec.Command("nix-eval-jobs",
-		"--expr", expr,
+		releasePath,
+		"--arg", "checkMeta", "false",
 		"--workers", fmt.Sprintf("%d", workers),
 		"--max-memory-size", "4096",
 		"--option", "allow-import-from-derivation", "false")
