@@ -357,6 +357,17 @@ func getOrCreateRevision(db *sql.DB, rev string) (int64, error) {
 	return id, nil
 }
 
+// BatchProcessingContext holds the context for batch processing derivations
+type BatchProcessingContext struct {
+	batcher    *DBBatcher
+	visited    *sync.Map
+	wg         *sync.WaitGroup
+	semaphore  chan struct{} // Limit concurrency
+	inputBatch chan []string // Channel for batches of input derivations
+	batchSize  int           // Size of batches for input derivations
+}
+
+// Modified findFODsForRevision function with batch processing
 func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	revStartTime := time.Now()
 	log.Printf("[%s] Starting to find all FODs...", rev)
@@ -371,7 +382,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	}()
 
 	// Initialize the batcher
-	batcher, err := NewDBBatcher(db, 1000, revisionID)
+	batcher, err := NewDBBatcher(db, 5000, revisionID) // Increased batch size
 	if err != nil {
 		return fmt.Errorf("failed to create database batcher: %w", err)
 	}
@@ -387,44 +398,110 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		for range ticker.C {
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
-			log.Printf("[%s] Memory: Alloc=%dMB TotalAlloc=%dMB Sys=%dMB",
-				rev, m.Alloc/1024/1024, m.TotalAlloc/1024/1024, m.Sys/1024/1024)
+			log.Printf("[%s] Memory: Alloc=%dMB TotalAlloc=%dMB Sys=%dMB NumGoroutine=%d",
+				rev, m.Alloc/1024/1024, m.TotalAlloc/1024/1024, m.Sys/1024/1024, runtime.NumGoroutine())
 		}
 	}()
 
 	// Determine optimal number of worker goroutines
-	numWorkers := 32 // Adjust as needed
+	numWorkers := 16 // Adjusted down from 32 for batch processing
 
 	// Create a channel for derivation paths
-	drvPathChan := make(chan string, 5000) // Buffer size can be adjusted
+	drvPathChan := make(chan string, 10000) // Increased buffer size
+
+	// Create a channel for batches of input derivations
+	inputBatchChan := make(chan []string, 100)
 
 	// Create processing context with semaphore to limit concurrency
-	maxConcurrency := 2000
-	ctx := &ProcessingContext{
-		batcher:   batcher,
-		visited:   visited,
-		wg:        &wg,
-		semaphore: make(chan struct{}, maxConcurrency),
+	maxConcurrency := 500 // Reduced from 2000 for batch processing
+	batchSize := 50       // Size of batches for processing
+
+	ctx := &BatchProcessingContext{
+		batcher:    batcher,
+		visited:    visited,
+		wg:         &wg,
+		semaphore:  make(chan struct{}, maxConcurrency),
+		inputBatch: inputBatchChan,
+		batchSize:  batchSize,
 	}
 
-	// Start worker goroutines to process derivations
+	// Start worker goroutines to process derivations in batches
 	for range numWorkers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for drvPath := range drvPathChan {
-				if _, loaded := visited.LoadOrStore(drvPath, true); !loaded {
-					// Process the derivation in the current goroutine
-					processDerivation(drvPath, ctx)
+
+			for {
+				// Create a batch
+				batch := make([]string, 0, batchSize)
+
+				// Try to fill the batch from the channel
+				// First get at least one item or exit if channel is closed
+				select {
+				case drvPath, ok := <-drvPathChan:
+					if !ok {
+						// Channel is closed, no more work
+						return
+					}
+					batch = append(batch, drvPath)
+				case <-time.After(5 * time.Second):
+					// Timeout waiting for work, check if we should exit
+					select {
+					case drvPath, ok := <-drvPathChan:
+						if !ok {
+							return
+						}
+						batch = append(batch, drvPath)
+					default:
+						// No work and timed out, exit
+						return
+					}
+				}
+
+				// Try to get more items without blocking
+			batchFilling:
+				for len(batch) < batchSize {
+					select {
+					case path, ok := <-drvPathChan:
+						if !ok {
+							// Channel closed
+							break batchFilling
+						}
+						batch = append(batch, path)
+					default:
+						// No more items available without blocking
+						break batchFilling
+					}
+				}
+
+				// Process the batch
+				if len(batch) > 0 {
+					processBatch(batch, ctx)
 				}
 			}
 		}()
 	}
 
+	// Start a goroutine to process input derivation batches
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for batch := range inputBatchChan {
+			// Process each batch of input derivations
+			for _, path := range batch {
+				if _, loaded := visited.LoadOrStore(path, true); !loaded {
+					// Send to the main processing channel
+					drvPathChan <- path
+				}
+			}
+		}
+	}()
+
 	// Run nix-eval-jobs in a separate goroutine and feed the channel
 	evalJobsErr := make(chan error, 1)
 	go func() {
-		defer close(drvPathChan) // Close the channel when done
+		defer close(drvPathChan)    // Close the channel when done
+		defer close(inputBatchChan) // Close the input batch channel when done
 
 		// Run nix-eval-jobs and stream results to the channel
 		err := streamNixEvalJobs(rev, worktreeDir, 8, drvPathChan)
@@ -463,6 +540,138 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	}
 	log.Printf("[%s] Final stats: %d FODs", rev, fodCount)
 	return nil
+}
+
+// processBatch processes a batch of derivation paths
+func processBatch(batch []string, ctx *BatchProcessingContext) {
+	// Filter out already visited paths
+	var toProcess []string
+	for _, path := range batch {
+		if _, loaded := ctx.visited.LoadOrStore(path, true); !loaded {
+			toProcess = append(toProcess, path)
+		}
+	}
+
+	if len(toProcess) == 0 {
+		return
+	}
+
+	// Process each derivation in the batch
+	inputDrvs := make([][]string, 0, len(toProcess))
+
+	for _, drvPath := range toProcess {
+		ctx.batcher.IncrementDrvCount()
+
+		file, err := os.Open(drvPath)
+		if err != nil {
+			log.Printf("Error opening file %s: %v", drvPath, err)
+			continue
+		}
+
+		drv, err := derivation.ReadDerivation(file)
+		file.Close() // Close file immediately after reading
+
+		if err != nil {
+			log.Printf("Error reading derivation %s: %v", drvPath, err)
+			continue
+		}
+
+		// Check for FODs
+		for name, out := range drv.Outputs {
+			if out.HashAlgorithm != "" {
+				fod := FOD{
+					DrvPath:       drvPath,
+					OutputPath:    out.Path,
+					HashAlgorithm: out.HashAlgorithm,
+					Hash:          out.Hash,
+				}
+				ctx.batcher.AddFOD(fod)
+				if os.Getenv("VERBOSE") == "1" {
+					log.Printf("Found FOD: %s (output: %s, hash: %s)",
+						filepath.Base(drvPath), name, out.Hash)
+				}
+				break
+			}
+		}
+
+		// Collect input derivations
+		if len(drv.InputDerivations) > 0 {
+			inputPaths := make([]string, 0, len(drv.InputDerivations))
+			for path := range drv.InputDerivations {
+				inputPaths = append(inputPaths, path)
+			}
+
+			if len(inputPaths) > 0 {
+				inputDrvs = append(inputDrvs, inputPaths)
+			}
+		}
+	}
+
+	// Process input derivations in batches
+	if len(inputDrvs) > 0 {
+		// Flatten all input derivations
+		allInputs := make([]string, 0, len(inputDrvs)*5) // Estimate
+		for _, inputs := range inputDrvs {
+			allInputs = append(allInputs, inputs...)
+		}
+
+		// Send in batches to the input batch channel
+		for i := 0; i < len(allInputs); i += ctx.batchSize {
+			end := i + ctx.batchSize
+			if end > len(allInputs) {
+				end = len(allInputs)
+			}
+
+			// Create a batch
+			batch := allInputs[i:end]
+
+			// Send the batch to be processed
+			select {
+			case ctx.inputBatch <- batch:
+				// Batch sent successfully
+			default:
+				// Channel is full, process in current goroutine
+				for _, path := range batch {
+					if _, loaded := ctx.visited.LoadOrStore(path, true); !loaded {
+						// Process directly
+						file, err := os.Open(path)
+						if err != nil {
+							log.Printf("Error opening file %s: %v", path, err)
+							continue
+						}
+
+						drv, err := derivation.ReadDerivation(file)
+						file.Close()
+
+						if err != nil {
+							log.Printf("Error reading derivation %s: %v", path, err)
+							continue
+						}
+
+						ctx.batcher.IncrementDrvCount()
+
+						// Check for FODs
+						for name, out := range drv.Outputs {
+							if out.HashAlgorithm != "" {
+								fod := FOD{
+									DrvPath:       path,
+									OutputPath:    out.Path,
+									HashAlgorithm: out.HashAlgorithm,
+									Hash:          out.Hash,
+								}
+								ctx.batcher.AddFOD(fod)
+								if os.Getenv("VERBOSE") == "1" {
+									log.Printf("Found FOD: %s (output: %s, hash: %s)",
+										filepath.Base(path), name, out.Hash)
+								}
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 // streamNixEvalJobs runs nix-eval-jobs and streams results to the provided channel
