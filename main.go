@@ -33,7 +33,7 @@ type DrvRevision struct {
 	RevisionID int64
 }
 
-var workers = 32
+var workers = 16
 
 // initDB initializes the SQLite database
 func initDB() *sql.DB {
