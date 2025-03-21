@@ -3,6 +3,8 @@ pkgs.stdenv.mkDerivation {
   pname = "caddy-with-cloudflare";
   version = pkgs.caddy.version;
 
+  meta.mainProgram = "caddy";
+
   dontUnpack = true;
 
   nativeBuildInputs = with pkgs; [
@@ -26,4 +28,3 @@ pkgs.stdenv.mkDerivation {
     cp caddy $out/bin/
   '';
 }
-

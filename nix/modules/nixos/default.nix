@@ -1,14 +1,15 @@
+{ flake, inputs }:
 {
   config,
-  lib,
   pkgs,
-  perSystem,
+  lib,
   ...
 }:
-with lib;
 let
   cfg = config.services.fod-oracle;
+  pkgs' = flake.packages.${pkgs.system};
 in
+with lib;
 {
   options.services.fod-oracle = {
     enable = mkEnableOption "FOD Oracle API service";
@@ -27,9 +28,16 @@ in
 
     package = mkOption {
       type = types.package;
-      default = pkgs.fod-oracle.api-server;
+      default = pkgs'.api-server;
       defaultText = literalExpression "pkgs.fod-oracle.api-server";
       description = "The FOD Oracle API server package to use.";
+    };
+
+    caddyPackage = mkOption {
+      type = types.package;
+      default = pkgs'.cloudflare-caddy;
+      defaultText = literalExpression "pkgs.cloudflare-caddy or pkgs.caddy";
+      description = "The Caddy package to use (with Cloudflare plugin).";
     };
 
     user = mkOption {
@@ -131,7 +139,7 @@ in
     services.caddy = {
       enable = true;
 
-      package = perSystem.self.cloudflare-caddy;
+      package = cfg.caddyPackage;
 
       virtualHosts = {
         ${cfg.domain} = {

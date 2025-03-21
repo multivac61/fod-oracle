@@ -74,10 +74,46 @@ The following API endpoints are available:
 - `GET /api/health` - Health check
 - `GET /api/revisions` - List all nixpkgs revisions
 - `GET /api/revisions/{id}` - Get details for a specific revision
+- `GET /api/revision/{rev}` - Get details for a specific revision by git hash
 - `GET /api/fods` - List FODs (with pagination)
 - `GET /api/fods/{hash}` - Find FODs by hash
 - `GET /api/stats` - Get database statistics
 - `GET /api/compare` - Compare FODs between revisions
+
+## NixOS Module
+
+FOD Oracle includes a NixOS module that makes it easy to deploy the API server with Caddy for HTTPS and Cloudflare DNS integration.
+
+### Basic Configuration
+
+```nix
+{
+  imports = [ 
+    # Path to the FOD Oracle module
+    /path/to/fod-oracle/nix/modules/nixos/default.nix 
+  ];
+
+  services.fod-oracle = {
+    enable = true;
+    domain = "api.your-domain.com";
+    cloudflareApiTokenFile = "/path/to/cloudflare-token";
+    openFirewall = true;
+  };
+}
+```
+
+### Integration Testing
+
+To ensure that the NixOS module works correctly, FOD Oracle includes an integration test that runs on Linux systems:
+
+```bash
+# Run all checks including the integration test (Linux only)
+nix flake check -L
+```
+
+The integration test creates a NixOS VM, deploys FOD Oracle with the module, and verifies that both the API server and Caddy reverse proxy are working correctly.
+
+Note: The integration test only runs on x86_64-linux platforms and is automatically skipped on other platforms like macOS.
 
 ## Development
 
@@ -99,6 +135,6 @@ go build -o api-server cmd/api/main.go
 
 # Build the frontend
 cd frontend
-nnpm install
-nnpm run build
+npm install
+npm run build
 ```
