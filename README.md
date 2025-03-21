@@ -104,16 +104,16 @@ FOD Oracle includes a NixOS module that makes it easy to deploy the API server w
 
 ### Integration Testing
 
-To ensure that the NixOS module works correctly, FOD Oracle includes an integration test that runs on Linux systems:
+To ensure that the NixOS module works correctly, FOD Oracle includes an integration test that runs only on x86_64-linux systems:
 
 ```bash
-# Run all checks including the integration test (Linux only)
+# Run all checks including the integration test (x86_64-linux only)
 nix flake check -L
 ```
 
 The integration test creates a NixOS VM, deploys FOD Oracle with the module, and verifies that both the API server and Caddy reverse proxy are working correctly.
 
-Note: The integration test only runs on x86_64-linux platforms and is automatically skipped on other platforms like macOS.
+Note: The integration test only runs on x86_64-linux platforms and is automatically skipped on other platforms like macOS or aarch64-linux.
 
 ## Development
 
