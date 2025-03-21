@@ -73,7 +73,7 @@ with lib;
     cloudflareApiTokenFile = mkOption {
       type = types.str;
       default = "";
-      description = "Path to file containing Cloudflare API token for DNS challenges.";
+      description = "Path to file containing Cloudflare API token for DNS challenges. File should contain CLOUDFLARE_API_TOKEN=secret.";
     };
 
     exposeThroughTailscale = mkOption {
@@ -149,18 +149,13 @@ with lib;
 
             # TLS with Cloudflare DNS challenge
             tls {
-              dns cloudflare ${
-                if cfg.cloudflareApiToken != "" then cfg.cloudflareApiToken else "{env.CLOUDFLARE_API_TOKEN}"
-              }
+              dns cloudflare {$CLOUDFLARE_API_TOKEN}
             }
           '';
         };
       };
     };
-
-    systemd.services.caddy.environment = mkIf (cfg.cloudflareApiTokenFile != "") {
-      CLOUDFLARE_API_TOKEN = "$(cat ${cfg.cloudflareApiTokenFile})";
-    };
+    systemd.services.caddy.serviceConfig.EnvironmentFile = cfg.cloudflareApiTokenFile;
 
     services.tailscale = mkIf cfg.exposeThroughTailscale {
       enable = true;
