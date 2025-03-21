@@ -33,13 +33,6 @@ with lib;
       description = "The FOD Oracle API server package to use.";
     };
 
-    caddyPackage = mkOption {
-      type = types.package;
-      default = pkgs'.cloudflare-caddy;
-      defaultText = literalExpression "pkgs.cloudflare-caddy or pkgs.caddy";
-      description = "The Caddy package to use (with Cloudflare plugin).";
-    };
-
     user = mkOption {
       type = types.str;
       default = "fod-oracle";
@@ -50,48 +43,6 @@ with lib;
       type = types.str;
       default = "fod-oracle";
       description = "Group under which FOD Oracle runs.";
-    };
-
-    openFirewall = mkOption {
-      type = types.bool;
-      default = false;
-      description = "Whether to open the firewall for the FOD Oracle port.";
-    };
-
-    domain = mkOption {
-      type = types.str;
-      default = "fod-oracle.org";
-      description = "Domain name to use for the FOD Oracle API service.";
-    };
-
-    cloudflareApiToken = mkOption {
-      type = types.str;
-      default = "";
-      description = "Cloudflare API token for DNS challenges.";
-    };
-
-    cloudflareApiTokenFile = mkOption {
-      type = types.str;
-      default = "";
-      description = "Path to file containing Cloudflare API token for DNS challenges. File should contain CLOUDFLARE_API_TOKEN=secret.";
-    };
-
-    exposeThroughTailscale = mkOption {
-      type = types.bool;
-      default = false;
-      description = "Whether to expose the FOD Oracle API service through Tailscale.";
-    };
-
-    tailscaleTags = mkOption {
-      type = types.listOf types.str;
-      default = [ "tag:fod-oracle" ];
-      description = "Tailscale tags for access control.";
-    };
-
-    tailscaleAuthKey = mkOption {
-      type = types.str;
-      default = "";
-      description = "Path to file containing Tailscale auth key.";
     };
   };
 
@@ -134,62 +85,6 @@ with lib;
         StateDirectory = "fod-oracle";
         StateDirectoryMode = "0750";
       };
-    };
-
-    services.caddy = {
-      enable = true;
-
-      package = cfg.caddyPackage;
-
-      virtualHosts = {
-        ${cfg.domain} = {
-          extraConfig = ''
-            # API reverse proxy
-            reverse_proxy /* http://127.0.0.1:${toString cfg.port}
-
-            # TLS with Cloudflare DNS challenge
-            tls {
-              dns cloudflare {$CLOUDFLARE_API_TOKEN}
-            }
-          '';
-        };
-      };
-    };
-    systemd.services.caddy.serviceConfig.EnvironmentFile = cfg.cloudflareApiTokenFile;
-
-    services.tailscale = mkIf cfg.exposeThroughTailscale {
-      enable = true;
-      authKeyFile = if cfg.tailscaleAuthKey != "" then cfg.tailscaleAuthKey else "{env.TS_AUTHKEY}";
-      extraUpFlags = [
-        "--advertise-tags=${concatStringsSep "," cfg.tailscaleTags}"
-      ];
-    };
-
-    # Tailscale Funnel (optional)
-    systemd.services.fod-oracle-tailscale-funnel = mkIf cfg.exposeThroughTailscale {
-      description = "FOD Oracle Tailscale Funnel";
-      wantedBy = [ "multi-user.target" ];
-      after = [
-        "tailscaled.service"
-        "fod-oracle-api.service"
-        "caddy.service"
-      ];
-      requires = [ "tailscaled.service" ];
-
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        ExecStart = "${pkgs.tailscale}/bin/tailscale funnel 443";
-        ExecStop = "${pkgs.tailscale}/bin/tailscale funnel off";
-      };
-    };
-
-    # Open firewall for HTTP/HTTPS
-    networking.firewall = mkIf cfg.openFirewall {
-      allowedTCPPorts = [
-        80
-        443
-      ];
     };
   };
 }
