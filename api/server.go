@@ -287,10 +287,20 @@ func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get last updated timestamp
-	err = s.db.QueryRow("SELECT MAX(timestamp) FROM revisions").Scan(&stats.LastUpdated)
+	var lastUpdatedStr string
+	err = s.db.QueryRow("SELECT MAX(timestamp) FROM revisions").Scan(&lastUpdatedStr)
 	if err != nil && err != sql.ErrNoRows {
 		respondError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	
+	if lastUpdatedStr != "" {
+		parsedTime, err := time.Parse(time.RFC3339, lastUpdatedStr)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "Failed to parse timestamp: "+err.Error())
+			return
+		}
+		stats.LastUpdated = parsedTime
 	}
 
 	// Get unique hashes
