@@ -29,7 +29,6 @@ FOD Oracle is a tool for tracking and analyzing fixed-output derivations (FODs) 
 
 - **CLI**: Command-line tool for scanning nixpkgs revisions and populating the database
 - **API Server**: Provides RESTful API access to the FOD data
-- **Frontend**: Web UI for exploring and visualizing FOD data
 
 ## Usage
 
@@ -38,34 +37,10 @@ FOD Oracle is a tool for tracking and analyzing fixed-output derivations (FODs) 
 To scan a nixpkgs revision:
 
 ```bash
-./fod-oracle <nixpkgs-revision>
+go run . <nixpkgs-revision>
 ```
 
-For example:
-
-```bash
-./fod-oracle 12345abcde67890fedcba09876543210abcdef12
-```
-
-### API Server
-
-To start the API server:
-
-```bash
-./run-api.sh
-```
-
-The API server listens on port 8080 by default.
-
-### Frontend
-
-To start the frontend development server:
-
-```bash
-./run-frontend.sh
-```
-
-The frontend is available at http://localhost:5173.
+This took around 7 minutes on a 7950 AMD Ryzen 9 16-core processor.
 
 ## API Endpoints
 
@@ -89,16 +64,8 @@ FOD Oracle includes a NixOS module that makes it easy to deploy the API server w
 
 ```nix
 {
-  imports = [ 
-    # Path to the FOD Oracle module
-    /path/to/fod-oracle/nix/modules/nixos/default.nix 
-  ];
-
   services.fod-oracle = {
     enable = true;
-    domain = "api.your-domain.com";
-    cloudflareApiTokenFile = "/path/to/cloudflare-token";
-    openFirewall = true;
   };
 }
 ```
@@ -115,27 +82,3 @@ nix flake check -L
 The integration test creates a NixOS VM, deploys FOD Oracle with the module, and verifies that both the API server and Caddy reverse proxy are working correctly.
 
 Note: The integration test only runs on x86_64-linux platforms and is automatically skipped on other platforms like macOS or aarch64-linux.
-
-## Development
-
-### Requirements
-
-- Go 1.21 or later
-- Node.js 16 or later
-- Nix (for running nix-eval-jobs)
-- Git
-
-### Building from Source
-
-```bash
-# Build the CLI
-go build -o fod-oracle main.go
-
-# Build the API server
-go build -o api-server cmd/api/main.go
-
-# Build the frontend
-cd frontend
-npm install
-npm run build
-```
