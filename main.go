@@ -37,13 +37,15 @@ var workers = 16
 
 // initDB initializes the SQLite database
 func initDB() *sql.DB {
-	dbDir := "./db"
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
-		log.Fatalf("Failed to create database directory: %v", err)
+	dbPath := os.Getenv("FOD_ORACLE_DB_PATH")
+	if dbPath == "" {
+		// Default to the db directory in the current working directory
+		currentDir, err := os.Getwd()
+		if err != nil {
+			log.Fatalf("Failed to get current directory: %v", err)
+		}
+		dbPath = filepath.Join(currentDir, "db", "fods.db")
 	}
-
-	dbPath := filepath.Join(dbDir, "fods.db")
-	log.Printf("Using database at: %s", dbPath)
 
 	// Add busy_timeout and other optimizations
 	connString := dbPath + "?_journal_mode=WAL" +
