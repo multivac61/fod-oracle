@@ -295,7 +295,8 @@ func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	if lastUpdatedStr != "" {
-		parsedTime, err := time.Parse(time.RFC3339, lastUpdatedStr)
+		// Try parsing with the format from the database: "2025-03-20 17:01:42"
+		parsedTime, err := time.Parse("2006-01-02 15:04:05", lastUpdatedStr)
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, "Failed to parse timestamp: "+err.Error())
 			return
