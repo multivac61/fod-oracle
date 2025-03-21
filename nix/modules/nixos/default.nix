@@ -1,13 +1,11 @@
-# NixOS module for FOD-Oracle API Server with Caddy and Cloudflare DNS integration
 {
   config,
   lib,
   pkgs,
+  perSystem,
   ...
 }:
-
 with lib;
-
 let
   cfg = config.services.fod-oracle;
 in
@@ -70,7 +68,6 @@ in
       description = "Path to file containing Cloudflare API token for DNS challenges.";
     };
 
-    # Keep Tailscale options for alternative access
     exposeThroughTailscale = mkOption {
       type = types.bool;
       default = false;
@@ -82,10 +79,15 @@ in
       default = [ "tag:fod-oracle" ];
       description = "Tailscale tags for access control.";
     };
+
+    tailscaleAuthKey = mkOption {
+      type = types.str;
+      default = "";
+      description = "Path to file containing Tailscale auth key.";
+    };
   };
 
   config = mkIf cfg.enable {
-    # User and group
     users.users.${cfg.user} = {
       isSystemUser = true;
       group = cfg.group;
@@ -96,7 +98,6 @@ in
 
     users.groups.${cfg.group} = { };
 
-    # Ensure the database directory exists and has correct permissions
     system.activationScripts.fod-oracle-dirs = {
       text = ''
         mkdir -p "$(dirname ${cfg.dbPath})"
@@ -105,7 +106,6 @@ in
       deps = [ ];
     };
 
-    # API Server service
     systemd.services.fod-oracle-api = {
       description = "FOD Oracle API Server";
       wantedBy = [ "multi-user.target" ];
@@ -128,30 +128,13 @@ in
       };
     };
 
-    # Caddy configuration with Cloudflare DNS integration
     services.caddy = {
       enable = true;
 
-      # Build Caddy with Cloudflare DNS module
-      package = pkgs.caddy.withPlugins (plugins: [
-        (plugins.buildPlugin {
-          name = "cloudflare";
-          src = pkgs.fetchFromGitHub {
-            owner = "caddy-dns";
-            repo = "cloudflare";
-            rev = "v0.5.0"; # Use the most recent stable version
-            # You'll need to replace this with the actual hash when you first build the module
-            # If you try to build with this fake hash, Nix will fail but show you the correct hash to use
-            sha256 = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-          };
-          version = "v0.5.0";
-        })
-      ]);
+      package = perSystem.self.cloudflare-caddy;
 
-      # Setup Caddy with Cloudflare DNS and your domain - API only
       virtualHosts = {
         ${cfg.domain} = {
-          # Main domain configuration for API only
           extraConfig = ''
             # API reverse proxy
             reverse_proxy /* http://127.0.0.1:${toString cfg.port}
@@ -167,15 +150,13 @@ in
       };
     };
 
-    # Set environment variables for Cloudflare API token if file is provided
     systemd.services.caddy.environment = mkIf (cfg.cloudflareApiTokenFile != "") {
       CLOUDFLARE_API_TOKEN = "$(cat ${cfg.cloudflareApiTokenFile})";
     };
 
-    # Tailscale integration (optional)
     services.tailscale = mkIf cfg.exposeThroughTailscale {
       enable = true;
-      authKeyFile = mkDefault config.sops.secrets.tailscale_key.path;
+      authKeyFile = if cfg.tailscaleAuthKey != "" then cfg.tailscaleAuthKey else "{env.TS_AUTHKEY}";
       extraUpFlags = [
         "--advertise-tags=${concatStringsSep "," cfg.tailscaleTags}"
       ];
