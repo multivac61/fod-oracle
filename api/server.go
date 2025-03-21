@@ -74,6 +74,7 @@ func (s *Server) routes() {
 	s.router.Get("/api/revision/{rev}", s.handleGetRevisionByHash)
 	s.router.Get("/api/fods", s.handleGetFODs)
 	s.router.Get("/api/fods/{hash}", s.handleGetFODByHash)
+	s.router.Get("/api/commit/{commit}/fods", s.handleGetFODsByCommit)
 	s.router.Get("/api/stats", s.handleGetStats)
 	s.router.Get("/api/compare", s.handleCompareRevisions)
 }
@@ -518,4 +519,102 @@ func (s *Server) handleGetRevisionByHash(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondJSON(w, http.StatusOK, rev)
+}
+
+// handleGetFODsByCommit returns all FODs associated with a specific nixpkgs commit
+func (s *Server) handleGetFODsByCommit(w http.ResponseWriter, r *http.Request) {
+	commit := chi.URLParam(r, "commit")
+	if commit == "" {
+		respondError(w, http.StatusBadRequest, "Commit hash is required")
+		return
+	}
+
+	// Parse pagination parameters
+	limitStr := r.URL.Query().Get("limit")
+	offsetStr := r.URL.Query().Get("offset")
+
+	limit := 100
+	if limitStr != "" {
+		parsedLimit, err := strconv.Atoi(limitStr)
+		if err == nil && parsedLimit > 0 && parsedLimit <= 1000 {
+			limit = parsedLimit
+		}
+	}
+
+	offset := 0
+	if offsetStr != "" {
+		parsedOffset, err := strconv.Atoi(offsetStr)
+		if err == nil && parsedOffset >= 0 {
+			offset = parsedOffset
+		}
+	}
+
+	// First, check if the commit exists and get its ID
+	var revisionID int64
+	err := s.db.QueryRow("SELECT id FROM revisions WHERE rev = ?", commit).Scan(&revisionID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondError(w, http.StatusNotFound, "Commit not found in database")
+		} else {
+			respondError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	// Get the total count for pagination metadata
+	var total int
+	err = s.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM drv_revisions dr
+		WHERE dr.revision_id = ?
+	`, revisionID).Scan(&total)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Get FODs for this revision with pagination
+	query := `
+		SELECT f.drv_path, f.output_path, f.hash_algorithm, f.hash
+		FROM fods f
+		JOIN drv_revisions dr ON f.drv_path = dr.drv_path
+		WHERE dr.revision_id = ?
+		ORDER BY f.drv_path
+		LIMIT ? OFFSET ?
+	`
+
+	rows, err := s.db.Query(query, revisionID, limit, offset)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var fods []FOD
+	for rows.Next() {
+		var fod FOD
+		if err := rows.Scan(&fod.DrvPath, &fod.OutputPath, &fod.HashAlgorithm, &fod.Hash); err != nil {
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		fods = append(fods, fod)
+	}
+
+	if err := rows.Err(); err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Create a response with pagination metadata
+	response := map[string]interface{}{
+		"data": fods,
+		"pagination": map[string]interface{}{
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+		},
+		"commit": commit,
+	}
+
+	respondJSON(w, http.StatusOK, response)
 }

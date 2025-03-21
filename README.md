@@ -77,6 +77,7 @@ The following API endpoints are available:
 - `GET /api/revision/{rev}` - Get details for a specific revision by git hash
 - `GET /api/fods` - List FODs (with pagination)
 - `GET /api/fods/{hash}` - Find FODs by hash
+- `GET /api/commit/{commit}/fods` - List all FODs associated with a specific nixpkgs commit hash (with pagination)
 - `GET /api/stats` - Get database statistics
 - `GET /api/compare` - Compare FODs between revisions
 
