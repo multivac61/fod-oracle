@@ -36,30 +36,120 @@ type DrvRevision struct {
 
 // exprFileStats tracks statistics for each expression file evaluation
 type exprFileStats struct {
-	exists          bool
-	attempted       bool
-	succeeded       bool
-	errorMessage    string
+	exists           bool
+	attempted        bool
+	succeeded        bool
+	errorMessage     string
 	derivationsFound int
-	
-	// Fields for database storage
-	revisionID     int64  // References revisions.id
-	filePath       string // Relative path to the file
-	evaluationTime time.Time
+}
+
+// NeofetchInfo represents the parsed JSON output from neofetch
+type NeofetchInfo struct {
+	Host         string `json:"Host"`
+	CPU          string `json:"CPU"`
+	Cores        string `json:"CPU Cores"`
+	Memory       string `json:"Memory"`
+	Kernel       string `json:"Kernel"`
+	OS           string `json:"OS"`
+	Shell        string `json:"Shell"`
+	Resolution   string `json:"Resolution"`
+	DE           string `json:"DE"`
+	WM           string `json:"WM"`
+	Terminal     string `json:"Terminal"`
+	TerminalFont string `json:"Terminal Font"`
+	CPUUsage     string `json:"CPU Usage"`
+	DiskUsage    string `json:"Disk"`
+	Battery      string `json:"Battery"`
+	LocalIP      string `json:"Local IP"`
+	PublicIP     string `json:"Public IP"`
+	Uptime       string `json:"Uptime"`
+
+	// Add other fields that might be present in neofetch output
+	// The raw JSON string is also stored, so we don't lose any fields
 }
 
 // Default number of workers for nix-eval-jobs
 var workers = 16
 
+// systemInfo holds the neofetch JSON data
+var systemInfoJSON string
+
+// systemInfo holds the parsed neofetch data
+var systemInfo NeofetchInfo
+
+// getCPUCores extracts the number of cores from neofetch CPU cores field
+func getCPUCores(coresStr string) int {
+	// Handle format like "8 (16)" (8 physical, 16 logical)
+	if strings.Contains(coresStr, "(") {
+		parts := strings.Split(coresStr, "(")
+		if len(parts) >= 2 {
+			logical := strings.TrimRight(parts[1], ")")
+			if cores, err := strconv.Atoi(strings.TrimSpace(logical)); err == nil {
+				return cores
+			}
+		}
+	}
+
+	// Try to parse as a number (logic cores)
+	if cores, err := strconv.Atoi(strings.TrimSpace(coresStr)); err == nil {
+		return cores
+	}
+
+	// Fallback to runtime.NumCPU()
+	return runtime.NumCPU()
+}
+
+// getSystemInfo collects information about the system using neofetch
+func getSystemInfo() (NeofetchInfo, string) {
+	// Default fallback info
+	info := NeofetchInfo{
+		Host:   "unknown",
+		CPU:    "unknown",
+		Cores:  fmt.Sprintf("%d", runtime.NumCPU()),
+		Memory: "unknown",
+		Kernel: runtime.GOOS,
+		OS:     runtime.GOOS + "/" + runtime.GOARCH,
+	}
+
+	// Get hostname as a fallback
+	if hostname, err := os.Hostname(); err == nil {
+		info.Host = hostname
+	}
+
+	// Try to run neofetch via nix
+	cmd := exec.Command("neofetch", "--stdout", "--json")
+	output, err := cmd.Output()
+	if err != nil {
+		log.Printf("Warning: Failed to run neofetch: %v. Using basic system info.", err)
+		jsonData, _ := json.Marshal(info)
+		return info, string(jsonData)
+	}
+
+	// Parse the JSON output
+	jsonStr := string(output)
+	if err := json.Unmarshal([]byte(jsonStr), &info); err != nil {
+		log.Printf("Warning: Failed to parse neofetch JSON: %v. Using basic system info.", err)
+		jsonData, _ := json.Marshal(info)
+		return info, string(jsonData)
+	}
+
+	return info, jsonStr
+}
+
 // init initializes configuration from environment variables
 func init() {
+	// Collect system information
+	var jsonStr string
+	systemInfo, jsonStr = getSystemInfo()
+	systemInfoJSON = jsonStr
+
 	// Check for custom worker count in environment
 	if workersEnv := os.Getenv("FOD_ORACLE_NUM_WORKERS"); workersEnv != "" {
 		if w, err := strconv.Atoi(workersEnv); err == nil && w > 0 {
 			workers = w
 			log.Printf("Using %d workers from FOD_ORACLE_NUM_WORKERS environment variable", workers)
 		} else if err != nil {
-			log.Printf("Warning: Invalid FOD_ORACLE_NUM_WORKERS value '%s': %v. Using default: %d", 
+			log.Printf("Warning: Invalid FOD_ORACLE_NUM_WORKERS value '%s': %v. Using default: %d",
 				workersEnv, err, workers)
 		}
 	}
@@ -165,6 +255,13 @@ func initDB() *sql.DB {
         processing_time_seconds INTEGER DEFAULT 0,
         worker_count INTEGER DEFAULT 0,
         memory_mb_peak INTEGER DEFAULT 0,
+        system_info TEXT,                      -- JSON from neofetch
+        host_name TEXT,                        -- Extracted from system_info for easy querying
+        cpu_model TEXT,                        -- Extracted from system_info for easy querying
+        cpu_cores INTEGER DEFAULT 0,           -- Extracted from system_info for easy querying
+        memory_total TEXT,                     -- Extracted from system_info for easy querying
+        kernel_version TEXT,                   -- Extracted from system_info for easy querying
+        os_name TEXT,                          -- Extracted from system_info for easy querying
         evaluation_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
     );
@@ -596,7 +693,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		for range ticker.C {
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
-			
+
 			// Update peak memory if higher
 			allocMB := int(m.Alloc / 1024 / 1024)
 			memoryMutex.Lock()
@@ -604,7 +701,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 				peakMemoryMB = allocMB
 			}
 			memoryMutex.Unlock()
-			
+
 			log.Printf("[%s] Memory: Alloc=%dMB TotalAlloc=%dMB Sys=%dMB (Peak=%dMB)",
 				rev, allocMB, m.TotalAlloc/1024/1024, m.Sys/1024/1024, peakMemoryMB)
 		}
@@ -649,7 +746,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 
 	// Variable to track if fallback was used
 	usedFallback := false
-	
+
 	// Variable to hold evaluation metadata
 	fileStats := make(map[string]*exprFileStats)
 
@@ -657,18 +754,18 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	log.Printf("[%s] Running nix-eval-jobs with %d workers to populate work queue", rev, workers)
 	if err := streamNixEvalJobs(rev, worktreeDir, workers, drvPathChan, fileStats, &usedFallback); err != nil {
 		close(drvPathChan)
-		
+
 		// Store metadata even if there was an error
 		processingTime := time.Since(revStartTime)
 		memoryMutex.Lock()
 		currentPeakMemory := peakMemoryMB
 		memoryMutex.Unlock()
-		
-		if storeErr := storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir, 
+
+		if storeErr := storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir,
 			processingTime, usedFallback, currentPeakMemory); storeErr != nil {
 			log.Printf("[%s] Error storing evaluation metadata: %v", rev, storeErr)
 		}
-		
+
 		return fmt.Errorf("failed to run nix-eval-jobs: %w", err)
 	}
 	close(drvPathChan)
@@ -691,26 +788,30 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		log.Printf("[%s] Error counting FODs: %v", rev, err)
 	}
 	log.Printf("[%s] Final stats: %d FODs", rev, fodCount)
-	
+
 	// Store the evaluation metadata in the database
 	memoryMutex.Lock()
 	finalPeakMemory := peakMemoryMB
 	memoryMutex.Unlock()
-	
-	if err := storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir, 
+
+	if err := storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir,
 		revElapsed, usedFallback, finalPeakMemory); err != nil {
 		log.Printf("[%s] Error storing evaluation metadata: %v", rev, err)
 	} else {
+		cpuCores := getCPUCores(systemInfo.Cores)
 		log.Printf("[%s] Successfully stored evaluation metadata in database (workers=%d, peak memory=%dMB)",
 			rev, workers, finalPeakMemory)
+		log.Printf("[%s] System info: %s, %s, %s, %d cores",
+			rev, systemInfo.Host, systemInfo.OS, systemInfo.CPU, cpuCores)
 	}
-	
+
 	return nil
 }
 
 // streamNixEvalJobs runs nix-eval-jobs and streams results to the provided channel
-func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan chan<- string, 
-	fileStats map[string]*exprFileStats, usedFallback *bool) error {
+func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan chan<- string,
+	fileStats map[string]*exprFileStats, usedFallback *bool,
+) error {
 	log.Printf("[%s] Running nix-eval-jobs with nixpkgs at %s (%d worker threads)", rev, nixpkgsDir, workers)
 
 	// Define all possible Nix expression files that could be evaluated
@@ -726,26 +827,15 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 		filepath.Join(nixpkgsDir, "default.nix"),
 	}
 
-	// Begin collecting stats for the expression files
-	type exprFileStats struct {
-		exists          bool
-		attempted       bool
-		succeeded       bool
-		errorMessage    string
-		derivationsFound int
-	}
-	fileStats := make(map[string]*exprFileStats)
-	
+	// // Begin collecting stats for the expression files
+	// fileStats = make(map[string]*exprFileStats)
+
 	// Check which expression files exist and initialize stats
 	var existingPaths []string
 	for _, path := range possiblePaths {
 		relPath, _ := filepath.Rel(nixpkgsDir, path)
-		fileStats[path] = &exprFileStats{
-			revisionID: 0, // Will be set later in the storeEvaluationMetadata function
-			filePath: relPath,
-			evaluationTime: time.Now(),
-		}
-		
+		fileStats[path] = &exprFileStats{}
+
 		if _, err := os.Stat(path); err == nil {
 			fileStats[path].exists = true
 			existingPaths = append(existingPaths, path)
@@ -768,7 +858,7 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 	for _, expressionPath := range existingPaths {
 		relPath, _ := filepath.Rel(nixpkgsDir, expressionPath)
 		stats := fileStats[expressionPath]
-		
+
 		log.Printf("[%s] Attempting to evaluate expression file: %s", rev, relPath)
 		stats.attempted = true
 
@@ -831,7 +921,7 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 				log.Printf("[%s] Failed to parse JSON from %s: %v", rev, relPath, err)
 				continue
 			}
-			
+
 			// Only count each derivation once per file and globally
 			if result.DrvPath != "" {
 				fileVisited[result.DrvPath] = true
@@ -840,7 +930,7 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 					totalJobCount++
 					drvPathChan <- result.DrvPath
 				}
-				
+
 				jobCount++
 				if jobCount%1000 == 0 {
 					log.Printf("[%s] Processed %d jobs from %s (unique in this file: %d, global total: %d)",
@@ -868,11 +958,11 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 			} else {
 				stats.errorMessage = fmt.Sprintf("Exit error: %v", err)
 			}
-			log.Printf("[%s] nix-eval-jobs for %s exited with error, but processed %d derivations (found %d unique)", 
+			log.Printf("[%s] nix-eval-jobs for %s exited with error, but processed %d derivations (found %d unique)",
 				rev, relPath, jobCount, len(fileVisited))
 		} else {
 			stats.succeeded = true
-			log.Printf("[%s] nix-eval-jobs for %s completed successfully with %d derivations (found %d unique)", 
+			log.Printf("[%s] nix-eval-jobs for %s completed successfully with %d derivations (found %d unique)",
 				rev, relPath, jobCount, len(fileVisited))
 		}
 	}
@@ -888,22 +978,19 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 
 	// If no jobs were found, try the fallback mechanism
 	log.Printf("[%s] No jobs found with nix-eval-jobs, trying fallback with nix-instantiate...", rev)
-	
+
 	// Mark that we're using the fallback mechanism
 	*usedFallback = true
-	
+
 	// Add fallback to stats tracking
 	fallbackPath := filepath.Join(nixpkgsDir, "fallback-extract.nix")
 	relFallbackPath := "fallback-extract.nix"
 	fallbackStats := &exprFileStats{
-		exists: false, 
+		exists:    false,
 		attempted: true,
-		revisionID: 0, // Will be set later in the storeEvaluationMetadata function
-		filePath: relFallbackPath,
-		evaluationTime: time.Now(),
 	}
 	fileStats[fallbackPath] = fallbackStats
-	
+
 	// Create a simple Nix file that tries to extract derivations from basic packages
 	fallbackNixContent := `
 let
@@ -945,26 +1032,25 @@ in drvPaths
 		errMsg := fmt.Sprintf("Failed to write fallback Nix file: %v", err)
 		fallbackStats.errorMessage = errMsg
 		log.Printf("[%s] %s", rev, errMsg)
-		
+
 		// Print the final status summary including fallback
 		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
-		
+
 		return fmt.Errorf("nix-eval-jobs failed and fallback creation failed: %w", err)
 	}
-	
+
 	fallbackStats.exists = true
-	
+
 	// Try to evaluate with nix-instantiate
 	log.Printf("[%s] Running fallback with nix-instantiate on %s", rev, relFallbackPath)
 	fallbackCmd := exec.Command("nix-instantiate", "--eval", "--json", fallbackPath)
 	fallbackCmd.Dir = nixpkgsDir // Set working directory to nixpkgs dir
 	fallbackOutput, err := fallbackCmd.Output()
-	
 	if err != nil {
 		errMsg := fmt.Sprintf("Fallback with nix-instantiate failed: %v", err)
 		fallbackStats.errorMessage = errMsg
 		log.Printf("[%s] %s", rev, errMsg)
-		
+
 		// Try one more fallback with a simpler expression for very old Nixpkgs
 		log.Printf("[%s] Trying simpler fallback expression...", rev)
 		simpleFallbackContent := `
@@ -975,58 +1061,55 @@ in drvPaths
 `
 		// Add simple fallback to stats
 		simpleFallbackPath := filepath.Join(nixpkgsDir, "simple-fallback.nix")
-		simpleFallbackPath_rel := "simple-fallback.nix"
+		// simpleFallbackPath_rel := "simple-fallback.nix"
 		simpleFallbackStats := &exprFileStats{
-			exists: false, 
+			exists:    false,
 			attempted: true,
-			revisionID: 0, // Will be set later in the storeEvaluationMetadata function
-			filePath: simpleFallbackPath_rel,
-			evaluationTime: time.Now(),
 		}
 		fileStats[simpleFallbackPath] = simpleFallbackStats
-		
+
 		if err := os.WriteFile(simpleFallbackPath, []byte(simpleFallbackContent), 0644); err != nil {
 			errMsg := fmt.Sprintf("Failed to write simple fallback Nix file: %v", err)
 			simpleFallbackStats.errorMessage = errMsg
 			log.Printf("[%s] %s", rev, errMsg)
-			
+
 			// Print the final status summary including all fallbacks
 			printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath, simpleFallbackPath)
-			
+
 			// At least record that we tried this revision
 			log.Printf("[%s] All evaluation methods failed, but recording revision in database", rev)
 			return nil
 		}
-		
+
 		simpleFallbackStats.exists = true
-		
+
 		// Skip trying to evaluate the simple fallback - it's just a last resort attempt
 		// that would likely fail but makes sure we record the revision in the database
 		log.Printf("[%s] All evaluation methods failed, but recording revision in database", rev)
-		
+
 		// Print the final status summary including all fallbacks
 		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath, simpleFallbackPath)
-		
+
 		return nil
 	}
-	
+
 	// Parse the output
 	var drvPaths []string
 	if err := json.Unmarshal(fallbackOutput, &drvPaths); err != nil {
 		errMsg := fmt.Sprintf("Failed to parse fallback output: %v", err)
 		fallbackStats.errorMessage = errMsg
 		log.Printf("[%s] %s", rev, errMsg)
-		
+
 		// Print the final status summary including fallback
 		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
-		
+
 		return fmt.Errorf("fallback output parsing failed: %w", err)
 	}
-	
+
 	// Add the paths to our channel
 	fallbackJobCount := 0
 	fallbackVisited := make(map[string]bool)
-	
+
 	for _, path := range drvPaths {
 		if path != "" {
 			fallbackVisited[path] = true
@@ -1038,37 +1121,37 @@ in drvPaths
 			fallbackJobCount++
 		}
 	}
-	
+
 	fallbackStats.derivationsFound = len(fallbackVisited)
-	
+
 	if len(fallbackVisited) > 0 {
 		fallbackStats.succeeded = true
 		log.Printf("[%s] Fallback found %d basic derivations (%d unique)",
 			rev, fallbackJobCount, len(fallbackVisited))
-		
+
 		// Print the final status summary including fallback
 		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
-		
+
 		return nil
 	}
-	
+
 	log.Printf("[%s] Fallback did not find any derivations", rev)
 	// Print the final status summary including fallback
 	printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
-	
+
 	return fmt.Errorf("all evaluation methods failed for %s", rev)
 }
 
 // storeEvaluationMetadata persists the evaluation metadata to the database
-func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exprFileStats, 
-	nixpkgsDir string, processingTime time.Duration, usedFallback bool, peakMemoryMB int) error {
-	
+func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exprFileStats,
+	nixpkgsDir string, processingTime time.Duration, usedFallback bool, peakMemoryMB int,
+) error {
 	// Begin transaction
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	
+
 	// Deferred function to handle transaction commit/rollback
 	var success bool
 	defer func() {
@@ -1076,7 +1159,7 @@ func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exp
 			tx.Rollback()
 		}
 	}()
-	
+
 	// Prepare statement for inserting metadata
 	metadataStmt, err := tx.Prepare(`
 		INSERT INTO evaluation_metadata (
@@ -1091,87 +1174,92 @@ func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exp
 		return fmt.Errorf("failed to prepare metadata statement: %w", err)
 	}
 	defer metadataStmt.Close()
-	
+
 	// Counters for revision-level stats
 	var totalFound, totalAttempted, totalSucceeded, totalDerivations int
-	
+
 	// Insert metadata for each file
 	for path, stat := range stats {
 		relPath, _ := filepath.Rel(nixpkgsDir, path)
-		
+
 		// Convert boolean to int for SQLite
 		exists := 0
 		if stat.exists {
 			exists = 1
 			totalFound++
 		}
-		
+
 		attempted := 0
 		if stat.attempted {
 			attempted = 1
 			totalAttempted++
 		}
-		
+
 		succeeded := 0
 		if stat.succeeded {
 			succeeded = 1
 			totalSucceeded++
 		}
-		
+
 		totalDerivations += stat.derivationsFound
-		
+
 		// Execute the insert
 		_, err := metadataStmt.Exec(
 			revisionID, relPath, exists, attempted,
 			succeeded, stat.errorMessage, stat.derivationsFound,
-			exists, attempted, succeeded, 
+			exists, attempted, succeeded,
 			stat.errorMessage, stat.derivationsFound)
-		
 		if err != nil {
 			return fmt.Errorf("failed to insert metadata for %s: %w", relPath, err)
 		}
 	}
-	
+
 	// Insert revision-level stats
 	fallbackUsed := 0
 	if usedFallback {
 		fallbackUsed = 1
 	}
-	
+
+	// Parse CPU cores as integer
+	cpuCores := getCPUCores(systemInfo.Cores)
+
 	_, err = tx.Exec(`
 		INSERT INTO revision_stats (
 			revision_id, total_expressions_found, total_expressions_attempted,
 			total_expressions_succeeded, total_derivations_found,
-			fallback_used, processing_time_seconds, worker_count, memory_mb_peak
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			fallback_used, processing_time_seconds, worker_count, memory_mb_peak,
+			system_info, host_name, cpu_model, cpu_cores, memory_total, kernel_version, os_name
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(revision_id) DO UPDATE SET
 		total_expressions_found = ?, total_expressions_attempted = ?,
 		total_expressions_succeeded = ?, total_derivations_found = ?,
-		fallback_used = ?, processing_time_seconds = ?, worker_count = ?, memory_mb_peak = ?
-	`, 
-	revisionID, totalFound, totalAttempted, totalSucceeded, totalDerivations,
-	fallbackUsed, int(processingTime.Seconds()), workers, peakMemoryMB,
-	totalFound, totalAttempted, totalSucceeded, totalDerivations,
-	fallbackUsed, int(processingTime.Seconds()), workers, peakMemoryMB)
-	
+		fallback_used = ?, processing_time_seconds = ?, worker_count = ?, memory_mb_peak = ?,
+		system_info = ?, host_name = ?, cpu_model = ?, cpu_cores = ?, memory_total = ?, kernel_version = ?, os_name = ?
+	`,
+		revisionID, totalFound, totalAttempted, totalSucceeded, totalDerivations,
+		fallbackUsed, int(processingTime.Seconds()), workers, peakMemoryMB,
+		systemInfoJSON, systemInfo.Host, systemInfo.CPU, cpuCores, systemInfo.Memory, systemInfo.Kernel, systemInfo.OS,
+		totalFound, totalAttempted, totalSucceeded, totalDerivations,
+		fallbackUsed, int(processingTime.Seconds()), workers, peakMemoryMB,
+		systemInfoJSON, systemInfo.Host, systemInfo.CPU, cpuCores, systemInfo.Memory, systemInfo.Kernel, systemInfo.OS)
 	if err != nil {
 		return fmt.Errorf("failed to insert revision stats: %w", err)
 	}
-	
+
 	// Commit the transaction
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
-	
+
 	success = true
 	return nil
 }
 
 func printExpressionSummary(rev, nixpkgsDir string, basePaths []string, stats map[string]*exprFileStats, extraPaths ...string) {
 	log.Printf("[%s] Expression file evaluation summary:", rev)
-	log.Printf("[%s] %-50s %-10s %-10s %-10s %-10s %s", 
+	log.Printf("[%s] %-50s %-10s %-10s %-10s %-10s %s",
 		rev, "FILE", "EXISTS", "ATTEMPTED", "SUCCEEDED", "DERIVATIONS", "ERROR")
-	
+
 	// First print the base paths
 	for _, path := range basePaths {
 		relPath, _ := filepath.Rel(nixpkgsDir, path)
@@ -1185,12 +1273,12 @@ func printExpressionSummary(rev, nixpkgsDir string, basePaths []string, stats ma
 					errorSummary = s.errorMessage
 				}
 			}
-			log.Printf("[%s] %-50s %-10t %-10t %-10t %-10d %s", 
-				rev, relPath, s.exists, s.attempted, s.succeeded, 
+			log.Printf("[%s] %-50s %-10t %-10t %-10t %-10d %s",
+				rev, relPath, s.exists, s.attempted, s.succeeded,
 				s.derivationsFound, errorSummary)
 		}
 	}
-	
+
 	// Then print any extra paths (fallbacks)
 	for _, path := range extraPaths {
 		relPath, _ := filepath.Rel(nixpkgsDir, path)
@@ -1204,8 +1292,8 @@ func printExpressionSummary(rev, nixpkgsDir string, basePaths []string, stats ma
 					errorSummary = s.errorMessage
 				}
 			}
-			log.Printf("[%s] %-50s %-10t %-10t %-10t %-10d %s", 
-				rev, relPath, s.exists, s.attempted, s.succeeded, 
+			log.Printf("[%s] %-50s %-10t %-10t %-10t %-10d %s",
+				rev, relPath, s.exists, s.attempted, s.succeeded,
 				s.derivationsFound, errorSummary)
 		}
 	}
@@ -1341,7 +1429,14 @@ func cleanupWorktrees() error {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Println("Starting FOD finder...")
+
+	// Get CPU cores as an integer
+	// cpuCores := getCPUCores(systemInfo.Cores)
+
 	log.Printf("Configuration: %d worker threads", workers)
+	log.Printf("System: %s, CPU: %s (%s), Memory: %s",
+		systemInfo.Host, systemInfo.CPU, systemInfo.Cores, systemInfo.Memory)
+	log.Printf("OS: %s, Kernel: %s", systemInfo.OS, systemInfo.Kernel)
 
 	// Clean up any leftover worktrees from previous runs
 	if err := cleanupWorktrees(); err != nil {

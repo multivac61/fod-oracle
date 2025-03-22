@@ -9,6 +9,14 @@ buildGoModule {
   nativeBuildInputs = [ makeWrapper ];
   postFixup = ''
     wrapProgram $out/bin/fod-oracle \
-      --prefix PATH : ${lib.makeBinPath [ pkgs.nix-eval-jobs ]}
+      --prefix PATH : ${
+        lib.makeBinPath (
+          with pkgs;
+          [
+            nix-eval-jobs
+            neofetch
+          ]
+        )
+      }
   '';
 }
