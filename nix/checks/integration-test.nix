@@ -111,11 +111,11 @@ if pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
                   revision_id, file_path, file_exists, attempted, 
                   succeeded, error_message, derivations_found
                 ) VALUES
-                  (1, 'pkgs/top-level/release.nix', 1, 1, 1, '', 42),
+                  (1, 'pkgs/top-level/release.nix', 1, 1, 1, null, 42),
                   (1, 'pkgs/top-level/default.nix', 1, 1, 0, 'Failed to evaluate', 0),
-                  (1, 'pkgs/top-level/all-packages.nix', 1, 0, 0, '', 0),
-                  (2, 'pkgs/top-level/release.nix', 1, 1, 1, '', 53),
-                  (2, 'pkgs/top-level/all-packages.nix', 1, 1, 1, '', 128);
+                  (1, 'pkgs/top-level/all-packages.nix', 1, 0, 0, null, 0),
+                  (2, 'pkgs/top-level/release.nix', 1, 1, 1, null, 53),
+                  (2, 'pkgs/top-level/all-packages.nix', 1, 1, 1, null, 128);
                   
                 -- Add test data for revision_stats
                 INSERT INTO revision_stats (
