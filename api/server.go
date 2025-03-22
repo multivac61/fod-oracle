@@ -77,6 +77,10 @@ func (s *Server) routes() {
 	s.router.Get("/api/commit/{commit}/fods", s.handleGetFODsByCommit)
 	s.router.Get("/api/stats", s.handleGetStats)
 	s.router.Get("/api/compare", s.handleCompareRevisions)
+	
+	// New endpoints for evaluation metadata and stats
+	s.router.Get("/api/evaluation-metadata", s.handleGetEvaluationMetadata)
+	s.router.Get("/api/revision-stats", s.handleGetRevisionStats)
 }
 
 // ServeHTTP implements the http.Handler interface
@@ -502,6 +506,219 @@ func respondJSON(w http.ResponseWriter, status int, data interface{}) {
 // respondError sends an error response
 func respondError(w http.ResponseWriter, status int, message string) {
 	respondJSON(w, status, map[string]string{"error": message})
+}
+
+// EvaluationMetadata represents file evaluation metadata
+type EvaluationMetadata struct {
+	ID               int64     `json:"id"`
+	RevisionID       int64     `json:"revision_id"`
+	FilePath         string    `json:"file_path"`
+	FileExists       bool      `json:"file_exists"`
+	Attempted        bool      `json:"attempted"`
+	Succeeded        bool      `json:"succeeded"`
+	ErrorMessage     string    `json:"error_message"`
+	DerivationsFound int       `json:"derivations_found"`
+	EvaluationTime   time.Time `json:"evaluation_time"`
+}
+
+// handleGetEvaluationMetadata returns evaluation metadata for a specific revision
+func (s *Server) handleGetEvaluationMetadata(w http.ResponseWriter, r *http.Request) {
+	revIDStr := r.URL.Query().Get("revision_id")
+	if revIDStr == "" {
+		respondError(w, http.StatusBadRequest, "revision_id query parameter is required")
+		return
+	}
+
+	revID, err := strconv.ParseInt(revIDStr, 10, 64)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid revision ID format")
+		return
+	}
+
+	// Verify the revision exists
+	var exists bool
+	err = s.db.QueryRow("SELECT 1 FROM revisions WHERE id = ?", revID).Scan(&exists)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondError(w, http.StatusNotFound, "Revision not found")
+		} else {
+			respondError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	// Query evaluation metadata for this revision
+	rows, err := s.db.Query(`
+		SELECT id, revision_id, file_path, file_exists, attempted, 
+		       succeeded, error_message, derivations_found, evaluation_time
+		FROM evaluation_metadata
+		WHERE revision_id = ?
+		ORDER BY file_path
+	`, revID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var metadata []EvaluationMetadata
+	for rows.Next() {
+		var m EvaluationMetadata
+		var fileExists, attempted, succeeded int
+		var errorMsg sql.NullString
+
+		err := rows.Scan(
+			&m.ID, &m.RevisionID, &m.FilePath, &fileExists, &attempted,
+			&succeeded, &errorMsg, &m.DerivationsFound, &m.EvaluationTime,
+		)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		// Convert integer flags to booleans
+		m.FileExists = fileExists != 0
+		m.Attempted = attempted != 0
+		m.Succeeded = succeeded != 0
+		
+		// Handle nullable error message
+		if errorMsg.Valid {
+			m.ErrorMessage = errorMsg.String
+		} else {
+			m.ErrorMessage = ""
+		}
+
+		metadata = append(metadata, m)
+	}
+
+	if err := rows.Err(); err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, metadata)
+}
+
+// RevisionStats represents revision-level statistics
+type RevisionStats struct {
+	RevisionID               int64     `json:"revision_id"`
+	TotalExpressionsFound    int       `json:"total_expressions_found"`
+	TotalExpressionsAttempted int       `json:"total_expressions_attempted"`
+	TotalExpressionsSucceeded int       `json:"total_expressions_succeeded"`
+	TotalDerivationsFound    int       `json:"total_derivations_found"`
+	FallbackUsed             bool      `json:"fallback_used"`
+	ProcessingTimeSeconds    int       `json:"processing_time_seconds"`
+	WorkerCount              int       `json:"worker_count"`
+	MemoryMBPeak             int       `json:"memory_mb_peak"`
+	SystemInfo               string    `json:"system_info"`
+	HostName                 string    `json:"host_name"`
+	CPUModel                 string    `json:"cpu_model"`
+	CPUCores                 int       `json:"cpu_cores"`
+	MemoryTotal              string    `json:"memory_total"`
+	KernelVersion            string    `json:"kernel_version"`
+	OSName                   string    `json:"os_name"`
+	EvaluationTimestamp      time.Time `json:"evaluation_timestamp"`
+}
+
+// handleGetRevisionStats returns evaluation statistics for a specific revision
+func (s *Server) handleGetRevisionStats(w http.ResponseWriter, r *http.Request) {
+	revIDStr := r.URL.Query().Get("revision_id")
+	if revIDStr == "" {
+		respondError(w, http.StatusBadRequest, "revision_id query parameter is required")
+		return
+	}
+
+	revID, err := strconv.ParseInt(revIDStr, 10, 64)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "Invalid revision ID format")
+		return
+	}
+
+	// Verify the revision exists
+	var exists bool
+	err = s.db.QueryRow("SELECT 1 FROM revisions WHERE id = ?", revID).Scan(&exists)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondError(w, http.StatusNotFound, "Revision not found")
+		} else {
+			respondError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	// Query revision stats
+	var stats RevisionStats
+	var fallbackUsed int
+	var sysInfo, hostName, cpuModel, memTotal, kernelVer, osName sql.NullString
+	var timestamp sql.NullString
+
+	err = s.db.QueryRow(`
+		SELECT 
+			revision_id, total_expressions_found, total_expressions_attempted,
+			total_expressions_succeeded, total_derivations_found,
+			fallback_used, processing_time_seconds, worker_count, memory_mb_peak,
+			system_info, host_name, cpu_model, cpu_cores, memory_total, 
+			kernel_version, os_name, evaluation_timestamp
+		FROM revision_stats
+		WHERE revision_id = ?
+	`, revID).Scan(
+		&stats.RevisionID, &stats.TotalExpressionsFound, &stats.TotalExpressionsAttempted,
+		&stats.TotalExpressionsSucceeded, &stats.TotalDerivationsFound,
+		&fallbackUsed, &stats.ProcessingTimeSeconds, &stats.WorkerCount, &stats.MemoryMBPeak,
+		&sysInfo, &hostName, &cpuModel, &stats.CPUCores, &memTotal,
+		&kernelVer, &osName, &timestamp,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondError(w, http.StatusNotFound, "No statistics found for this revision")
+		} else {
+			respondError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	// Convert integer flags to booleans
+	stats.FallbackUsed = fallbackUsed != 0
+	
+	// Handle nullable strings
+	if sysInfo.Valid {
+		stats.SystemInfo = sysInfo.String
+	}
+	if hostName.Valid {
+		stats.HostName = hostName.String
+	}
+	if cpuModel.Valid {
+		stats.CPUModel = cpuModel.String
+	}
+	if memTotal.Valid {
+		stats.MemoryTotal = memTotal.String
+	}
+	if kernelVer.Valid {
+		stats.KernelVersion = kernelVer.String
+	}
+	if osName.Valid {
+		stats.OSName = osName.String
+	}
+	
+	// Parse timestamp
+	if timestamp.Valid {
+		var err error
+		// Try parsing with format from database
+		stats.EvaluationTimestamp, err = time.Parse("2006-01-02 15:04:05", timestamp.String)
+		if err != nil {
+			// If that fails, try ISO format
+			stats.EvaluationTimestamp, err = time.Parse(time.RFC3339, timestamp.String)
+			if err != nil {
+				// If all parsing fails, use current time as fallback
+				stats.EvaluationTimestamp = time.Now()
+			}
+		}
+	} else {
+		stats.EvaluationTimestamp = time.Now()
+	}
+
+	respondJSON(w, http.StatusOK, stats)
 }
 
 // handleGetRevisionByHash returns details about a specific revision by its git hash
