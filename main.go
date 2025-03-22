@@ -33,6 +33,15 @@ type DrvRevision struct {
 	RevisionID int64
 }
 
+// exprFileStats tracks statistics for each expression file evaluation
+type exprFileStats struct {
+	exists          bool
+	attempted       bool
+	succeeded       bool
+	errorMessage    string
+	derivationsFound int
+}
+
 var workers = 16
 
 // initDB initializes the SQLite database
@@ -606,110 +615,179 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan chan<- string) error {
 	log.Printf("[%s] Running nix-eval-jobs with nixpkgs at %s", rev, nixpkgsDir)
 
-	// Check multiple possible Nix expression files in order of preference
+	// Define all possible Nix expression files that could be evaluated
 	possiblePaths := []string{
 		filepath.Join(nixpkgsDir, "pkgs/top-level/release-outpaths.nix"),
+		filepath.Join(nixpkgsDir, "pkgs/top-level/release.nix"),
+		filepath.Join(nixpkgsDir, "pkgs/top-level/release-small.nix"),
 		filepath.Join(nixpkgsDir, "pkgs/top-level/all-packages.nix"),
+		filepath.Join(nixpkgsDir, "nixos/release.nix"),
+		filepath.Join(nixpkgsDir, "nixos/release-small.nix"),
+		filepath.Join(nixpkgsDir, "nixos/release-combined.nix"),
 		filepath.Join(nixpkgsDir, "all-packages.nix"),
 		filepath.Join(nixpkgsDir, "default.nix"),
 	}
 
-	var expressionPath string
+	// Begin collecting stats for the expression files
+	fileStats := make(map[string]*exprFileStats)
+	
+	// Check which expression files exist and initialize stats
+	var existingPaths []string
 	for _, path := range possiblePaths {
+		relPath, _ := filepath.Rel(nixpkgsDir, path)
+		fileStats[path] = &exprFileStats{}
+		
 		if _, err := os.Stat(path); err == nil {
-			expressionPath = path
-			log.Printf("[%s] Found Nix expression file: %s", rev, expressionPath)
-			break
+			fileStats[path].exists = true
+			existingPaths = append(existingPaths, path)
+			log.Printf("[%s] Found Nix expression file: %s", rev, relPath)
+		} else {
+			log.Printf("[%s] Expression file does not exist: %s", rev, relPath)
 		}
 	}
 
-	if expressionPath == "" {
-		return fmt.Errorf("no suitable Nix expression file found in %s", nixpkgsDir)
+	// We'll try using the fallback mechanism if no files exist
+	if len(existingPaths) == 0 {
+		log.Printf("[%s] Warning: No suitable Nix expression files found in %s, will try fallback mechanism", rev, nixpkgsDir)
 	}
 
-	// Build the command with the specific Nix expression path and arguments
-	cmd := exec.Command("nix-eval-jobs",
-		expressionPath,
-		"--arg", "checkMeta", "false",
-		"--workers", fmt.Sprintf("%d", workers),
-		"--max-memory-size", "4096",
-		"--option", "allow-import-from-derivation", "false")
+	totalJobCount := 0
+	// Global deduplication map across all expression files
+	globalVisited := make(map[string]bool)
 
-	// Capture stdout
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
+	// Evaluate each expression file
+	for _, expressionPath := range existingPaths {
+		relPath, _ := filepath.Rel(nixpkgsDir, expressionPath)
+		stats := fileStats[expressionPath]
+		
+		log.Printf("[%s] Attempting to evaluate expression file: %s", rev, relPath)
+		stats.attempted = true
 
-	// Capture stderr instead of redirecting to /dev/null
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stderr pipe: %w", err)
-	}
+		// Build the command with the specific Nix expression path and arguments
+		cmd := exec.Command("nix-eval-jobs",
+			expressionPath,
+			"--arg", "checkMeta", "false",
+			"--workers", fmt.Sprintf("%d", workers),
+			"--max-memory-size", "4096",
+			"--option", "allow-import-from-derivation", "false")
 
-	// Start capturing stderr in a goroutine
-	stderrChan := make(chan string, 1)
-	go func() {
-		stderrBytes, _ := io.ReadAll(stderr)
-		stderrChan <- string(stderrBytes)
-	}()
-
-	err = cmd.Start()
-	if err != nil {
-		return fmt.Errorf("failed to start nix-eval-jobs: %w", err)
-	}
-
-	// Process stdout as before
-	scanner := bufio.NewScanner(stdout)
-	const maxScannerSize = 10 * 1024 * 1024
-	buf := make([]byte, maxScannerSize)
-	scanner.Buffer(buf, maxScannerSize)
-
-	jobCount := 0
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		var result struct {
-			DrvPath string `json:"drvPath"`
-		}
-		if err := json.Unmarshal([]byte(line), &result); err != nil {
-			log.Printf("[%s] Failed to parse JSON: %v", rev, err)
+		// Capture stdout
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			errMsg := fmt.Sprintf("Failed to create stdout pipe: %v", err)
+			stats.errorMessage = errMsg
+			log.Printf("[%s] %s for %s", rev, errMsg, relPath)
 			continue
 		}
-		if result.DrvPath != "" {
-			jobCount++
-			if jobCount%1000 == 0 {
-				log.Printf("[%s] Processed %d jobs from nix-eval-jobs", rev, jobCount)
+
+		// Capture stderr
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			errMsg := fmt.Sprintf("Failed to create stderr pipe: %v", err)
+			stats.errorMessage = errMsg
+			log.Printf("[%s] %s for %s", rev, errMsg, relPath)
+			continue
+		}
+
+		// Start capturing stderr in a goroutine
+		stderrChan := make(chan string, 1)
+		go func() {
+			stderrBytes, _ := io.ReadAll(stderr)
+			stderrChan <- string(stderrBytes)
+		}()
+
+		err = cmd.Start()
+		if err != nil {
+			errMsg := fmt.Sprintf("Failed to start nix-eval-jobs: %v", err)
+			stats.errorMessage = errMsg
+			log.Printf("[%s] %s for %s", rev, errMsg, relPath)
+			continue
+		}
+
+		// Process stdout
+		scanner := bufio.NewScanner(stdout)
+		const maxScannerSize = 10 * 1024 * 1024
+		buf := make([]byte, maxScannerSize)
+		scanner.Buffer(buf, maxScannerSize)
+
+		jobCount := 0
+		fileVisited := make(map[string]bool)
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			var result struct {
+				DrvPath string `json:"drvPath"`
 			}
-			drvPathChan <- result.DrvPath
+			if err := json.Unmarshal([]byte(line), &result); err != nil {
+				log.Printf("[%s] Failed to parse JSON from %s: %v", rev, relPath, err)
+				continue
+			}
+			
+			// Only count each derivation once per file and globally
+			if result.DrvPath != "" {
+				fileVisited[result.DrvPath] = true
+				if !globalVisited[result.DrvPath] {
+					globalVisited[result.DrvPath] = true
+					totalJobCount++
+					drvPathChan <- result.DrvPath
+				}
+				
+				jobCount++
+				if jobCount%1000 == 0 {
+					log.Printf("[%s] Processed %d jobs from %s (unique in this file: %d, global total: %d)",
+						rev, jobCount, relPath, len(fileVisited), totalJobCount)
+				}
+			}
+		}
+
+		stats.derivationsFound = len(fileVisited)
+
+		if err := scanner.Err(); err != nil {
+			errMsg := fmt.Sprintf("Error reading stdout: %v", err)
+			stats.errorMessage = errMsg
+			log.Printf("[%s] %s from %s", rev, errMsg, relPath)
+		}
+
+		// Wait for command to complete
+		err = cmd.Wait()
+		stderrOutput := <-stderrChan
+
+		if err != nil {
+			if stderrOutput != "" {
+				stats.errorMessage = fmt.Sprintf("Exit error: %v\nStderr: %s", err, stderrOutput)
+				log.Printf("[%s] nix-eval-jobs stderr output for %s: %s", rev, relPath, stderrOutput)
+			} else {
+				stats.errorMessage = fmt.Sprintf("Exit error: %v", err)
+			}
+			log.Printf("[%s] nix-eval-jobs for %s exited with error, but processed %d derivations (found %d unique)", 
+				rev, relPath, jobCount, len(fileVisited))
+		} else {
+			stats.succeeded = true
+			log.Printf("[%s] nix-eval-jobs for %s completed successfully with %d derivations (found %d unique)", 
+				rev, relPath, jobCount, len(fileVisited))
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading stdout: %w", err)
+	// Print the summary table of all expression files and their status
+	printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats)
+
+	// If we found some jobs, consider it a success regardless of errors
+	if totalJobCount > 0 {
+		log.Printf("[%s] Total unique derivations found across all expression files: %d", rev, totalJobCount)
+		return nil
 	}
 
-	// Wait for command to complete
-	err = cmd.Wait()
-	stderrOutput := <-stderrChan
-
-	if err != nil {
-		// Log stderr output to help diagnose the issue
-		if stderrOutput != "" {
-			log.Printf("[%s] nix-eval-jobs stderr output: %s", rev, stderrOutput)
-		}
-		// If we processed some jobs, consider it a partial success
-		if jobCount > 0 {
-			log.Printf("[%s] nix-eval-jobs exited with error but processed %d jobs, continuing", rev, jobCount)
-			return nil
-		}
-		
-		// Try fallback mechanism for older nixpkgs: use nix-instantiate to find some basic derivations
-		log.Printf("[%s] nix-eval-jobs failed, trying fallback with nix-instantiate...", rev)
-		
-		// Create a simple Nix file that tries to extract derivations from basic packages
-		fallbackNixFile := filepath.Join(nixpkgsDir, "fallback-extract.nix")
-		fallbackNixContent := `
+	// If no jobs were found, try the fallback mechanism
+	log.Printf("[%s] No jobs found with nix-eval-jobs, trying fallback with nix-instantiate...", rev)
+	
+	// Add fallback to stats tracking
+	fallbackPath := filepath.Join(nixpkgsDir, "fallback-extract.nix")
+	relFallbackPath := "fallback-extract.nix"
+	fallbackStats := &exprFileStats{exists: false, attempted: true}
+	fileStats[fallbackPath] = fallbackStats
+	
+	// Create a simple Nix file that tries to extract derivations from basic packages
+	fallbackNixContent := `
 let
   # Try to import with different approaches
   pkgsAttempt = builtins.tryEval (import ./. {});
@@ -745,59 +823,161 @@ let
   drvPaths = map extractDrvPath (builtins.filter (p: p ? drvPath || p ? outPath) basicPkgs);
 in drvPaths
 `
-		if err := os.WriteFile(fallbackNixFile, []byte(fallbackNixContent), 0644); err != nil {
-			log.Printf("[%s] Failed to write fallback Nix file: %v", rev, err)
-			return fmt.Errorf("nix-eval-jobs command failed and fallback failed: %w", err)
-		}
+	if err := os.WriteFile(fallbackPath, []byte(fallbackNixContent), 0644); err != nil {
+		errMsg := fmt.Sprintf("Failed to write fallback Nix file: %v", err)
+		fallbackStats.errorMessage = errMsg
+		log.Printf("[%s] %s", rev, errMsg)
 		
-		// Try to evaluate with nix-instantiate
-		fallbackCmd := exec.Command("nix-instantiate", "--eval", "--json", fallbackNixFile)
-		fallbackCmd.Dir = nixpkgsDir // Set working directory to nixpkgs dir
-		fallbackOutput, err := fallbackCmd.Output()
-		if err != nil {
-			log.Printf("[%s] Fallback with nix-instantiate failed: %v", rev, err)
-			
-			// Try one more fallback with a simpler expression for very old Nixpkgs
-			simpleFallbackContent := `
+		// Print the final status summary including fallback
+		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
+		
+		return fmt.Errorf("nix-eval-jobs failed and fallback creation failed: %w", err)
+	}
+	
+	fallbackStats.exists = true
+	
+	// Try to evaluate with nix-instantiate
+	log.Printf("[%s] Running fallback with nix-instantiate on %s", rev, relFallbackPath)
+	fallbackCmd := exec.Command("nix-instantiate", "--eval", "--json", fallbackPath)
+	fallbackCmd.Dir = nixpkgsDir // Set working directory to nixpkgs dir
+	fallbackOutput, err := fallbackCmd.Output()
+	
+	if err != nil {
+		errMsg := fmt.Sprintf("Fallback with nix-instantiate failed: %v", err)
+		fallbackStats.errorMessage = errMsg
+		log.Printf("[%s] %s", rev, errMsg)
+		
+		// Try one more fallback with a simpler expression for very old Nixpkgs
+		log.Printf("[%s] Trying simpler fallback expression...", rev)
+		simpleFallbackContent := `
 let
   pkgs = import ./. {};
   drvPaths = [];
 in drvPaths
 `
-			if err := os.WriteFile(fallbackNixFile, []byte(simpleFallbackContent), 0644); err != nil {
-				return fmt.Errorf("all fallback methods failed: %w", err)
-			}
+		// Add simple fallback to stats
+		simpleFallbackPath := filepath.Join(nixpkgsDir, "simple-fallback.nix")
+		// Variable defined but not used
+		simpleFallbackStats := &exprFileStats{exists: false, attempted: true}
+		fileStats[simpleFallbackPath] = simpleFallbackStats
+		
+		if err := os.WriteFile(simpleFallbackPath, []byte(simpleFallbackContent), 0644); err != nil {
+			errMsg := fmt.Sprintf("Failed to write simple fallback Nix file: %v", err)
+			simpleFallbackStats.errorMessage = errMsg
+			log.Printf("[%s] %s", rev, errMsg)
+			
+			// Print the final status summary including all fallbacks
+			printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath, simpleFallbackPath)
 			
 			// At least record that we tried this revision
 			log.Printf("[%s] All evaluation methods failed, but recording revision in database", rev)
 			return nil
 		}
 		
-		// Parse the output
-		var drvPaths []string
-		if err := json.Unmarshal(fallbackOutput, &drvPaths); err != nil {
-			log.Printf("[%s] Failed to parse fallback output: %v", rev, err)
-			return fmt.Errorf("fallback output parsing failed: %w", err)
-		}
+		simpleFallbackStats.exists = true
 		
-		// Add the paths to our channel
-		for _, path := range drvPaths {
-			if path != "" {
-				jobCount++
+		// Skip trying to evaluate the simple fallback - it's just a last resort attempt
+		// that would likely fail but makes sure we record the revision in the database
+		log.Printf("[%s] All evaluation methods failed, but recording revision in database", rev)
+		
+		// Print the final status summary including all fallbacks
+		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath, simpleFallbackPath)
+		
+		return nil
+	}
+	
+	// Parse the output
+	var drvPaths []string
+	if err := json.Unmarshal(fallbackOutput, &drvPaths); err != nil {
+		errMsg := fmt.Sprintf("Failed to parse fallback output: %v", err)
+		fallbackStats.errorMessage = errMsg
+		log.Printf("[%s] %s", rev, errMsg)
+		
+		// Print the final status summary including fallback
+		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
+		
+		return fmt.Errorf("fallback output parsing failed: %w", err)
+	}
+	
+	// Add the paths to our channel
+	fallbackJobCount := 0
+	fallbackVisited := make(map[string]bool)
+	
+	for _, path := range drvPaths {
+		if path != "" {
+			fallbackVisited[path] = true
+			if !globalVisited[path] {
+				globalVisited[path] = true
+				totalJobCount++
 				drvPathChan <- path
 			}
+			fallbackJobCount++
 		}
-		
-		if jobCount > 0 {
-			log.Printf("[%s] Fallback found %d basic derivations", rev, jobCount)
-			return nil
-		}
-		
-		return fmt.Errorf("both nix-eval-jobs and fallback mechanism failed for %s", rev)
 	}
+	
+	fallbackStats.derivationsFound = len(fallbackVisited)
+	
+	if len(fallbackVisited) > 0 {
+		fallbackStats.succeeded = true
+		log.Printf("[%s] Fallback found %d basic derivations (%d unique)",
+			rev, fallbackJobCount, len(fallbackVisited))
+		
+		// Print the final status summary including fallback
+		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
+		
+		return nil
+	}
+	
+	log.Printf("[%s] Fallback did not find any derivations", rev)
+	// Print the final status summary including fallback
+	printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
+	
+	return fmt.Errorf("all evaluation methods failed for %s", rev)
+}
 
-	log.Printf("[%s] nix-eval-jobs completed with %d jobs", rev, jobCount)
-	return nil
+// printExpressionSummary prints a table summary of all expression files and their status
+func printExpressionSummary(rev, nixpkgsDir string, basePaths []string, stats map[string]*exprFileStats, extraPaths ...string) {
+	log.Printf("[%s] Expression file evaluation summary:", rev)
+	log.Printf("[%s] %-50s %-10s %-10s %-10s %-10s %s", 
+		rev, "FILE", "EXISTS", "ATTEMPTED", "SUCCEEDED", "DERIVATIONS", "ERROR")
+	
+	// First print the base paths
+	for _, path := range basePaths {
+		relPath, _ := filepath.Rel(nixpkgsDir, path)
+		if s, ok := stats[path]; ok {
+			var errorSummary string
+			if s.errorMessage != "" {
+				// Truncate very long error messages
+				if len(s.errorMessage) > 100 {
+					errorSummary = s.errorMessage[:97] + "..."
+				} else {
+					errorSummary = s.errorMessage
+				}
+			}
+			log.Printf("[%s] %-50s %-10t %-10t %-10t %-10d %s", 
+				rev, relPath, s.exists, s.attempted, s.succeeded, 
+				s.derivationsFound, errorSummary)
+		}
+	}
+	
+	// Then print any extra paths (fallbacks)
+	for _, path := range extraPaths {
+		relPath, _ := filepath.Rel(nixpkgsDir, path)
+		if s, ok := stats[path]; ok {
+			var errorSummary string
+			if s.errorMessage != "" {
+				// Truncate very long error messages
+				if len(s.errorMessage) > 100 {
+					errorSummary = s.errorMessage[:97] + "..."
+				} else {
+					errorSummary = s.errorMessage
+				}
+			}
+			log.Printf("[%s] %-50s %-10t %-10t %-10t %-10d %s", 
+				rev, relPath, s.exists, s.attempted, s.succeeded, 
+				s.derivationsFound, errorSummary)
+		}
+	}
 }
 
 func prepareNixpkgsWorktree(rev string) (string, error) {
