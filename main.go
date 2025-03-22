@@ -233,7 +233,7 @@ func initDB() *sql.DB {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         revision_id INTEGER NOT NULL,
         file_path TEXT NOT NULL,
-        exists INTEGER NOT NULL,
+        file_exists INTEGER NOT NULL,
         attempted INTEGER NOT NULL,
         succeeded INTEGER NOT NULL,
         error_message TEXT,
@@ -1163,11 +1163,11 @@ func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exp
 	// Prepare statement for inserting metadata
 	metadataStmt, err := tx.Prepare(`
 		INSERT INTO evaluation_metadata (
-			revision_id, file_path, exists, attempted,
+			revision_id, file_path, file_exists, attempted,
 			succeeded, error_message, derivations_found
 		) VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(revision_id, file_path) DO UPDATE SET
-		exists = ?, attempted = ?, succeeded = ?, 
+		file_exists = ?, attempted = ?, succeeded = ?, 
 		error_message = ?, derivations_found = ?
 	`)
 	if err != nil {
@@ -1183,9 +1183,9 @@ func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exp
 		relPath, _ := filepath.Rel(nixpkgsDir, path)
 
 		// Convert boolean to int for SQLite
-		exists := 0
+		fileExists := 0
 		if stat.exists {
-			exists = 1
+			fileExists = 1
 			totalFound++
 		}
 
@@ -1205,9 +1205,9 @@ func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exp
 
 		// Execute the insert
 		_, err := metadataStmt.Exec(
-			revisionID, relPath, exists, attempted,
+			revisionID, relPath, fileExists, attempted,
 			succeeded, stat.errorMessage, stat.derivationsFound,
-			exists, attempted, succeeded,
+			fileExists, attempted, succeeded,
 			stat.errorMessage, stat.derivationsFound)
 		if err != nil {
 			return fmt.Errorf("failed to insert metadata for %s: %w", relPath, err)

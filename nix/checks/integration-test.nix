@@ -44,6 +44,44 @@ if pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
                   FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
                 );
                 CREATE INDEX idx_drv_path ON drv_revisions(drv_path);
+                
+                -- Table for storing expression file evaluation metadata
+                CREATE TABLE IF NOT EXISTS evaluation_metadata (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  revision_id INTEGER NOT NULL,
+                  file_path TEXT NOT NULL,
+                  file_exists INTEGER NOT NULL,
+                  attempted INTEGER NOT NULL,
+                  succeeded INTEGER NOT NULL,
+                  error_message TEXT,
+                  derivations_found INTEGER DEFAULT 0,
+                  evaluation_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+                  FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
+                );
+                CREATE INDEX idx_evaluation_revision ON evaluation_metadata(revision_id);
+                CREATE UNIQUE INDEX idx_evaluation_file ON evaluation_metadata(revision_id, file_path);
+                
+                -- Table for general evaluation stats per revision
+                CREATE TABLE IF NOT EXISTS revision_stats (
+                  revision_id INTEGER PRIMARY KEY,
+                  total_expressions_found INTEGER DEFAULT 0,
+                  total_expressions_attempted INTEGER DEFAULT 0,
+                  total_expressions_succeeded INTEGER DEFAULT 0,
+                  total_derivations_found INTEGER DEFAULT 0,
+                  fallback_used INTEGER DEFAULT 0,
+                  processing_time_seconds INTEGER DEFAULT 0,
+                  worker_count INTEGER DEFAULT 0,
+                  memory_mb_peak INTEGER DEFAULT 0,
+                  system_info TEXT,
+                  host_name TEXT,
+                  cpu_model TEXT,
+                  cpu_cores INTEGER DEFAULT 0,
+                  memory_total TEXT,
+                  kernel_version TEXT,
+                  os_name TEXT,
+                  evaluation_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                  FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
+                );
 
                 PRAGMA journal_mode=WAL;
                 PRAGMA synchronous=NORMAL;
@@ -67,6 +105,40 @@ if pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
                   ('/nix/store/test-pkg-3.drv', 2),
                   ('/nix/store/test-pkg-4.drv', 2),
                   ('/nix/store/test-pkg-5.drv', 2);
+                  
+                -- Add test data for evaluation_metadata
+                INSERT INTO evaluation_metadata (
+                  revision_id, file_path, file_exists, attempted, 
+                  succeeded, error_message, derivations_found
+                ) VALUES
+                  (1, 'pkgs/top-level/release.nix', 1, 1, 1, '', 42),
+                  (1, 'pkgs/top-level/default.nix', 1, 1, 0, 'Failed to evaluate', 0),
+                  (1, 'pkgs/top-level/all-packages.nix', 1, 0, 0, '', 0),
+                  (2, 'pkgs/top-level/release.nix', 1, 1, 1, '', 53),
+                  (2, 'pkgs/top-level/all-packages.nix', 1, 1, 1, '', 128);
+                  
+                -- Add test data for revision_stats
+                INSERT INTO revision_stats (
+                  revision_id, total_expressions_found, total_expressions_attempted,
+                  total_expressions_succeeded, total_derivations_found,
+                  fallback_used, processing_time_seconds, worker_count, memory_mb_peak,
+                  system_info, host_name, cpu_model, cpu_cores, memory_total, 
+                  kernel_version, os_name
+                ) VALUES
+                  (1, 3, 2, 1, 42, 0, 120, 16, 1024, 
+                   '{"Host":"test-host-1","CPU":"Test CPU 1","CPU Cores":"8 (16)","Memory":"32GB"}', 
+                   'test-host-1', 'Test CPU 1', 16, '32GB', 'test-kernel-1', 'NixOS 1');
+                
+                INSERT INTO revision_stats (
+                  revision_id, total_expressions_found, total_expressions_attempted,
+                  total_expressions_succeeded, total_derivations_found,
+                  fallback_used, processing_time_seconds, worker_count, memory_mb_peak,
+                  system_info, host_name, cpu_model, cpu_cores, memory_total, 
+                  kernel_version, os_name
+                ) VALUES
+                  (2, 2, 2, 2, 181, 0, 145, 16, 1536, 
+                   '{"Host":"test-host-2","CPU":"Test CPU 2","CPU Cores":"8 (16)","Memory":"64GB"}', 
+                   'test-host-2', 'Test CPU 2', 16, '64GB', 'test-kernel-2', 'NixOS 2');
                 EOF
               '';
         in
@@ -171,6 +243,17 @@ if pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
           # Test other endpoints instead
           fods = json.loads(server.succeed("curl -s http://localhost:8080/api/fods?limit=2"))
           print(f"FODs response (first 2): {fods}")
+          
+          # Test metadata endpoints
+          metadata = json.loads(server.succeed("curl -s http://localhost:8080/api/metadata?revision_id=1"))
+          print(f"Metadata for revision 1: {metadata}")
+          assert len(metadata) >= 3, f"Expected at least 3 metadata entries, got {len(metadata)}"
+          
+          # Test revision stats endpoint
+          stats = json.loads(server.succeed("curl -s http://localhost:8080/api/revision-stats?revision_id=1"))
+          print(f"Stats for revision 1: {stats}")
+          assert stats["total_expressions_found"] == 3, f"Expected 3 expressions found, got {stats['total_expressions_found']}"
+          assert stats["total_derivations_found"] == 42, f"Expected 42 derivations found, got {stats['total_derivations_found']}"
 
       # Test from client node
       with subtest("Client access to API"):
