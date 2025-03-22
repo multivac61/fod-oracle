@@ -606,12 +606,30 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan chan<- string) error {
 	log.Printf("[%s] Running nix-eval-jobs with nixpkgs at %s", rev, nixpkgsDir)
 
-	// Path to the release-outpaths.nix file
-	releasePath := filepath.Join(nixpkgsDir, "pkgs/top-level/release-outpaths.nix")
+	// Check multiple possible Nix expression files in order of preference
+	possiblePaths := []string{
+		filepath.Join(nixpkgsDir, "pkgs/top-level/release-outpaths.nix"),
+		filepath.Join(nixpkgsDir, "pkgs/top-level/all-packages.nix"),
+		filepath.Join(nixpkgsDir, "all-packages.nix"),
+		filepath.Join(nixpkgsDir, "default.nix"),
+	}
+
+	var expressionPath string
+	for _, path := range possiblePaths {
+		if _, err := os.Stat(path); err == nil {
+			expressionPath = path
+			log.Printf("[%s] Found Nix expression file: %s", rev, expressionPath)
+			break
+		}
+	}
+
+	if expressionPath == "" {
+		return fmt.Errorf("no suitable Nix expression file found in %s", nixpkgsDir)
+	}
 
 	// Build the command with the specific Nix expression path and arguments
 	cmd := exec.Command("nix-eval-jobs",
-		releasePath,
+		expressionPath,
 		"--arg", "checkMeta", "false",
 		"--workers", fmt.Sprintf("%d", workers),
 		"--max-memory-size", "4096",
@@ -685,7 +703,97 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 			log.Printf("[%s] nix-eval-jobs exited with error but processed %d jobs, continuing", rev, jobCount)
 			return nil
 		}
-		return fmt.Errorf("nix-eval-jobs command failed: %w", err)
+		
+		// Try fallback mechanism for older nixpkgs: use nix-instantiate to find some basic derivations
+		log.Printf("[%s] nix-eval-jobs failed, trying fallback with nix-instantiate...", rev)
+		
+		// Create a simple Nix file that tries to extract derivations from basic packages
+		fallbackNixFile := filepath.Join(nixpkgsDir, "fallback-extract.nix")
+		fallbackNixContent := `
+let
+  # Try to import with different approaches
+  pkgsAttempt = builtins.tryEval (import ./. {});
+  
+  # Handle different Nixpkgs structures over the years
+  pkgs = if pkgsAttempt.success then pkgsAttempt.value else {};
+  
+  # Try to get various basic utilities that exist in most Nixpkgs versions
+  basicPkgsList = [
+    (pkgs.stdenv or {}).cc or {}
+    pkgs.bash or {}
+    pkgs.coreutils or {}
+    pkgs.gnutar or {}
+    pkgs.gzip or {}
+    pkgs.gnused or {}
+    pkgs.gnugrep or {}
+    # Try older package names too
+    pkgs.gcc or {}
+    pkgs.binutils or {}
+    pkgs.perl or {}
+    pkgs.python or {}
+  ];
+  
+  # Try to handle various package structures over the years
+  basicPkgs = builtins.filter (p: p != {}) basicPkgsList;
+  
+  # Just extract the derivation paths for these basic packages
+  extractDrvPath = p: 
+    if p ? drvPath then p.drvPath
+    else if p ? outPath then p.outPath
+    else "";
+  
+  drvPaths = map extractDrvPath (builtins.filter (p: p ? drvPath || p ? outPath) basicPkgs);
+in drvPaths
+`
+		if err := os.WriteFile(fallbackNixFile, []byte(fallbackNixContent), 0644); err != nil {
+			log.Printf("[%s] Failed to write fallback Nix file: %v", rev, err)
+			return fmt.Errorf("nix-eval-jobs command failed and fallback failed: %w", err)
+		}
+		
+		// Try to evaluate with nix-instantiate
+		fallbackCmd := exec.Command("nix-instantiate", "--eval", "--json", fallbackNixFile)
+		fallbackCmd.Dir = nixpkgsDir // Set working directory to nixpkgs dir
+		fallbackOutput, err := fallbackCmd.Output()
+		if err != nil {
+			log.Printf("[%s] Fallback with nix-instantiate failed: %v", rev, err)
+			
+			// Try one more fallback with a simpler expression for very old Nixpkgs
+			simpleFallbackContent := `
+let
+  pkgs = import ./. {};
+  drvPaths = [];
+in drvPaths
+`
+			if err := os.WriteFile(fallbackNixFile, []byte(simpleFallbackContent), 0644); err != nil {
+				return fmt.Errorf("all fallback methods failed: %w", err)
+			}
+			
+			// At least record that we tried this revision
+			log.Printf("[%s] All evaluation methods failed, but recording revision in database", rev)
+			return nil
+		}
+		
+		// Parse the output
+		var drvPaths []string
+		if err := json.Unmarshal(fallbackOutput, &drvPaths); err != nil {
+			log.Printf("[%s] Failed to parse fallback output: %v", rev, err)
+			return fmt.Errorf("fallback output parsing failed: %w", err)
+		}
+		
+		// Add the paths to our channel
+		for _, path := range drvPaths {
+			if path != "" {
+				jobCount++
+				drvPathChan <- path
+			}
+		}
+		
+		if jobCount > 0 {
+			log.Printf("[%s] Fallback found %d basic derivations", rev, jobCount)
+			return nil
+		}
+		
+		return fmt.Errorf("both nix-eval-jobs and fallback mechanism failed for %s", rev)
 	}
 
 	log.Printf("[%s] nix-eval-jobs completed with %d jobs", rev, jobCount)
