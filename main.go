@@ -40,6 +40,11 @@ type exprFileStats struct {
 	succeeded       bool
 	errorMessage    string
 	derivationsFound int
+	
+	// Fields for database storage
+	revisionID     int64  // References revisions.id
+	filePath       string // Relative path to the file
+	evaluationTime time.Time
 }
 
 var workers = 16
@@ -116,6 +121,35 @@ func initDB() *sql.DB {
         FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_drv_path ON drv_revisions(drv_path);
+    
+    -- Table for storing expression file evaluation metadata
+    CREATE TABLE IF NOT EXISTS evaluation_metadata (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        revision_id INTEGER NOT NULL,
+        file_path TEXT NOT NULL,
+        exists INTEGER NOT NULL,
+        attempted INTEGER NOT NULL,
+        succeeded INTEGER NOT NULL,
+        error_message TEXT,
+        derivations_found INTEGER DEFAULT 0,
+        evaluation_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_evaluation_revision ON evaluation_metadata(revision_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_evaluation_file ON evaluation_metadata(revision_id, file_path);
+    
+    -- Table for general evaluation stats per revision
+    CREATE TABLE IF NOT EXISTS revision_stats (
+        revision_id INTEGER PRIMARY KEY,
+        total_expressions_found INTEGER DEFAULT 0,
+        total_expressions_attempted INTEGER DEFAULT 0,
+        total_expressions_succeeded INTEGER DEFAULT 0,
+        total_derivations_found INTEGER DEFAULT 0,
+        fallback_used INTEGER DEFAULT 0,
+        processing_time_seconds INTEGER DEFAULT 0,
+        evaluation_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
+    );
     `
 	_, err = db.Exec(createTables)
 	if err != nil {
@@ -582,10 +616,23 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		close(done)
 	}()
 
+	// Variable to track if fallback was used
+	usedFallback := false
+	
+	// Variable to hold evaluation metadata
+	fileStats := make(map[string]*exprFileStats)
+
 	// Run nix-eval-jobs and stream results to the channel
 	log.Printf("[%s] Running nix-eval-jobs to populate work queue", rev)
-	if err := streamNixEvalJobs(rev, worktreeDir, workers, drvPathChan); err != nil {
+	if err := streamNixEvalJobs(rev, worktreeDir, workers, drvPathChan, fileStats, &usedFallback); err != nil {
 		close(drvPathChan)
+		
+		// Store metadata even if there was an error
+		processingTime := time.Since(revStartTime)
+		if storeErr := storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir, processingTime, usedFallback); storeErr != nil {
+			log.Printf("[%s] Error storing evaluation metadata: %v", rev, storeErr)
+		}
+		
 		return fmt.Errorf("failed to run nix-eval-jobs: %w", err)
 	}
 	close(drvPathChan)
@@ -608,11 +655,20 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		log.Printf("[%s] Error counting FODs: %v", rev, err)
 	}
 	log.Printf("[%s] Final stats: %d FODs", rev, fodCount)
+	
+	// Store the evaluation metadata in the database
+	if err := storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir, revElapsed, usedFallback); err != nil {
+		log.Printf("[%s] Error storing evaluation metadata: %v", rev, err)
+	} else {
+		log.Printf("[%s] Successfully stored evaluation metadata in database", rev)
+	}
+	
 	return nil
 }
 
 // streamNixEvalJobs runs nix-eval-jobs and streams results to the provided channel
-func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan chan<- string) error {
+func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan chan<- string, 
+	fileStats map[string]*exprFileStats, usedFallback *bool) error {
 	log.Printf("[%s] Running nix-eval-jobs with nixpkgs at %s", rev, nixpkgsDir)
 
 	// Define all possible Nix expression files that could be evaluated
@@ -629,13 +685,24 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 	}
 
 	// Begin collecting stats for the expression files
+	type exprFileStats struct {
+		exists          bool
+		attempted       bool
+		succeeded       bool
+		errorMessage    string
+		derivationsFound int
+	}
 	fileStats := make(map[string]*exprFileStats)
 	
 	// Check which expression files exist and initialize stats
 	var existingPaths []string
 	for _, path := range possiblePaths {
 		relPath, _ := filepath.Rel(nixpkgsDir, path)
-		fileStats[path] = &exprFileStats{}
+		fileStats[path] = &exprFileStats{
+			revisionID: 0, // Will be set later in the storeEvaluationMetadata function
+			filePath: relPath,
+			evaluationTime: time.Now(),
+		}
 		
 		if _, err := os.Stat(path); err == nil {
 			fileStats[path].exists = true
@@ -780,10 +847,19 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 	// If no jobs were found, try the fallback mechanism
 	log.Printf("[%s] No jobs found with nix-eval-jobs, trying fallback with nix-instantiate...", rev)
 	
+	// Mark that we're using the fallback mechanism
+	*usedFallback = true
+	
 	// Add fallback to stats tracking
 	fallbackPath := filepath.Join(nixpkgsDir, "fallback-extract.nix")
 	relFallbackPath := "fallback-extract.nix"
-	fallbackStats := &exprFileStats{exists: false, attempted: true}
+	fallbackStats := &exprFileStats{
+		exists: false, 
+		attempted: true,
+		revisionID: 0, // Will be set later in the storeEvaluationMetadata function
+		filePath: relFallbackPath,
+		evaluationTime: time.Now(),
+	}
 	fileStats[fallbackPath] = fallbackStats
 	
 	// Create a simple Nix file that tries to extract derivations from basic packages
@@ -857,8 +933,14 @@ in drvPaths
 `
 		// Add simple fallback to stats
 		simpleFallbackPath := filepath.Join(nixpkgsDir, "simple-fallback.nix")
-		// Variable defined but not used
-		simpleFallbackStats := &exprFileStats{exists: false, attempted: true}
+		simpleFallbackPath_rel := "simple-fallback.nix"
+		simpleFallbackStats := &exprFileStats{
+			exists: false, 
+			attempted: true,
+			revisionID: 0, // Will be set later in the storeEvaluationMetadata function
+			filePath: simpleFallbackPath_rel,
+			evaluationTime: time.Now(),
+		}
 		fileStats[simpleFallbackPath] = simpleFallbackStats
 		
 		if err := os.WriteFile(simpleFallbackPath, []byte(simpleFallbackContent), 0644); err != nil {
@@ -935,7 +1017,114 @@ in drvPaths
 	return fmt.Errorf("all evaluation methods failed for %s", rev)
 }
 
-// printExpressionSummary prints a table summary of all expression files and their status
+// storeEvaluationMetadata persists the evaluation metadata to the database
+func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exprFileStats, 
+	nixpkgsDir string, processingTime time.Duration, usedFallback bool) error {
+	
+	// Begin transaction
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	
+	// Deferred function to handle transaction commit/rollback
+	var success bool
+	defer func() {
+		if !success {
+			tx.Rollback()
+		}
+	}()
+	
+	// Prepare statement for inserting metadata
+	metadataStmt, err := tx.Prepare(`
+		INSERT INTO evaluation_metadata (
+			revision_id, file_path, exists, attempted,
+			succeeded, error_message, derivations_found
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(revision_id, file_path) DO UPDATE SET
+		exists = ?, attempted = ?, succeeded = ?, 
+		error_message = ?, derivations_found = ?
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare metadata statement: %w", err)
+	}
+	defer metadataStmt.Close()
+	
+	// Counters for revision-level stats
+	var totalFound, totalAttempted, totalSucceeded, totalDerivations int
+	
+	// Insert metadata for each file
+	for path, stat := range stats {
+		relPath, _ := filepath.Rel(nixpkgsDir, path)
+		
+		// Convert boolean to int for SQLite
+		exists := 0
+		if stat.exists {
+			exists = 1
+			totalFound++
+		}
+		
+		attempted := 0
+		if stat.attempted {
+			attempted = 1
+			totalAttempted++
+		}
+		
+		succeeded := 0
+		if stat.succeeded {
+			succeeded = 1
+			totalSucceeded++
+		}
+		
+		totalDerivations += stat.derivationsFound
+		
+		// Execute the insert
+		_, err := metadataStmt.Exec(
+			revisionID, relPath, exists, attempted,
+			succeeded, stat.errorMessage, stat.derivationsFound,
+			exists, attempted, succeeded, 
+			stat.errorMessage, stat.derivationsFound)
+		
+		if err != nil {
+			return fmt.Errorf("failed to insert metadata for %s: %w", relPath, err)
+		}
+	}
+	
+	// Insert revision-level stats
+	fallbackUsed := 0
+	if usedFallback {
+		fallbackUsed = 1
+	}
+	
+	_, err = tx.Exec(`
+		INSERT INTO revision_stats (
+			revision_id, total_expressions_found, total_expressions_attempted,
+			total_expressions_succeeded, total_derivations_found,
+			fallback_used, processing_time_seconds
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(revision_id) DO UPDATE SET
+		total_expressions_found = ?, total_expressions_attempted = ?,
+		total_expressions_succeeded = ?, total_derivations_found = ?,
+		fallback_used = ?, processing_time_seconds = ?
+	`, 
+	revisionID, totalFound, totalAttempted, totalSucceeded, totalDerivations,
+	fallbackUsed, int(processingTime.Seconds()),
+	totalFound, totalAttempted, totalSucceeded, totalDerivations,
+	fallbackUsed, int(processingTime.Seconds()))
+	
+	if err != nil {
+		return fmt.Errorf("failed to insert revision stats: %w", err)
+	}
+	
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	
+	success = true
+	return nil
+}
+
 func printExpressionSummary(rev, nixpkgsDir string, basePaths []string, stats map[string]*exprFileStats, extraPaths ...string) {
 	log.Printf("[%s] Expression file evaluation summary:", rev)
 	log.Printf("[%s] %-50s %-10s %-10s %-10s %-10s %s", 
