@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,7 +48,22 @@ type exprFileStats struct {
 	evaluationTime time.Time
 }
 
+// Default number of workers for nix-eval-jobs
 var workers = 16
+
+// init initializes configuration from environment variables
+func init() {
+	// Check for custom worker count in environment
+	if workersEnv := os.Getenv("FOD_ORACLE_NUM_WORKERS"); workersEnv != "" {
+		if w, err := strconv.Atoi(workersEnv); err == nil && w > 0 {
+			workers = w
+			log.Printf("Using %d workers from FOD_ORACLE_NUM_WORKERS environment variable", workers)
+		} else if err != nil {
+			log.Printf("Warning: Invalid FOD_ORACLE_NUM_WORKERS value '%s': %v. Using default: %d", 
+				workersEnv, err, workers)
+		}
+	}
+}
 
 // initDB initializes the SQLite database
 func initDB() *sql.DB {
@@ -147,6 +163,8 @@ func initDB() *sql.DB {
         total_derivations_found INTEGER DEFAULT 0,
         fallback_used INTEGER DEFAULT 0,
         processing_time_seconds INTEGER DEFAULT 0,
+        worker_count INTEGER DEFAULT 0,
+        memory_mb_peak INTEGER DEFAULT 0,
         evaluation_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
     );
@@ -567,6 +585,10 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	visited := &sync.Map{}
 	var wg sync.WaitGroup
 
+	// Track peak memory usage
+	var peakMemoryMB int
+	var memoryMutex sync.Mutex
+
 	// Start memory monitoring
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
@@ -574,8 +596,17 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		for range ticker.C {
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
-			log.Printf("[%s] Memory: Alloc=%dMB TotalAlloc=%dMB Sys=%dMB",
-				rev, m.Alloc/1024/1024, m.TotalAlloc/1024/1024, m.Sys/1024/1024)
+			
+			// Update peak memory if higher
+			allocMB := int(m.Alloc / 1024 / 1024)
+			memoryMutex.Lock()
+			if allocMB > peakMemoryMB {
+				peakMemoryMB = allocMB
+			}
+			memoryMutex.Unlock()
+			
+			log.Printf("[%s] Memory: Alloc=%dMB TotalAlloc=%dMB Sys=%dMB (Peak=%dMB)",
+				rev, allocMB, m.TotalAlloc/1024/1024, m.Sys/1024/1024, peakMemoryMB)
 		}
 	}()
 
@@ -623,13 +654,18 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	fileStats := make(map[string]*exprFileStats)
 
 	// Run nix-eval-jobs and stream results to the channel
-	log.Printf("[%s] Running nix-eval-jobs to populate work queue", rev)
+	log.Printf("[%s] Running nix-eval-jobs with %d workers to populate work queue", rev, workers)
 	if err := streamNixEvalJobs(rev, worktreeDir, workers, drvPathChan, fileStats, &usedFallback); err != nil {
 		close(drvPathChan)
 		
 		// Store metadata even if there was an error
 		processingTime := time.Since(revStartTime)
-		if storeErr := storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir, processingTime, usedFallback); storeErr != nil {
+		memoryMutex.Lock()
+		currentPeakMemory := peakMemoryMB
+		memoryMutex.Unlock()
+		
+		if storeErr := storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir, 
+			processingTime, usedFallback, currentPeakMemory); storeErr != nil {
 			log.Printf("[%s] Error storing evaluation metadata: %v", rev, storeErr)
 		}
 		
@@ -657,10 +693,16 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	log.Printf("[%s] Final stats: %d FODs", rev, fodCount)
 	
 	// Store the evaluation metadata in the database
-	if err := storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir, revElapsed, usedFallback); err != nil {
+	memoryMutex.Lock()
+	finalPeakMemory := peakMemoryMB
+	memoryMutex.Unlock()
+	
+	if err := storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir, 
+		revElapsed, usedFallback, finalPeakMemory); err != nil {
 		log.Printf("[%s] Error storing evaluation metadata: %v", rev, err)
 	} else {
-		log.Printf("[%s] Successfully stored evaluation metadata in database", rev)
+		log.Printf("[%s] Successfully stored evaluation metadata in database (workers=%d, peak memory=%dMB)",
+			rev, workers, finalPeakMemory)
 	}
 	
 	return nil
@@ -669,7 +711,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 // streamNixEvalJobs runs nix-eval-jobs and streams results to the provided channel
 func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan chan<- string, 
 	fileStats map[string]*exprFileStats, usedFallback *bool) error {
-	log.Printf("[%s] Running nix-eval-jobs with nixpkgs at %s", rev, nixpkgsDir)
+	log.Printf("[%s] Running nix-eval-jobs with nixpkgs at %s (%d worker threads)", rev, nixpkgsDir, workers)
 
 	// Define all possible Nix expression files that could be evaluated
 	possiblePaths := []string{
@@ -1019,7 +1061,7 @@ in drvPaths
 
 // storeEvaluationMetadata persists the evaluation metadata to the database
 func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exprFileStats, 
-	nixpkgsDir string, processingTime time.Duration, usedFallback bool) error {
+	nixpkgsDir string, processingTime time.Duration, usedFallback bool, peakMemoryMB int) error {
 	
 	// Begin transaction
 	tx, err := db.Begin()
@@ -1100,17 +1142,17 @@ func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exp
 		INSERT INTO revision_stats (
 			revision_id, total_expressions_found, total_expressions_attempted,
 			total_expressions_succeeded, total_derivations_found,
-			fallback_used, processing_time_seconds
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
+			fallback_used, processing_time_seconds, worker_count, memory_mb_peak
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(revision_id) DO UPDATE SET
 		total_expressions_found = ?, total_expressions_attempted = ?,
 		total_expressions_succeeded = ?, total_derivations_found = ?,
-		fallback_used = ?, processing_time_seconds = ?
+		fallback_used = ?, processing_time_seconds = ?, worker_count = ?, memory_mb_peak = ?
 	`, 
 	revisionID, totalFound, totalAttempted, totalSucceeded, totalDerivations,
-	fallbackUsed, int(processingTime.Seconds()),
+	fallbackUsed, int(processingTime.Seconds()), workers, peakMemoryMB,
 	totalFound, totalAttempted, totalSucceeded, totalDerivations,
-	fallbackUsed, int(processingTime.Seconds()))
+	fallbackUsed, int(processingTime.Seconds()), workers, peakMemoryMB)
 	
 	if err != nil {
 		return fmt.Errorf("failed to insert revision stats: %w", err)
@@ -1299,6 +1341,7 @@ func cleanupWorktrees() error {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Println("Starting FOD finder...")
+	log.Printf("Configuration: %d worker threads", workers)
 
 	// Clean up any leftover worktrees from previous runs
 	if err := cleanupWorktrees(); err != nil {
