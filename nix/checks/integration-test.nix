@@ -44,7 +44,7 @@ if pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
                   FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
                 );
                 CREATE INDEX idx_drv_path ON drv_revisions(drv_path);
-                
+
                 -- Table for storing expression file evaluation metadata
                 CREATE TABLE IF NOT EXISTS evaluation_metadata (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,7 +60,7 @@ if pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
                 );
                 CREATE INDEX idx_evaluation_revision ON evaluation_metadata(revision_id);
                 CREATE UNIQUE INDEX idx_evaluation_file ON evaluation_metadata(revision_id, file_path);
-                
+
                 -- Table for general evaluation stats per revision
                 CREATE TABLE IF NOT EXISTS revision_stats (
                   revision_id INTEGER PRIMARY KEY,
@@ -128,7 +128,7 @@ if pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
                   (1, 3, 2, 1, 42, 0, 120, 16, 1024, 
                    '{"Host":"test-host-1","CPU":"Test CPU 1","CPU Cores":"8 (16)","Memory":"32GB"}', 
                    'test-host-1', 'Test CPU 1', 16, '32GB', 'test-kernel-1', 'NixOS 1');
-                
+
                 INSERT INTO revision_stats (
                   revision_id, total_expressions_found, total_expressions_attempted,
                   total_expressions_succeeded, total_derivations_found,
@@ -161,11 +161,10 @@ if pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
           services.fod-oracle = {
             enable = true;
             port = 8080;
-            
+
             # Database in a temporary location
             dbPath = "/tmp/fod-oracle-test.db";
           };
-
 
           # Configure firewall to allow client communication
           networking.firewall = {
