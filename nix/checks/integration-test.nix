@@ -226,13 +226,13 @@ if pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
 
       # Test the API on the server
       with subtest("API health check"):
-          result = server.succeed("curl -s http://localhost:8080/api/health")
+          result = server.succeed("curl -s http://localhost:8080/health")
           assert "ok" in result, f"Health check failed: {result}"
 
       # Test API endpoints
       with subtest("API endpoints"):
           # Test revisions endpoint
-          revisions = json.loads(server.succeed("curl -s http://localhost:8080/api/revisions"))
+          revisions = json.loads(server.succeed("curl -s http://localhost:8080/revisions"))
           print(f"Revisions response: {revisions}")
           
           # Skip the stats endpoint as it has issues with timestamp parsing
@@ -240,12 +240,12 @@ if pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
           print("Skipping stats endpoint test due to timestamp parsing issue")
           
           # Test other endpoints instead
-          fods = json.loads(server.succeed("curl -s http://localhost:8080/api/fods?limit=2"))
+          fods = json.loads(server.succeed("curl -s http://localhost:8080/fods?limit=2"))
           print(f"FODs response (first 2): {fods}")
           
           # Test evaluation metadata endpoints
           try:
-              metadata_response = server.succeed("curl -s http://localhost:8080/api/evaluation-metadata?revision_id=1")
+              metadata_response = server.succeed("curl -s http://localhost:8080/evaluation-metadata?revision_id=1")
               print(f"Metadata response: {metadata_response}")
               
               # Skip assertion if endpoint isn't implemented yet
@@ -261,7 +261,7 @@ if pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
           
           # Test revision stats endpoint
           try:
-              stats_response = server.succeed("curl -s http://localhost:8080/api/revision-stats?revision_id=1")
+              stats_response = server.succeed("curl -s http://localhost:8080/revision-stats?revision_id=1")
               print(f"Stats response: {stats_response}")
               
               # Skip assertion if endpoint isn't implemented yet
@@ -282,7 +282,7 @@ if pkgs.stdenv.isLinux && pkgs.stdenv.hostPlatform.system == "x86_64-linux" then
           client.succeed("cat /etc/hosts | grep server")
           
           # Test HTTP health check from client
-          client.succeed("curl -s --connect-timeout 5 http://server:8080/api/health | grep -q 'ok'")
+          client.succeed("curl -s --connect-timeout 5 http://server:8080/health | grep -q 'ok'")
           
           print("API direct access successful")
     '';

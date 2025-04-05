@@ -76,7 +76,7 @@ func TestHandleGetStats(t *testing.T) {
 
 	// Create server and request
 	server := NewServer(db)
-	req, err := http.NewRequest("GET", "/api/stats", nil)
+	req, err := http.NewRequest("GET", "/stats", nil)
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}
@@ -120,3 +120,4 @@ func TestHandleGetStats(t *testing.T) {
 		t.Errorf("Incorrect last updated time: got %v want %v", stats.LastUpdated, expectedTime)
 	}
 }
+

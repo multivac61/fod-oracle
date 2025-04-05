@@ -68,19 +68,19 @@ func NewServer(db *sql.DB) *Server {
 
 // routes sets up the API routes
 func (s *Server) routes() {
-	s.router.Get("/api/health", s.handleHealth)
-	s.router.Get("/api/revisions", s.handleGetRevisions)
-	s.router.Get("/api/revisions/{id}", s.handleGetRevision)
-	s.router.Get("/api/revision/{rev}", s.handleGetRevisionByHash)
-	s.router.Get("/api/fods", s.handleGetFODs)
-	s.router.Get("/api/fods/{hash}", s.handleGetFODByHash)
-	s.router.Get("/api/commit/{commit}/fods", s.handleGetFODsByCommit)
-	s.router.Get("/api/stats", s.handleGetStats)
-	s.router.Get("/api/compare", s.handleCompareRevisions)
-	
+	s.router.Get("/health", s.handleHealth)
+	s.router.Get("/revisions", s.handleGetRevisions)
+	s.router.Get("/revisions/{id}", s.handleGetRevision)
+	s.router.Get("/revision/{rev}", s.handleGetRevisionByHash)
+	s.router.Get("/fods", s.handleGetFODs)
+	s.router.Get("/fods/{hash}", s.handleGetFODByHash)
+	s.router.Get("/commit/{commit}/fods", s.handleGetFODsByCommit)
+	s.router.Get("/stats", s.handleGetStats)
+	s.router.Get("/compare", s.handleCompareRevisions)
+
 	// New endpoints for evaluation metadata and stats
-	s.router.Get("/api/evaluation-metadata", s.handleGetEvaluationMetadata)
-	s.router.Get("/api/revision-stats", s.handleGetRevisionStats)
+	s.router.Get("/evaluation-metadata", s.handleGetEvaluationMetadata)
+	s.router.Get("/revision-stats", s.handleGetRevisionStats)
 }
 
 // ServeHTTP implements the http.Handler interface
@@ -297,7 +297,7 @@ func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	
+
 	if lastUpdatedStr != "" {
 		// Try parsing with the format from the database: "2025-03-20 17:01:42"
 		parsedTime, err := time.Parse("2006-01-02 15:04:05", lastUpdatedStr)
@@ -327,14 +327,14 @@ func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 
 // ComparisonResult represents the result of comparing two revisions
 type ComparisonResult struct {
-	Rev1          string `json:"rev1"`
-	Rev2          string `json:"rev2"`
-	CommonFODs    int    `json:"commonFODs"`
-	OnlyInRev1    int    `json:"onlyInRev1"`
-	OnlyInRev2    int    `json:"onlyInRev2"`
-	HashChanges   int    `json:"hashChanges"`
-	TotalInRev1   int    `json:"totalInRev1"`
-	TotalInRev2   int    `json:"totalInRev2"`
+	Rev1          string    `json:"rev1"`
+	Rev2          string    `json:"rev2"`
+	CommonFODs    int       `json:"commonFODs"`
+	OnlyInRev1    int       `json:"onlyInRev1"`
+	OnlyInRev2    int       `json:"onlyInRev2"`
+	HashChanges   int       `json:"hashChanges"`
+	TotalInRev1   int       `json:"totalInRev1"`
+	TotalInRev2   int       `json:"totalInRev2"`
 	FODsWithDiffs []FODDiff `json:"fodsWithDiffs,omitempty"`
 }
 
@@ -580,7 +580,7 @@ func (s *Server) handleGetEvaluationMetadata(w http.ResponseWriter, r *http.Requ
 		m.FileExists = fileExists != 0
 		m.Attempted = attempted != 0
 		m.Succeeded = succeeded != 0
-		
+
 		// Handle nullable error message
 		if errorMsg.Valid {
 			m.ErrorMessage = errorMsg.String
@@ -601,23 +601,23 @@ func (s *Server) handleGetEvaluationMetadata(w http.ResponseWriter, r *http.Requ
 
 // RevisionStats represents revision-level statistics
 type RevisionStats struct {
-	RevisionID               int64     `json:"revision_id"`
-	TotalExpressionsFound    int       `json:"total_expressions_found"`
+	RevisionID                int64     `json:"revision_id"`
+	TotalExpressionsFound     int       `json:"total_expressions_found"`
 	TotalExpressionsAttempted int       `json:"total_expressions_attempted"`
 	TotalExpressionsSucceeded int       `json:"total_expressions_succeeded"`
-	TotalDerivationsFound    int       `json:"total_derivations_found"`
-	FallbackUsed             bool      `json:"fallback_used"`
-	ProcessingTimeSeconds    int       `json:"processing_time_seconds"`
-	WorkerCount              int       `json:"worker_count"`
-	MemoryMBPeak             int       `json:"memory_mb_peak"`
-	SystemInfo               string    `json:"system_info"`
-	HostName                 string    `json:"host_name"`
-	CPUModel                 string    `json:"cpu_model"`
-	CPUCores                 int       `json:"cpu_cores"`
-	MemoryTotal              string    `json:"memory_total"`
-	KernelVersion            string    `json:"kernel_version"`
-	OSName                   string    `json:"os_name"`
-	EvaluationTimestamp      time.Time `json:"evaluation_timestamp"`
+	TotalDerivationsFound     int       `json:"total_derivations_found"`
+	FallbackUsed              bool      `json:"fallback_used"`
+	ProcessingTimeSeconds     int       `json:"processing_time_seconds"`
+	WorkerCount               int       `json:"worker_count"`
+	MemoryMBPeak              int       `json:"memory_mb_peak"`
+	SystemInfo                string    `json:"system_info"`
+	HostName                  string    `json:"host_name"`
+	CPUModel                  string    `json:"cpu_model"`
+	CPUCores                  int       `json:"cpu_cores"`
+	MemoryTotal               string    `json:"memory_total"`
+	KernelVersion             string    `json:"kernel_version"`
+	OSName                    string    `json:"os_name"`
+	EvaluationTimestamp       time.Time `json:"evaluation_timestamp"`
 }
 
 // handleGetRevisionStats returns evaluation statistics for a specific revision
@@ -668,7 +668,6 @@ func (s *Server) handleGetRevisionStats(w http.ResponseWriter, r *http.Request) 
 		&sysInfo, &hostName, &cpuModel, &stats.CPUCores, &memTotal,
 		&kernelVer, &osName, &timestamp,
 	)
-
 	if err != nil {
 		if err == sql.ErrNoRows {
 			respondError(w, http.StatusNotFound, "No statistics found for this revision")
@@ -680,7 +679,7 @@ func (s *Server) handleGetRevisionStats(w http.ResponseWriter, r *http.Request) 
 
 	// Convert integer flags to booleans
 	stats.FallbackUsed = fallbackUsed != 0
-	
+
 	// Handle nullable strings
 	if sysInfo.Valid {
 		stats.SystemInfo = sysInfo.String
@@ -700,7 +699,7 @@ func (s *Server) handleGetRevisionStats(w http.ResponseWriter, r *http.Request) 
 	if osName.Valid {
 		stats.OSName = osName.String
 	}
-	
+
 	// Parse timestamp
 	if timestamp.Valid {
 		var err error

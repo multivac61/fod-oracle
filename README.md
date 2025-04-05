@@ -46,12 +46,12 @@ This took around 7 minutes on a 7950 AMD Ryzen 9 16-core processor.
 
 The following API endpoints are available:
 
-- `GET /api/health` - Health check
-- `GET /api/revisions` - List all nixpkgs revisions
-- `GET /api/revisions/{id}` - Get details for a specific revision
-- `GET /api/revision/{rev}` - Get details for a specific revision by git hash
-- `GET /api/fods` - List FODs (with pagination)
-- `GET /api/fods/{hash}` - Find FODs by hash
-- `GET /api/commit/{commit}/fods` - List all FODs associated with a specific nixpkgs commit hash (with pagination)
-- `GET /api/stats` - Get database statistics
-- `GET /api/compare` - Compare FODs between revisions
+- `GET api.fod-oracle.org/health` - Health check
+- `GET api.fod-oracle.org/revisions` - List all nixpkgs revisions
+- `GET api.fod-oracle.org/revisions/{id}` - Get details for a specific revision
+- `GET api.fod-oracle.org/revision/{rev}` - Get details for a specific revision by git hash
+- `GET api.fod-oracle.org/fods` - List FODs (with pagination)
+- `GET api.fod-oracle.org/fods/{hash}` - Find FODs by hash
+- `GET api.fod-oracle.org/commit/{commit}/fods` - List all FODs associated with a specific nixpkgs commit hash (with pagination)
+- `GET api.fod-oracle.org/stats` - Get database statistics
+- `GET api.fod-oracle.org/compare` - Compare FODs between revisions
