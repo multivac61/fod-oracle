@@ -46,11 +46,11 @@ This took around 7 minutes on a 7950 AMD Ryzen 9 16-core processor.
 
 The following API endpoints are available:
 
-- `GET [api.fod-oracle.org/health](https://api.fod-oracle.org/health)` - Health check
-- `GET [api.fod-oracle.org/revisions](https://api.fod-oracle.org/revisions)` - List all nixpkgs revisions
-- `GET api.fod-oracle.org/revisions/{id}` - Get details for a specific revision
-- `GET api.fod-oracle.org/revision/{rev}` - Get details for a specific revision by git hash
-- `GET [api.fod-oracle.org/fods](https://api.fod-oracle.org/fods)` - List FODs (with pagination)
-- `GET api.fod-oracle.org/fods/{hash}` - Find FODs by hash
-- `GET api.fod-oracle.org/commit/{commit}/fods` - List all FODs associated with a specific nixpkgs commit hash (with pagination)
-- `GET [api.fod-oracle.org/stats](https://api.fod-oracle.org/stats)` - Get database statistics
+- https://api.fod-oracle.org/health - Health check
+- https://api.fod-oracle.org/revisions - List all nixpkgs revisions
+- https://api.fod-oracle.org/stats - Get database statistics
+- https://api.fod-oracle.org/fods - List FODs (with pagination)
+- `https://api.fod-oracle.org/revisions/{id}` - Get details for a specific revision
+- `https://api.fod-oracle.org/revision/{rev}` - Get details for a specific revision by git hash
+- `https://api.fod-oracle.org/fods/{hash}` - Find FODs by hash
+- `https://api.fod-oracle.org/commit/{commit}/fods` - List all FODs associated with a specific nixpkgs commit hash (with pagination)
