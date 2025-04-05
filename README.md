@@ -37,7 +37,7 @@ FOD Oracle is a tool for tracking and analyzing fixed-output derivations (FODs) 
 To scan a nixpkgs revision:
 
 ```bash
-go run . <nixpkgs-revision>
+nix run github:multivac61/fod-oracle -- <nixpkgs-revision>
 ```
 
 This took around 7 minutes on a 7950 AMD Ryzen 9 16-core processor.
@@ -55,30 +55,3 @@ The following API endpoints are available:
 - `GET /api/commit/{commit}/fods` - List all FODs associated with a specific nixpkgs commit hash (with pagination)
 - `GET /api/stats` - Get database statistics
 - `GET /api/compare` - Compare FODs between revisions
-
-## NixOS Module
-
-FOD Oracle includes a NixOS module that makes it easy to deploy the API server with Caddy for HTTPS and Cloudflare DNS integration.
-
-### Basic Configuration
-
-```nix
-{
-  services.fod-oracle = {
-    enable = true;
-  };
-}
-```
-
-### Integration Testing
-
-To ensure that the NixOS module works correctly, FOD Oracle includes an integration test that runs only on x86_64-linux systems:
-
-```bash
-# Run all checks including the integration test (x86_64-linux only)
-nix flake check -L
-```
-
-The integration test creates a NixOS VM, deploys FOD Oracle with the module, and verifies that both the API server and Caddy reverse proxy are working correctly.
-
-Note: The integration test only runs on x86_64-linux platforms and is automatically skipped on other platforms like macOS or aarch64-linux.
