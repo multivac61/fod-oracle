@@ -177,7 +177,7 @@ func (s *Server) handleGetFODs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var args []interface{}
+	var args []any
 	query := `
 		SELECT f.drv_path, f.output_path, f.hash_algorithm, f.hash
 		FROM fods f
@@ -495,7 +495,7 @@ func (s *Server) handleCompareRevisions(w http.ResponseWriter, r *http.Request) 
 }
 
 // respondJSON sends a JSON response
-func respondJSON(w http.ResponseWriter, status int, data interface{}) {
+func respondJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
@@ -833,9 +833,9 @@ func (s *Server) handleGetFODsByCommit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create a response with pagination metadata
-	response := map[string]interface{}{
+	response := map[string]any{
 		"data": fods,
-		"pagination": map[string]interface{}{
+		"pagination": map[string]any{
 			"total":  total,
 			"limit":  limit,
 			"offset": offset,
