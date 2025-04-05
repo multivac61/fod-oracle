@@ -120,4 +120,3 @@ func TestHandleGetStats(t *testing.T) {
 		t.Errorf("Incorrect last updated time: got %v want %v", stats.LastUpdated, expectedTime)
 	}
 }
-

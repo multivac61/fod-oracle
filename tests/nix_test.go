@@ -32,7 +32,7 @@ func TestPrepareNixpkgsWorktree(t *testing.T) {
 
 	// Create a fake git repository
 	repoDir := filepath.Join(tempDir, "repo")
-	if err := os.Mkdir(repoDir, 0755); err != nil {
+	if err := os.Mkdir(repoDir, 0o755); err != nil {
 		t.Fatalf("Failed to create repo directory: %v", err)
 	}
 
@@ -45,13 +45,13 @@ func TestPrepareNixpkgsWorktree(t *testing.T) {
 
 	// Create some files
 	libDir := filepath.Join(repoDir, "lib")
-	if err := os.MkdirAll(libDir, 0755); err != nil {
+	if err := os.MkdirAll(libDir, 0o755); err != nil {
 		t.Fatalf("Failed to create lib directory: %v", err)
 	}
 
 	// Create a minver.nix file
 	minverPath := filepath.Join(libDir, "minver.nix")
-	if err := os.WriteFile(minverPath, []byte("# This is a test file"), 0644); err != nil {
+	if err := os.WriteFile(minverPath, []byte("# This is a test file"), 0o644); err != nil {
 		t.Fatalf("Failed to create minver.nix: %v", err)
 	}
 
@@ -92,7 +92,7 @@ func TestPrepareNixpkgsWorktree(t *testing.T) {
 
 	// Test the worktree preparation (mock implementation for testing)
 	worktreeDir := filepath.Join(tempDir, "worktree")
-	
+
 	// This is a simple mock of the function we'd normally test
 	// In a real test, you'd call the actual prepareNixpkgsWorktree function
 	err = mockPrepareWorktree(repoDir, rev, worktreeDir)
@@ -125,7 +125,7 @@ func TestPrepareNixpkgsWorktree(t *testing.T) {
 // Mock implementation of prepareNixpkgsWorktree for testing
 func mockPrepareWorktree(repoPath, rev, worktreePath string) error {
 	// Create the worktree directory
-	if err := os.MkdirAll(worktreePath, 0755); err != nil {
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
 		return err
 	}
 
@@ -156,7 +156,7 @@ func TestCleanupWorktrees(t *testing.T) {
 
 	// Create a mock repository directory
 	repoDir := filepath.Join(tempDir, "nixpkgs-repo")
-	if err := os.MkdirAll(repoDir, 0755); err != nil {
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
 		t.Fatalf("Failed to create repo directory: %v", err)
 	}
 
@@ -175,7 +175,7 @@ func TestCleanupWorktrees(t *testing.T) {
 	}
 
 	for _, dir := range worktreeDirs {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatalf("Failed to create directory %s: %v", dir, err)
 		}
 	}

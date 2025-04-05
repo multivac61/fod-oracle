@@ -8,8 +8,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/multivac61/fod-oracle/api"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/multivac61/fod-oracle/api"
 )
 
 func main() {

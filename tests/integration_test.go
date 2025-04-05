@@ -26,7 +26,7 @@ func TestMainIntegration(t *testing.T) {
 
 	// Create a database directory
 	dbDir := filepath.Join(tempDir, "db")
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
+	if err := os.MkdirAll(dbDir, 0o755); err != nil {
 		t.Fatalf("Failed to create db directory: %v", err)
 	}
 
@@ -40,20 +40,20 @@ func TestMainIntegration(t *testing.T) {
 	// Set up a small test to run with a known Nixpkgs revision
 	// You would need a real commit hash for an actual test
 	testRev := "abcdef1234567890abcdef1234567890abcdef12" // Fake commit for testing
-	
+
 	// In a real test, we would run the application with the revision
 	// and then check the database for expected results
-	
+
 	// For now, we'll just test that the database is created correctly
 	// and the schema is valid
-	
+
 	// Set up the environment for the test - uncomment if actually running the command
 	/*
-	env := append(
-		os.Environ(),
-		"FOD_ORACLE_DB_PATH="+filepath.Join(dbDir, "test.db"),
-		"FOD_ORACLE_NUM_WORKERS=4",
-	)
+		env := append(
+			os.Environ(),
+			"FOD_ORACLE_DB_PATH="+filepath.Join(dbDir, "test.db"),
+			"FOD_ORACLE_NUM_WORKERS=4",
+		)
 	*/
 
 	// Mock the application run for testing purposes
@@ -138,7 +138,7 @@ func TestMainIntegration(t *testing.T) {
         FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
     );
     `
-	
+
 	// Execute the schema creation
 	for _, statement := range strings.Split(schemaSQL, ";") {
 		if strings.TrimSpace(statement) == "" {
@@ -195,7 +195,7 @@ func TestMainIntegration(t *testing.T) {
 	}
 
 	// Test queries to validate the database structure and relationships
-	
+
 	// 1. Count FODs for the revision
 	err = db.QueryRow(`
 		SELECT COUNT(*) FROM drv_revisions

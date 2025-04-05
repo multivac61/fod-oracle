@@ -47,7 +47,7 @@ func TestMetadataStorage(t *testing.T) {
 	}
 
 	// Test that metadata was stored correctly
-	
+
 	// 1. Check evaluation_metadata entries
 	rows, err := db.Query("SELECT file_path, file_exists, attempted, succeeded, error_message, derivations_found FROM evaluation_metadata WHERE revision_id = ?", revisionID)
 	if err != nil {
@@ -62,18 +62,18 @@ func TestMetadataStorage(t *testing.T) {
 		var fileExists, attempted, succeeded int
 		var errorMsg string
 		var derivationsFound int
-		
+
 		if err := rows.Scan(&filePath, &fileExists, &attempted, &succeeded, &errorMsg, &derivationsFound); err != nil {
 			t.Fatalf("Failed to scan metadata row: %v", err)
 		}
-		
+
 		// Verify the values match our mock data
 		mockStat, ok := stats[filePath]
 		if !ok {
 			t.Errorf("Got unexpected file_path: %s", filePath)
 			continue
 		}
-		
+
 		expectedExists := 0
 		if mockStat.exists {
 			expectedExists = 1
@@ -81,7 +81,7 @@ func TestMetadataStorage(t *testing.T) {
 		if fileExists != expectedExists {
 			t.Errorf("For %s, expected file_exists=%d, got %d", filePath, expectedExists, fileExists)
 		}
-		
+
 		expectedAttempted := 0
 		if mockStat.attempted {
 			expectedAttempted = 1
@@ -89,7 +89,7 @@ func TestMetadataStorage(t *testing.T) {
 		if attempted != expectedAttempted {
 			t.Errorf("For %s, expected attempted=%d, got %d", filePath, expectedAttempted, attempted)
 		}
-		
+
 		expectedSucceeded := 0
 		if mockStat.succeeded {
 			expectedSucceeded = 1
@@ -97,11 +97,11 @@ func TestMetadataStorage(t *testing.T) {
 		if succeeded != expectedSucceeded {
 			t.Errorf("For %s, expected succeeded=%d, got %d", filePath, expectedSucceeded, succeeded)
 		}
-		
+
 		if errorMsg != mockStat.errorMessage {
 			t.Errorf("For %s, expected error_message=%q, got %q", filePath, mockStat.errorMessage, errorMsg)
 		}
-		
+
 		if derivationsFound != mockStat.derivationsFound {
 			t.Errorf("For %s, expected derivations_found=%d, got %d", filePath, mockStat.derivationsFound, derivationsFound)
 		}
@@ -117,7 +117,7 @@ func TestMetadataStorage(t *testing.T) {
 	var totalFound, totalAttempted, totalSucceeded, totalDerivations, fallbackUsed, procTime, workers, memPeak int
 	var sysInfo, hostName, cpuModel, memTotal, kernelVer, osName string
 	var cpuCores int
-	
+
 	err = db.QueryRow(`
 		SELECT 
 			total_expressions_found, total_expressions_attempted,
@@ -194,12 +194,12 @@ func mockStoreEvaluationMetadata(
 		if stat.exists {
 			fileExists = 1
 		}
-		
+
 		attempted := 0
 		if stat.attempted {
 			attempted = 1
 		}
-		
+
 		succeeded := 0
 		if stat.succeeded {
 			succeeded = 1
@@ -233,12 +233,12 @@ func mockStoreEvaluationMetadata(
 
 	// Create mock system info
 	sysInfoObj := map[string]string{
-		"Host":     "test-host",
-		"CPU":      "Test CPU Model",
+		"Host":      "test-host",
+		"CPU":       "Test CPU Model",
 		"CPU Cores": "8 (16)",
-		"Memory":   "32GB",
-		"Kernel":   "test-kernel",
-		"OS":       "test-os",
+		"Memory":    "32GB",
+		"Kernel":    "test-kernel",
+		"OS":        "test-os",
 	}
 	sysInfoBytes, _ := json.Marshal(sysInfoObj)
 	sysInfoJSON := string(sysInfoBytes)

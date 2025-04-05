@@ -19,7 +19,7 @@ func SetupTestDB(t *testing.T) (*sql.DB, func()) {
 
 	// Set up the database path
 	dbPath := filepath.Join(tempDir, "test.db")
-	
+
 	// Connect to the database with WAL mode
 	connString := dbPath + "?_journal_mode=WAL" +
 		"&_synchronous=NORMAL" +
@@ -27,7 +27,7 @@ func SetupTestDB(t *testing.T) (*sql.DB, func()) {
 		"&_temp_store=MEMORY" +
 		"&_busy_timeout=5000" +
 		"&_locking_mode=NORMAL"
-	
+
 	db, err := sql.Open("sqlite3", connString)
 	if err != nil {
 		os.RemoveAll(tempDir)

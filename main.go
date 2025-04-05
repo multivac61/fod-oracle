@@ -1028,7 +1028,7 @@ let
   drvPaths = map extractDrvPath (builtins.filter (p: p ? drvPath || p ? outPath) basicPkgs);
 in drvPaths
 `
-	if err := os.WriteFile(fallbackPath, []byte(fallbackNixContent), 0644); err != nil {
+	if err := os.WriteFile(fallbackPath, []byte(fallbackNixContent), 0o644); err != nil {
 		errMsg := fmt.Sprintf("Failed to write fallback Nix file: %v", err)
 		fallbackStats.errorMessage = errMsg
 		log.Printf("[%s] %s", rev, errMsg)
@@ -1068,7 +1068,7 @@ in drvPaths
 		}
 		fileStats[simpleFallbackPath] = simpleFallbackStats
 
-		if err := os.WriteFile(simpleFallbackPath, []byte(simpleFallbackContent), 0644); err != nil {
+		if err := os.WriteFile(simpleFallbackPath, []byte(simpleFallbackContent), 0o644); err != nil {
 			errMsg := fmt.Sprintf("Failed to write simple fallback Nix file: %v", err)
 			simpleFallbackStats.errorMessage = errMsg
 			log.Printf("[%s] %s", rev, errMsg)
@@ -1325,7 +1325,7 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 	// Initialize or update the main repository with minimal history
 	if _, err := os.Stat(mainRepoDir); os.IsNotExist(err) {
 		log.Printf("Initializing shallow clone of nixpkgs repository")
-		if err := os.MkdirAll(filepath.Dir(mainRepoDir), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(mainRepoDir), 0o755); err != nil {
 			return "", fmt.Errorf("failed to create parent directory: %w", err)
 		}
 

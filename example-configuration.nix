@@ -48,4 +48,3 @@ in
   # System configuration values
   system.stateVersion = "23.11"; # Replace with your NixOS version
 }
-

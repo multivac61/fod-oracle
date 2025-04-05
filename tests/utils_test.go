@@ -74,7 +74,7 @@ func mockGetCPUCores(coresStr string) int {
 	} else {
 		result = 0 // Parsing error simulation
 	}
-	
+
 	// If result is non-zero, it was parsed successfully
 	if result > 0 {
 		return result
@@ -137,10 +137,10 @@ func TestEnvironmentVariables(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			os.Setenv("FOD_ORACLE_NUM_WORKERS", tc.envValue)
-			
+
 			// This is just a mock test, in a real test you'd call the actual code
 			result := mockGetWorkersFromEnv(tc.defaultVal)
-			
+
 			if result != tc.expectedVal {
 				t.Errorf("Expected workers to be %d, got %d", tc.expectedVal, result)
 			}
@@ -151,14 +151,14 @@ func TestEnvironmentVariables(t *testing.T) {
 	t.Run("test database path", func(t *testing.T) {
 		testPath := "/tmp/test-fods.db"
 		os.Setenv("FOD_ORACLE_DB_PATH", testPath)
-		
+
 		// In a real test, you'd call the actual function
 		resultPath := mockGetDBPath()
-		
+
 		if resultPath != testPath {
 			t.Errorf("Expected DB path to be %s, got %s", testPath, resultPath)
 		}
-		
+
 		// Test default path when env var is not set
 		os.Setenv("FOD_ORACLE_DB_PATH", "")
 		defaultPath := mockGetDBPath()
@@ -174,18 +174,18 @@ func mockGetWorkersFromEnv(defaultVal int) int {
 	if workersEnv == "" {
 		return defaultVal
 	}
-	
+
 	workers := 0
 	// This is just a mock function - in real code we would parse the value
 	if workersEnv == "24" {
 		workers = 24
 	}
-	
+
 	// If workers is still 0, parsing failed or was negative
 	if workers <= 0 {
 		return defaultVal
 	}
-	
+
 	return workers
 }
 
@@ -195,7 +195,7 @@ func mockGetDBPath() string {
 	if dbPath != "" {
 		return dbPath
 	}
-	
+
 	// Mock default path logic
 	return "/current/working/dir/db/fods.db"
 }
