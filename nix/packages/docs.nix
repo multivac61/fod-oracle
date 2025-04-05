@@ -99,7 +99,7 @@ pkgs.stdenv.mkDerivation {
 
     # Create HTML version of README
     mkdir -p output
-    pandoc -s -f markdown -t html5 \
+    pandoc -s -f gfm -t html5 \
       --metadata title="FOD Oracle" \
       -o output/index.html \
       README.md \
