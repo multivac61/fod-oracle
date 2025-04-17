@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log" // Added for max function
+	"net/http"
+	_ "net/http/pprof" // Import for profiling endpoint
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -158,9 +160,9 @@ func init() {
 	systemInfoJSON = jsonStr
 
 	// Set the default number of workers for nix-eval-jobs.
-	// Default to half the logical cores (minimum 1) to reduce potential memory pressure
-	// from many concurrent Nix evaluations. Tune this via the env var.
-	defaultNixWorkers := max(1, runtime.NumCPU()/2)
+	// Reverted default to NumCPU() as memory seems less constrained now.
+	// Tune this via the env var FOD_ORACLE_NIX_EVAL_WORKERS if needed.
+	defaultNixWorkers := runtime.NumCPU()
 	nixEvalJobsWorkers = defaultNixWorkers
 
 	// Check for custom worker count for nix-eval-jobs in environment
@@ -173,8 +175,15 @@ func init() {
 				workersEnv, err, nixEvalJobsWorkers) // Log the actual default being used
 		}
 	} else {
-		log.Printf("Using default worker count of %d for nix-eval-jobs (half CPU cores, min 1). Set FOD_ORACLE_NIX_EVAL_WORKERS to override.", nixEvalJobsWorkers)
+		log.Printf("Using default worker count of %d for nix-eval-jobs (CPU cores). Set FOD_ORACLE_NIX_EVAL_WORKERS to override.", nixEvalJobsWorkers)
 	}
+
+	// Enable block profiling to see where goroutines are waiting.
+	// Rate 1 means profile all blocking events. Adjust if overhead is too high.
+	runtime.SetBlockProfileRate(1)
+	// Enable mutex profiling to see lock contention.
+	// Rate 1 means profile all mutex contention. Adjust if overhead is too high.
+	runtime.SetMutexProfileFraction(1)
 }
 
 // initDB initializes the SQLite database
@@ -221,8 +230,8 @@ func initDB() *sql.DB {
 		"PRAGMA synchronous=NORMAL;",
 		"PRAGMA cache_size=-200000;", // ~200MB. Can be increased if DB operations are a bottleneck and RAM is available.
 		"PRAGMA temp_store=MEMORY;",
-		"PRAGMA mmap_size=4000000000;", // Reduced Memory mapping size (4GB). Can reserve significant virtual memory. Adjust based on RAM and DB size. Set to 0 to disable.
-		"PRAGMA page_size=32768;",      // Larger page size can help with large DBs
+		"PRAGMA mmap_size=0;",     // Disabled Memory mapping. Rely on OS page cache via cache_size. Might improve perf if mmap caused issues.
+		"PRAGMA page_size=32768;", // Larger page size can help with large DBs
 		"PRAGMA foreign_keys=ON;",
 		// "PRAGMA auto_vacuum=INCREMENTAL;", // Consider if DB size shrinks often, but adds overhead.
 	}
@@ -457,11 +466,14 @@ func (b *DBBatcher) writerLoop() {
 }
 
 // logStats prints processing statistics periodically
-func (b *DBBatcher) logStats() {
-	// Assumes lock is held by caller or called internally
-	if time.Since(b.lastStatsTime) >= 3*time.Second {
-		log.Printf("DB Stats: processed %d derivations, queued %d FODs for writing", b.stats.drvs, b.stats.fods)
-		b.lastStatsTime = time.Now()
+func (b *DBBatcher) logStats(force bool) { // Add force flag
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	// Log every 10 seconds OR if forced
+	if force || now.Sub(b.lastStatsTime) >= 10*time.Second {
+		log.Printf("Progress: Processed %d derivations, Queued %d FODs for DB write.", b.stats.drvs, b.stats.fods)
+		b.lastStatsTime = now
 	}
 }
 
@@ -619,13 +631,13 @@ func (b *DBBatcher) AddFOD(fod FOD) {
 
 // IncrementDrvCount increments the count of processed derivations and logs stats periodically.
 func (b *DBBatcher) IncrementDrvCount() {
-	b.mu.Lock()
-	b.stats.drvs++
-	shouldLog := time.Since(b.lastStatsTime) >= 3*time.Second
-	if shouldLog {
-		b.logStats() // Log stats while lock is held
-	}
-	b.mu.Unlock()
+	// No lock needed here, only called from processDerivation which already ensures single access via LoadOrStore
+	// b.mu.Lock()
+	// Use atomic increment? Simpler to just rely on batcher stats method locking.
+	// atomic.AddInt64(&b.stats.drvs, 1)
+	// b.mu.Unlock()
+
+	// Let logStats handle locking and counting for simplicity now
 }
 
 // GetProcessedDrvCount returns the current count of processed derivations.
@@ -644,6 +656,9 @@ func (b *DBBatcher) Flush() error {
 		b.mu.Unlock()
 		return nil // Nothing to flush
 	}
+
+	// Log stats one last time before flushing
+	b.logStats(true) // Force logging
 
 	// Copy remaining batches
 	fodsToSend := make([]FOD, len(b.fodBatch))
@@ -703,8 +718,22 @@ func (b *DBBatcher) Close() error {
 	// Signal the writer goroutine to exit by closing the channel
 	// Ensure writeChan is not nil before closing
 	if b.writeChan != nil {
-		close(b.writeChan)
-		b.writeChan = nil // Prevent double close
+		// Check if channel is already closed to prevent panic
+		select {
+		case _, ok := <-b.writeChan:
+			if !ok {
+				// Already closed
+				b.writeChan = nil
+			} else {
+				// Should not happen if read properly, but close defensively
+				close(b.writeChan)
+				b.writeChan = nil
+			}
+		default:
+			// Not closed, close it now
+			close(b.writeChan)
+			b.writeChan = nil
+		}
 	}
 
 	// Wait for the writer goroutine to finish processing and exit
@@ -766,7 +795,8 @@ type ProcessingContext struct {
 	batcher       *DBBatcher    // For writing results to the database
 	processedDrvs *sync.Map     // Thread-safe map to track processed derivations (key: drvPath, value: bool)
 	workQueue     chan<- string // Channel to send newly found derivation paths for processing
-	// wg is removed, managed within findFODsForRevision now
+	drvCounter    *int64        // Pointer to the shared counter in findFODsForRevision
+	muCounter     *sync.Mutex   // Mutex for the shared counter
 }
 
 // processDerivation processes a single derivation file.
@@ -783,8 +813,12 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 		return // Already processed or being processed by another goroutine
 	}
 
-	// Increment the counter only *after* successfully marking it as processed
-	ctx.batcher.IncrementDrvCount()
+	// Increment the shared counter atomically *after* successfully marking it as processed
+	// This ensures the counter reflects derivations actually starting processing.
+	ctx.muCounter.Lock()
+	*ctx.drvCounter++
+	ctx.muCounter.Unlock()
+	// ctx.batcher.IncrementDrvCount() // Remove direct call to batcher counter
 
 	// --- Open and Parse Derivation ---
 	// Use buffered reader for potentially better performance on larger files
@@ -806,7 +840,7 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 	}
 
 	// --- Process Outputs (Find FODs) ---
-	// isFOD := false // Keep track if this drv is a FOD
+	isFOD := false // Keep track if this drv is a FOD
 	for name, out := range drv.Outputs {
 		// Check if it's a Fixed Output Derivation (has hash info)
 		if out.HashAlgorithm != "" && out.Hash != "" {
@@ -817,7 +851,7 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 				Hash:          out.Hash,
 			}
 			ctx.batcher.AddFOD(fod) // Add to the database batch
-			// isFOD = true           // Mark that this drv is a FOD
+			isFOD = true            // Mark that this drv is a FOD
 
 			if os.Getenv("VERBOSE") == "1" {
 				log.Printf("Found FOD: %s (output: %s, hash: %s:%s)",
@@ -834,7 +868,8 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 	// --- Queue Input Derivations ---
 	// Optimization: If the current derivation itself was a FOD, we generally don't need to
 	// explore its inputs further for *this specific task* (finding FODs).
-	// Uncomment the 'if isFOD' block to enable this optimization.
+	// Uncomment the 'if isFOD' block to enable this optimization. This can significantly
+	// reduce the number of derivations processed if you only need the FODs themselves.
 	// if isFOD {
 	//     if os.Getenv("VERBOSE") == "1" {
 	//         log.Printf("Skipping inputs for FOD: %s", filepath.Base(inputFile))
@@ -930,8 +965,9 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	}()
 
 	// --- Initialize Database Batcher ---
-	// Use a reasonable batch size, e.g., 1000 or 5000. Larger batches reduce commit overhead but increase memory per batch.
-	batcher, err := NewDBBatcher(db, 2000, revisionID)
+	// Increased batch size to reduce commit frequency
+	dbBatchSize := 5000
+	batcher, err := NewDBBatcher(db, dbBatchSize, revisionID)
 	if err != nil {
 		return fmt.Errorf("[%s] failed to create database batcher: %w", rev, err)
 	}
@@ -943,10 +979,16 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	// Tune buffer size based on memory and expected number of derivations. 100k paths * ~100 bytes/path = ~10MB.
 	workQueue := make(chan string, 100000)
 
+	// Shared counter for processed derivations
+	var processedDrvCount int64 = 0
+	var counterMutex sync.Mutex
+
 	ctx := &ProcessingContext{
 		batcher:       batcher,
 		processedDrvs: processedDrvs,
 		workQueue:     workQueue, // Pass the send-only channel interface
+		drvCounter:    &processedDrvCount,
+		muCounter:     &counterMutex,
 	}
 
 	// Determine number of Go worker goroutines (use logical cores)
@@ -969,17 +1011,22 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		}(i)
 	}
 
-	// --- Memory Monitoring ---
+	// --- Memory Monitoring & Progress Reporting ---
 	var peakMemoryMB int64
 	var memoryMutex sync.Mutex
-	memoryDone := make(chan struct{})
+	monitorDone := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
+		memTicker := time.NewTicker(10 * time.Second)
+		progressTicker := time.NewTicker(15 * time.Second) // Log progress every 15s
+		defer memTicker.Stop()
+		defer progressTicker.Stop()
+
 		var m runtime.MemStats
+		var lastLoggedCount int64 = -1 // Initialize to ensure first log happens
+
 		for {
 			select {
-			case <-ticker.C:
+			case <-memTicker.C:
 				runtime.ReadMemStats(&m)
 				// Alloc is bytes allocated and not yet freed.
 				// Sys is total bytes obtained from OS.
@@ -994,8 +1041,21 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 				memoryMutex.Unlock()
 				log.Printf("[%s] Memory Usage: Alloc=%dMB Sys=%dMB (Peak Sys Reached=%dMB)",
 					rev, allocMB, sysMB, currentPeak)
-			case <-memoryDone:
-				log.Printf("[%s] Memory monitoring stopped.", rev)
+
+			case <-progressTicker.C:
+				counterMutex.Lock()
+				currentCount := processedDrvCount
+				counterMutex.Unlock()
+				// Only log if the count has changed since last time
+				if currentCount != lastLoggedCount {
+					log.Printf("[%s] Progress: Started processing %d derivations...", rev, currentCount)
+					lastLoggedCount = currentCount
+				}
+				// Also log DB stats periodically from here
+				batcher.logStats(false) // Log DB stats (non-forced)
+
+			case <-monitorDone:
+				log.Printf("[%s] Monitoring stopped.", rev)
 				return
 			}
 		}
@@ -1026,12 +1086,13 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 					// If the queue is full, the worker pool is the bottleneck.
 					// The path is already marked in processedDrvs, so it won't be processed later.
 				}
-				if queuedJobCount%5000 == 0 {
-					log.Printf("[%s] Queued %d unique initial derivations for processing (received %d total)...", rev, queuedJobCount, initialJobCount)
-				}
+				// Log less frequently here, main progress log is in monitor goroutine
+				// if queuedJobCount%20000 == 0 {
+				// 	log.Printf("[%s] Queued %d unique initial derivations for processing (received %d total)...", rev, queuedJobCount, initialJobCount)
+				// }
 			}
 		}
-		log.Printf("[%s] Finished processing %d initial derivations from nix-eval-jobs/fallback (%d unique queued).", rev, initialJobCount, queuedJobCount)
+		log.Printf("[%s] Finished receiving %d initial derivations from nix-eval-jobs/fallback (%d unique queued).", rev, initialJobCount, queuedJobCount)
 		// CRITICAL: Close the workQueue only after all initial paths are sent
 		// and the feeder goroutine is done processing drvPathChan.
 		close(workQueue)
@@ -1060,8 +1121,8 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	workerWg.Wait()
 	log.Printf("[%s] Go processing worker pool finished.", rev)
 
-	// Stop memory monitoring
-	close(memoryDone)
+	// Stop memory monitoring and progress reporting
+	close(monitorDone)
 
 	// Final flush of any remaining data in the DB batcher
 	log.Printf("[%s] Flushing final DB batches...", rev)
@@ -1076,13 +1137,21 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	log.Printf("[%s] Processing completed in %v", rev, revElapsed)
 
 	// Get final counts
-	processedCount := batcher.GetProcessedDrvCount() // Get count from batcher's internal stats
+	counterMutex.Lock()
+	finalProcessedCount := processedDrvCount // Get final count
+	counterMutex.Unlock()
 	var fodCount int64
 	countErr := db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount)
 	if countErr != nil {
 		log.Printf("[%s] Error counting final FODs in DB: %v", rev, countErr)
 	} else {
-		log.Printf("[%s] Final stats: Found %d FODs, processed %d total unique derivations.", rev, fodCount, processedCount)
+		log.Printf("[%s] Final stats: Found %d FODs, processed %d total unique derivations.", rev, fodCount, finalProcessedCount)
+	}
+
+	// Calculate and log processing rate
+	if revElapsed.Seconds() > 0 {
+		rate := float64(finalProcessedCount) / revElapsed.Seconds()
+		log.Printf("[%s] Average processing rate: %.2f derivations/second", rev, rate)
 	}
 
 	// Get final peak memory
@@ -1094,7 +1163,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	// Store evaluation metadata and overall stats
 	log.Printf("[%s] Storing evaluation metadata...", rev)
 	if storeErr := storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir,
-		revElapsed, usedFallback, finalPeakMemory, processedCount, numGoWorkers); storeErr != nil {
+		revElapsed, usedFallback, finalPeakMemory, finalProcessedCount, numGoWorkers); storeErr != nil {
 		log.Printf("[%s] Error storing evaluation metadata: %v", rev, storeErr)
 		// Decide if this error should cause the overall function to fail
 		// return storeErr // Optionally propagate metadata storage error
@@ -1105,13 +1174,14 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	// --- Performance Hint ---
 	// If CPU utilization is still low after these changes, consider:
 	// 1. Profiling `nix-eval-jobs` itself to see where it spends time.
-	// 2. Profiling this Go application (`go tool pprof`) to check for bottlenecks in:
-	//    - `processDerivation` (File I/O, JSON parsing)
-	//    - `DBBatcher` (Waiting for DB writes)
-	//    - Lock contention (though `sync.Map` and channel usage should minimize this)
+	// 2. Profiling this Go application (`go tool pprof http://localhost:6060/debug/pprof/`) to check for bottlenecks in:
+	//    - CPU Profile: Where time is spent (parsing, map access, etc.)
+	//    - Block Profile: Where goroutines are waiting (disk I/O, DB writes, channel waits)
+	//    - Mutex Profile: Lock contention (less likely now)
 	// 3. Increasing `nixEvalJobsWorkers` cautiously if memory allows.
-	// 4. Checking system I/O performance (disk speed).
-	log.Printf("[%s] Performance Hint: If CPU usage remains low, profile nix-eval-jobs or this Go app (pprof) to find bottlenecks.", rev)
+	// 4. Checking system I/O performance (disk speed for drv files and DB).
+	// 5. Uncommenting the FOD input skipping optimization in `processDerivation` if applicable.
+	log.Printf("[%s] Performance Hint: If CPU usage remains low, use pprof (http://localhost:6060/debug/pprof/) to find bottlenecks. Check block profile for I/O waits.", rev)
 
 	// Return the original evaluation error, if any
 	if evalErr != nil {
@@ -1180,12 +1250,13 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 		stats := fileStats[expressionPath] // Get stats object for this file
 		stats.attempted = true             // Mark as attempted
 
-		// Lowered default memory per worker
+		// Memory per worker (kept lower)
 		nixWorkerMemoryLimit := "2048" // MB
 		log.Printf("[%s] Evaluating expression file: %s with %d workers (mem limit %s MB)...", rev, relPath, workers, nixWorkerMemoryLimit)
 
 		// Build the nix-eval-jobs command
 		// Consider adding --impure if needed for specific nixpkgs versions/setups
+		// Add --force-check true? Might slow down but ensures drv path validity? Maybe not needed.
 		cmd := exec.Command("nix-eval-jobs",
 			expressionPath, // Use the full path
 			"--workers", fmt.Sprintf("%d", workers),
@@ -1287,9 +1358,9 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 				}
 
 				// Optional: Log progress periodically per file
-				if jobCountFile%5000 == 0 {
-					log.Printf("[%s] Found %d derivations from %s...", rev, jobCountFile, relPath)
-				}
+				// if jobCountFile%10000 == 0 {
+				// 	log.Printf("[%s] Found %d derivations from %s...", rev, jobCountFile, relPath)
+				// }
 			}
 		}
 
@@ -1872,6 +1943,18 @@ func main() {
 	log.Println("=================================================")
 	log.Println("Starting Nixpkgs FOD Finder")
 	log.Println("=================================================")
+
+	// --- Start Profiling Endpoint ---
+	// Run `go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30` for CPU profile
+	// Run `go tool pprof http://localhost:6060/debug/pprof/block` for blocking profile
+	// Run `go tool pprof http://localhost:6060/debug/pprof/mutex` for mutex profile
+	go func() {
+		log.Println("Starting pprof HTTP server on :6060")
+		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+			log.Printf("Error starting pprof server: %v", err)
+		}
+	}()
+	// --------------------------------
 
 	// Log initial configuration and system info
 	log.Printf("Configuration: nix-eval-jobs workers = %d (tune with FOD_ORACLE_NIX_EVAL_WORKERS)", nixEvalJobsWorkers)
