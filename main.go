@@ -1202,14 +1202,14 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 	// Order matters: try preferred/common ones first
 	relativePaths := []string{
 		"pkgs/top-level/release-outpaths.nix",
-		"pkgs/top-level/release.nix",
-		"pkgs/top-level/release-small.nix",
-		"pkgs/top-level/all-packages.nix",
-		"nixos/release.nix",
-		"nixos/release-small.nix",
-		"nixos/release-combined.nix",
-		"all-packages.nix", // Older nixpkgs might have this at top-level
-		"default.nix",      // Less common for full evaluation, but possible
+		// "pkgs/top-level/release.nix",
+		// "pkgs/top-level/release-small.nix",
+		// "pkgs/top-level/all-packages.nix",
+		// "nixos/release.nix",
+		// "nixos/release-small.nix",
+		// "nixos/release-combined.nix",
+		// "all-packages.nix", // Older nixpkgs might have this at top-level
+		// "default.nix",      // Less common for full evaluation, but possible
 	}
 
 	var existingPaths []string                            // Store full paths of files that actually exist
