@@ -75,3 +75,4 @@ _testmain.go
 
 nixpkgs-*
 bin/
+fod-oracle
