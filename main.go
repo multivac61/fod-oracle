@@ -68,8 +68,8 @@ type NeofetchInfo struct {
 	// The raw JSON string is also stored, so we don't lose any fields
 }
 
-// Default number of workers for nix-eval-jobs
-var workers = 16
+// Default number of workers for nix-eval-jobs, will be set to NumCPU in init()
+var workers int
 
 // systemInfo holds the neofetch JSON data
 var systemInfoJSON string
@@ -143,15 +143,20 @@ func init() {
 	systemInfo, jsonStr = getSystemInfo()
 	systemInfoJSON = jsonStr
 
+	// Set the default number of workers to the number of CPU cores
+	workers = runtime.NumCPU()
+	
 	// Check for custom worker count in environment
 	if workersEnv := os.Getenv("FOD_ORACLE_NUM_WORKERS"); workersEnv != "" {
 		if w, err := strconv.Atoi(workersEnv); err == nil && w > 0 {
 			workers = w
 			log.Printf("Using %d workers from FOD_ORACLE_NUM_WORKERS environment variable", workers)
 		} else if err != nil {
-			log.Printf("Warning: Invalid FOD_ORACLE_NUM_WORKERS value '%s': %v. Using default: %d",
+			log.Printf("Warning: Invalid FOD_ORACLE_NUM_WORKERS value '%s': %v. Using default: %d (number of CPU cores)",
 				workersEnv, err, workers)
 		}
+	} else {
+		log.Printf("Using default worker count of %d (number of CPU cores)", workers)
 	}
 }
 
@@ -578,12 +583,15 @@ func (b *DBBatcher) Close() error {
 
 // ProcessingContext holds the context for processing derivations
 type ProcessingContext struct {
-	batcher   *DBBatcher
-	visited   *sync.Map
-	wg        *sync.WaitGroup
-	semaphore chan struct{} // Limit concurrency
+	batcher     *DBBatcher
+	visited     *sync.Map
+	processedDrvs map[string]bool // Map to quickly check if we've already processed a derivation
+	wg          *sync.WaitGroup
+	workQueue   chan string       // Channel for queuing derivation paths
 }
 
+// processDerivation processes a single derivation
+// It assumes the caller has already checked and marked the derivation as processed
 func processDerivation(inputFile string, ctx *ProcessingContext) {
 	ctx.batcher.IncrementDrvCount()
 
@@ -619,22 +627,8 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 
 	// Queue input derivations to process
 	for path := range drv.InputDerivations {
-		if _, loaded := ctx.visited.LoadOrStore(path, true); !loaded {
-			// Acquire semaphore to limit concurrency
-			select {
-			case ctx.semaphore <- struct{}{}:
-				// We got a slot, process in a new goroutine
-				ctx.wg.Add(1)
-				go func(drvPath string) {
-					defer ctx.wg.Done()
-					defer func() { <-ctx.semaphore }() // Release semaphore when done
-					processDerivation(drvPath, ctx)
-				}(path)
-			default:
-				// No slots available, process in current goroutine
-				processDerivation(path, ctx)
-			}
-		}
+		// Send to the queue - each worker will check if it's been processed
+		ctx.workQueue <- path
 	}
 }
 
@@ -679,6 +673,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	}
 	defer batcher.Close()
 
+	// Use sync.Map for thread-safe sharing across goroutines
 	visited := &sync.Map{}
 	var wg sync.WaitGroup
 
@@ -707,41 +702,74 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		}
 	}()
 
-	// Create processing context with semaphore to limit concurrency
-	maxConcurrency := 5000
+	// Create a processing context with a work queue
+	workQueue := make(chan string, 100000) // Large buffer to avoid blocking
+	
+	// Create a map for quick lookup to avoid processing the same path multiple times
+	processedDrvs := make(map[string]bool)
+	
+	// Use number of CPU cores for worker pool size
+	numCPUCores := runtime.NumCPU()
+	log.Printf("[%s] Setting up worker pool with %d workers (matching CPU cores)", rev, numCPUCores)
+	
 	ctx := &ProcessingContext{
-		batcher:   batcher,
-		visited:   visited,
-		wg:        &wg,
-		semaphore: make(chan struct{}, maxConcurrency),
+		batcher:     batcher,
+		visited:     visited,
+		processedDrvs: processedDrvs,
+		wg:          &wg,
+		workQueue:   workQueue,
 	}
 
 	// Create a channel to receive derivation paths from nix-eval-jobs
 	drvPathChan := make(chan string, 50000)
 
-	// Start a goroutine to process derivation paths as they come in
-	done := make(chan struct{})
+	// Create a separate mutex for the processedDrvs map
+	// since it will be accessed by multiple worker goroutines
+	var processedMutex sync.Mutex
+
+	// Start worker pool with number of workers matching CPU cores
+	workerDone := make(chan struct{})
+	for i := 0; i < numCPUCores; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			
+			for drvPath := range workQueue {
+				// Local check with mutex to avoid processing the same path multiple times
+				processedMutex.Lock()
+				if _, exists := processedDrvs[drvPath]; exists {
+					processedMutex.Unlock()
+					continue
+				}
+				processedDrvs[drvPath] = true
+				processedMutex.Unlock()
+				
+				processDerivation(drvPath, ctx)
+			}
+			
+			if workerID == 0 {
+				log.Printf("[%s] Worker %d: Work queue closed, completing remaining tasks", rev, workerID)
+			}
+		}(i)
+	}
+
+	// Start a goroutine to process derivation paths from nix-eval-jobs
 	go func() {
 		for drvPath := range drvPathChan {
-			if _, loaded := visited.LoadOrStore(drvPath, true); !loaded {
-				// Process in a goroutine if we can acquire a semaphore
-				select {
-				case ctx.semaphore <- struct{}{}:
-					wg.Add(1)
-					go func(path string) {
-						defer wg.Done()
-						defer func() { <-ctx.semaphore }()
-						processDerivation(path, ctx)
-					}(drvPath)
-				default:
-					// Process in the current goroutine if we can't acquire a semaphore
-					processDerivation(drvPath, ctx)
-				}
+			// Check if we've already seen this path before sending to work queue
+			processedMutex.Lock()
+			if _, exists := processedDrvs[drvPath]; !exists {
+				workQueue <- drvPath
 			}
+			processedMutex.Unlock()
 		}
-		// Wait for all processing to complete
+		
+		// Close the work queue when all inputs have been processed
+		close(workQueue)
+		
+		// Wait for all workers to complete
 		wg.Wait()
-		close(done)
+		close(workerDone)
 	}()
 
 	// Variable to track if fallback was used
@@ -773,7 +801,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	// Wait for completion or timeout
 	timeout := time.After(1 * time.Hour)
 	select {
-	case <-done:
+	case <-workerDone:
 		log.Printf("[%s] All derivations processed", rev)
 	case <-timeout:
 		log.Printf("[%s] Processing timed out after 1 hour", rev)
@@ -787,7 +815,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	if err := db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount); err != nil {
 		log.Printf("[%s] Error counting FODs: %v", rev, err)
 	}
-	log.Printf("[%s] Final stats: %d FODs", rev, fodCount)
+	log.Printf("[%s] Final stats: %d FODs (%d derivations processed)", rev, fodCount, len(processedDrvs))
 
 	// Store the evaluation metadata in the database
 	memoryMutex.Lock()
@@ -800,7 +828,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	} else {
 		cpuCores := getCPUCores(systemInfo.Cores)
 		log.Printf("[%s] Successfully stored evaluation metadata in database (workers=%d, peak memory=%dMB)",
-			rev, workers, finalPeakMemory)
+			rev, numCPUCores, finalPeakMemory)
 		log.Printf("[%s] System info: %s, %s, %s, %d cores",
 			rev, systemInfo.Host, systemInfo.OS, systemInfo.CPU, cpuCores)
 	}
