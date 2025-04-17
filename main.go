@@ -870,12 +870,12 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 	// explore its inputs further for *this specific task* (finding FODs).
 	// Uncomment the 'if isFOD' block to enable this optimization. This can significantly
 	// reduce the number of derivations processed if you only need the FODs themselves.
-	// if isFOD {
-	//     if os.Getenv("VERBOSE") == "1" {
-	//         log.Printf("Skipping inputs for FOD: %s", filepath.Base(inputFile))
-	//     }
-	//     return // Optimization: Stop traversal at FODs if only finding FODs matters
-	// }
+	if isFOD {
+		if os.Getenv("VERBOSE") == "1" {
+			log.Printf("Skipping inputs for FOD: %s", filepath.Base(inputFile))
+		}
+		return // Optimization: Stop traversal at FODs if only finding FODs matters
+	}
 
 	for inputDrvPath := range drv.InputDerivations {
 		// Check if the input derivation has *already* been processed or queued.
