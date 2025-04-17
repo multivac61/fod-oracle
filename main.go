@@ -171,6 +171,13 @@ func initDB() *sql.DB {
 		}
 		dbPath = filepath.Join(currentDir, "db", "fods.db")
 	}
+	
+	// Make sure the parent directory exists
+	dbDir := filepath.Dir(dbPath)
+	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		log.Fatalf("Failed to create database directory at %s: %v", dbDir, err)
+	}
+	log.Printf("Using database at %s", dbPath)
 
 	// Add busy_timeout and other optimizations
 	connString := dbPath + "?_journal_mode=WAL" +
