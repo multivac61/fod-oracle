@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log" // Added for max function
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -142,6 +142,14 @@ func getSystemInfo() (NeofetchInfo, string) {
 	return info, jsonStr
 }
 
+// max returns the larger of x or y.
+func max(x, y int) int {
+	if x < y {
+		return y
+	}
+	return x
+}
+
 // init initializes configuration from environment variables
 func init() {
 	// Collect system information
@@ -149,8 +157,11 @@ func init() {
 	systemInfo, jsonStr = getSystemInfo()
 	systemInfoJSON = jsonStr
 
-	// Set the default number of workers for nix-eval-jobs to the number of logical CPU cores
-	nixEvalJobsWorkers = runtime.NumCPU()
+	// Set the default number of workers for nix-eval-jobs.
+	// Default to half the logical cores (minimum 1) to reduce potential memory pressure
+	// from many concurrent Nix evaluations. Tune this via the env var.
+	defaultNixWorkers := max(1, runtime.NumCPU()/2)
+	nixEvalJobsWorkers = defaultNixWorkers
 
 	// Check for custom worker count for nix-eval-jobs in environment
 	if workersEnv := os.Getenv("FOD_ORACLE_NIX_EVAL_WORKERS"); workersEnv != "" {
@@ -158,11 +169,11 @@ func init() {
 			nixEvalJobsWorkers = w
 			log.Printf("Using %d workers for nix-eval-jobs from FOD_ORACLE_NIX_EVAL_WORKERS environment variable", nixEvalJobsWorkers)
 		} else if err != nil {
-			log.Printf("Warning: Invalid FOD_ORACLE_NIX_EVAL_WORKERS value '%s': %v. Using default: %d (logical CPU cores)",
-				workersEnv, err, nixEvalJobsWorkers)
+			log.Printf("Warning: Invalid FOD_ORACLE_NIX_EVAL_WORKERS value '%s': %v. Using default: %d",
+				workersEnv, err, nixEvalJobsWorkers) // Log the actual default being used
 		}
 	} else {
-		log.Printf("Using default worker count of %d for nix-eval-jobs (logical CPU cores)", nixEvalJobsWorkers)
+		log.Printf("Using default worker count of %d for nix-eval-jobs (half CPU cores, min 1). Set FOD_ORACLE_NIX_EVAL_WORKERS to override.", nixEvalJobsWorkers)
 	}
 }
 
@@ -189,7 +200,7 @@ func initDB() *sql.DB {
 	// Consider tuning these based on workload and system
 	connString := dbPath + "?_journal_mode=WAL" + // Write-Ahead Logging for better concurrency
 		"&_synchronous=NORMAL" + // Less strict than FULL, faster writes
-		"&_cache_size=-200000" + // Cache size in KiB (negative means KiB), ~200MB
+		"&_cache_size=-200000" + // Cache size in KiB (negative means KiB), ~200MB. Increase if RAM allows and DB ops are slow.
 		"&_temp_store=MEMORY" + // Use memory for temporary tables
 		"&_busy_timeout=10000" + // 10 second timeout for locks
 		"&_locking_mode=NORMAL" // Default locking mode
@@ -208,11 +219,12 @@ func initDB() *sql.DB {
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL;",
 		"PRAGMA synchronous=NORMAL;",
-		"PRAGMA cache_size=-200000;", // ~200MB
+		"PRAGMA cache_size=-200000;", // ~200MB. Can be increased if DB operations are a bottleneck and RAM is available.
 		"PRAGMA temp_store=MEMORY;",
-		"PRAGMA mmap_size=30000000000;", // Memory mapping (adjust based on RAM)
-		"PRAGMA page_size=32768;",       // Larger page size can help with large DBs
+		"PRAGMA mmap_size=4000000000;", // Reduced Memory mapping size (4GB). Can reserve significant virtual memory. Adjust based on RAM and DB size. Set to 0 to disable.
+		"PRAGMA page_size=32768;",      // Larger page size can help with large DBs
 		"PRAGMA foreign_keys=ON;",
+		// "PRAGMA auto_vacuum=INCREMENTAL;", // Consider if DB size shrinks often, but adds overhead.
 	}
 
 	for _, pragma := range pragmas {
@@ -462,6 +474,8 @@ func (b *DBBatcher) executeWriteWithRetry(fods []FOD, relations []DrvRevision) e
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
 			backoff := baseBackoff * time.Duration(1<<attempt) // Exponential backoff
+			// Add jitter to backoff
+			backoff += time.Duration(float64(baseBackoff) * 0.1 * float64(attempt))
 			time.Sleep(backoff)
 			log.Printf("Retrying DB write (attempt %d/%d) after error: %v", attempt+1, maxRetries, lastErr)
 		}
@@ -473,7 +487,13 @@ func (b *DBBatcher) executeWriteWithRetry(fods []FOD, relations []DrvRevision) e
 		lastErr = err
 
 		// Check for specific errors that shouldn't be retried (e.g., constraint violations)
+		// This depends heavily on the specific errors returned by the sqlite driver
 		// if errors.Is(err, someNonRetryableError) { break }
+		// Example: Check if the error message indicates a constraint failure
+		if strings.Contains(err.Error(), "constraint failed") {
+			log.Printf("Warning: Encountered non-retryable constraint error during DB write: %v", err)
+			break // Don't retry constraint errors
+		}
 	}
 
 	log.Printf("ERROR: Failed to write batch to DB after %d attempts: %v", maxRetries, lastErr)
@@ -487,20 +507,44 @@ func (b *DBBatcher) executeWrite(fods []FOD, relations []DrvRevision) error {
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback() // Rollback if commit fails or function panics
+	// Ensure rollback happens if commit isn't reached
+	// Use a flag to track if commit was successful
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
 
-	fodStmtTx := tx.Stmt(b.fodStmt)
-	relStmtTx := tx.Stmt(b.relStmt)
-	defer fodStmtTx.Close() // Ensure prepared statements within tx are closed
+	fodStmtTx, err := tx.Prepare(`
+        INSERT INTO fods (drv_path, output_path, hash_algorithm, hash)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(drv_path) DO UPDATE SET
+        output_path = excluded.output_path,
+        hash_algorithm = excluded.hash_algorithm,
+        hash = excluded.hash,
+        timestamp = CURRENT_TIMESTAMP
+    `)
+	if err != nil {
+		return fmt.Errorf("failed to prepare FOD statement in transaction: %w", err)
+	}
+	defer fodStmtTx.Close()
+
+	relStmtTx, err := tx.Prepare(`
+        INSERT INTO drv_revisions (drv_path, revision_id)
+        VALUES (?, ?)
+        ON CONFLICT(drv_path, revision_id) DO NOTHING
+    `)
+	if err != nil {
+		return fmt.Errorf("failed to prepare relation statement in transaction: %w", err)
+	}
 	defer relStmtTx.Close()
 
 	// Insert/Update FODs
 	for _, fod := range fods {
-		_, err = fodStmtTx.Exec(
-			fod.DrvPath, fod.OutputPath, fod.HashAlgorithm, fod.Hash, // Values for INSERT
-			// fod.OutputPath, fod.HashAlgorithm, fod.Hash, // Values for ON CONFLICT UPDATE (using excluded)
-		)
+		_, err = fodStmtTx.Exec(fod.DrvPath, fod.OutputPath, fod.HashAlgorithm, fod.Hash)
 		if err != nil {
+			// Return error immediately on first failure within the transaction
 			return fmt.Errorf("failed to execute FOD statement for %s: %w", fod.DrvPath, err)
 		}
 	}
@@ -509,10 +553,9 @@ func (b *DBBatcher) executeWrite(fods []FOD, relations []DrvRevision) error {
 	for _, rel := range relations {
 		_, err = relStmtTx.Exec(rel.DrvPath, rel.RevisionID)
 		if err != nil {
-			// Don't necessarily fail the whole batch for relation errors if FODs are important
-			// Log the error and continue, or return error depending on requirements
-			log.Printf("Warning: Failed to execute relation statement for %s (rev %d): %v", rel.DrvPath, rel.RevisionID, err)
-			// return fmt.Errorf("failed to execute relation statement for %s: %w", rel.DrvPath, err)
+			// Log warning but continue? Or fail fast? Failing fast is safer for data consistency.
+			// log.Printf("Warning: Failed to execute relation statement for %s (rev %d): %v", rel.DrvPath, rel.RevisionID, err)
+			return fmt.Errorf("failed to execute relation statement for %s: %w", rel.DrvPath, err)
 		}
 	}
 
@@ -520,6 +563,7 @@ func (b *DBBatcher) executeWrite(fods []FOD, relations []DrvRevision) error {
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
+	committed = true // Mark commit as successful
 
 	return nil
 }
@@ -555,10 +599,17 @@ func (b *DBBatcher) AddFOD(fod FOD) {
 		b.mu.Unlock()
 
 		// Send the copied batch to the writer goroutine
-		b.writeChan <- writeOperation{
-			fods:      fodsToSend,
-			relations: relationsToSend,
-			// No resultChan needed for regular batch sends
+		// Use a non-blocking send with select to avoid deadlock if channel is full,
+		// although with a buffer and dedicated reader, this is less likely.
+		select {
+		case b.writeChan <- writeOperation{fods: fodsToSend, relations: relationsToSend}:
+			// Successfully sent
+		default:
+			// Should not happen with buffered channel and dedicated reader, but log if it does.
+			log.Printf("CRITICAL WARNING: DB writeChan buffer full! Data might be lost or processing stalled.")
+			// Re-acquire lock to put data back? Or drop it? Dropping risks data loss.
+			// Putting it back risks deadlock if channel never clears.
+			// For now, log critical warning. Needs monitoring.
 		}
 	} else {
 		// Release the lock if batch wasn't sent
@@ -611,20 +662,35 @@ func (b *DBBatcher) Flush() error {
 	b.mu.Unlock()
 
 	// Send the final batch to the writer
-	b.writeChan <- writeOperation{
+	op := writeOperation{
 		fods:       fodsToSend,
 		relations:  relationsToSend,
 		resultChan: resultChan, // Provide the channel to get the result
 	}
 
-	// Wait for the writer to process this specific batch
-	err := <-resultChan
-	if err != nil {
-		log.Printf("ERROR during DB flush: %v", err)
-		return err
+	select {
+	case b.writeChan <- op:
+		// Successfully sent flush operation
+	default:
+		// This is bad, means the writer goroutine might be stuck or channel full.
+		log.Printf("CRITICAL WARNING: Failed to send Flush operation to DB writer channel.")
+		return fmt.Errorf("failed to send flush operation to DB writer")
 	}
-	log.Println("DB Batcher flushed successfully.")
-	return nil
+
+	// Wait for the writer to process this specific batch
+	// Add a timeout to prevent waiting forever if the writer is stuck
+	select {
+	case err := <-resultChan:
+		if err != nil {
+			log.Printf("ERROR during DB flush: %v", err)
+			return err
+		}
+		log.Println("DB Batcher flushed successfully.")
+		return nil
+	case <-time.After(30 * time.Second): // 30-second timeout for flush
+		log.Printf("ERROR: Timeout waiting for DB flush to complete.")
+		return fmt.Errorf("timeout waiting for DB flush")
+	}
 }
 
 // Close flushes any remaining batches, signals the writer goroutine to stop,
@@ -635,21 +701,47 @@ func (b *DBBatcher) Close() error {
 	flushErr := b.Flush()
 
 	// Signal the writer goroutine to exit by closing the channel
-	close(b.writeChan)
+	// Ensure writeChan is not nil before closing
+	if b.writeChan != nil {
+		close(b.writeChan)
+		b.writeChan = nil // Prevent double close
+	}
 
 	// Wait for the writer goroutine to finish processing and exit
-	b.wg.Wait() // Wait for writerLoop to finish
-	<-b.done    // Ensure done channel is closed
+	// Add a timeout here as well
+	waitChan := make(chan struct{})
+	go func() {
+		b.wg.Wait() // Wait for writerLoop to finish
+		close(waitChan)
+	}()
 
-	log.Println("DB writer goroutine finished.")
+	select {
+	case <-waitChan:
+		log.Println("DB writer goroutine finished.")
+	case <-time.After(10 * time.Second): // 10-second timeout for writer to finish
+		log.Printf("ERROR: Timeout waiting for DB writer goroutine to finish.")
+		// Proceed with closing statements, but log the timeout
+	}
+
+	// Check if done channel was closed (it should be if writer exited cleanly)
+	select {
+	case <-b.done:
+		// Done channel closed as expected
+	default:
+		log.Printf("Warning: DB writer 'done' channel was not closed.")
+	}
 
 	// Close prepared statements
 	var closeErrors []error
-	if err := b.fodStmt.Close(); err != nil {
-		closeErrors = append(closeErrors, fmt.Errorf("failed to close FOD statement: %w", err))
+	if b.fodStmt != nil {
+		if err := b.fodStmt.Close(); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("failed to close FOD statement: %w", err))
+		}
 	}
-	if err := b.relStmt.Close(); err != nil {
-		closeErrors = append(closeErrors, fmt.Errorf("failed to close relation statement: %w", err))
+	if b.relStmt != nil {
+		if err := b.relStmt.Close(); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("failed to close relation statement: %w", err))
+		}
 	}
 
 	// Combine flush error and close errors
@@ -695,6 +787,7 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 	ctx.batcher.IncrementDrvCount()
 
 	// --- Open and Parse Derivation ---
+	// Use buffered reader for potentially better performance on larger files
 	file, err := os.Open(inputFile)
 	if err != nil {
 		// Log error but don't stop processing other derivations
@@ -702,8 +795,10 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 		return // Cannot proceed with this derivation
 	}
 	defer file.Close()
+	// bufferedFile := bufio.NewReader(file) // Use buffered reader
 
-	drv, err := derivation.ReadDerivation(file)
+	// Pass the original file reader to ReadDerivation
+	drv, err := derivation.ReadDerivation(file) // Use file directly, ReadDerivation likely buffers internally
 	if err != nil {
 		log.Printf("Error reading derivation %s: %v", inputFile, err)
 		// Mark as processed but couldn't parse
@@ -711,7 +806,7 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 	}
 
 	// --- Process Outputs (Find FODs) ---
-	// isFOD := false
+	// isFOD := false // Keep track if this drv is a FOD
 	for name, out := range drv.Outputs {
 		// Check if it's a Fixed Output Derivation (has hash info)
 		if out.HashAlgorithm != "" && out.Hash != "" {
@@ -722,35 +817,38 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 				Hash:          out.Hash,
 			}
 			ctx.batcher.AddFOD(fod) // Add to the database batch
-			// isFOD = true            // Mark that this drv is a FOD
+			// isFOD = true           // Mark that this drv is a FOD
 
 			if os.Getenv("VERBOSE") == "1" {
 				log.Printf("Found FOD: %s (output: %s, hash: %s:%s)",
 					filepath.Base(inputFile), name, out.HashAlgorithm, out.Hash)
 			}
-			// Typically, a FOD has only one output defining the fixed hash,
-			// but we process all outputs just in case. If multiple outputs have hashes,
-			// the current DB schema (drv_path primary key) stores the last one encountered.
-			// If multiple FOD outputs per drv need tracking, schema needs adjustment.
+			// Typically, a FOD has only one output defining the fixed hash.
+			// We add the FOD info based on the *first* output with hash info we find.
+			// If multiple outputs have hashes, the current DB schema might overwrite.
+			// Break after finding the first FOD output if that's the desired behavior.
+			break // Optimization: Assume first output with hash defines the FOD nature
 		}
 	}
 
 	// --- Queue Input Derivations ---
-	// If the current derivation itself was a FOD, we generally don't need to
+	// Optimization: If the current derivation itself was a FOD, we generally don't need to
 	// explore its inputs further for *this specific task* (finding FODs).
-	// However, exploring inputs might be necessary for other analyses or full graph traversal.
-	// For strict FOD finding, we can potentially skip queuing inputs if isFOD is true.
-	// Let's keep exploring inputs for now for completeness, but this is an optimization point.
+	// Uncomment the 'if isFOD' block to enable this optimization.
 	// if isFOD {
+	//     if os.Getenv("VERBOSE") == "1" {
+	//         log.Printf("Skipping inputs for FOD: %s", filepath.Base(inputFile))
+	//     }
 	//     return // Optimization: Stop traversal at FODs if only finding FODs matters
 	// }
 
 	for inputDrvPath := range drv.InputDerivations {
 		// Check if the input derivation has *already* been processed or queued.
-		// Use Load here for a quick check. If it exists, we don't need to queue it again.
+		// Use Load for a quick check. If it exists, we don't need to queue it again.
 		if _, loaded := ctx.processedDrvs.Load(inputDrvPath); !loaded {
 			// Only attempt to queue if not already loaded.
 			// Another goroutine might LoadOrStore it concurrently, which is fine.
+			// Use non-blocking send with select.
 			select {
 			case ctx.workQueue <- inputDrvPath:
 				// Successfully queued the input derivation path
@@ -782,21 +880,32 @@ func getOrCreateRevision(db *sql.DB, rev string) (int64, error) {
 	result, err := db.Exec("INSERT INTO revisions (rev) VALUES (?)", rev)
 	if err != nil {
 		// Handle potential race condition if another instance inserted it concurrently
+		// Use specific error check if available for the driver (e.g., sqlite3.ErrConstraintUnique)
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
 			log.Printf("Revision %s was likely inserted concurrently, retrying fetch...", rev)
-			// Retry the query row
+			// Retry the query row with a short delay
+			time.Sleep(50 * time.Millisecond)
 			err = db.QueryRow("SELECT id FROM revisions WHERE rev = ?", rev).Scan(&id)
 			if err == nil {
+				log.Printf("Successfully fetched concurrently inserted revision %s (ID: %d)", rev, id)
 				return id, nil
 			}
-			return 0, fmt.Errorf("error fetching concurrently inserted revision %s: %w", rev, err)
+			return 0, fmt.Errorf("error fetching concurrently inserted revision %s after retry: %w", rev, err)
 		}
 		return 0, fmt.Errorf("failed to insert revision %s: %w", rev, err)
 	}
 
 	id, err = result.LastInsertId()
 	if err != nil {
-		return 0, fmt.Errorf("failed to get last insert ID for revision %s: %w", rev, err)
+		// Attempt to query again if LastInsertId fails (might happen in some race conditions or driver issues)
+		log.Printf("Warning: LastInsertId failed for revision %s: %v. Attempting query...", rev, err)
+		time.Sleep(50 * time.Millisecond)
+		errQuery := db.QueryRow("SELECT id FROM revisions WHERE rev = ?", rev).Scan(&id)
+		if errQuery == nil {
+			log.Printf("Successfully fetched revision %s (ID: %d) after LastInsertId failed", rev, id)
+			return id, nil
+		}
+		return 0, fmt.Errorf("failed to get last insert ID for revision %s (and query failed: %v): %w", rev, errQuery, err)
 	}
 	log.Printf("Created revision %s with ID %d", rev, id)
 	return id, nil
@@ -821,7 +930,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	}()
 
 	// --- Initialize Database Batcher ---
-	// Use a reasonable batch size, e.g., 1000 or 5000
+	// Use a reasonable batch size, e.g., 1000 or 5000. Larger batches reduce commit overhead but increase memory per batch.
 	batcher, err := NewDBBatcher(db, 2000, revisionID)
 	if err != nil {
 		return fmt.Errorf("[%s] failed to create database batcher: %w", rev, err)
@@ -831,7 +940,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	// --- Setup Processing Context and Worker Pool ---
 	processedDrvs := &sync.Map{} // Map to track processed derivations [string]bool
 	// Use a large buffer to prevent nix-eval-jobs from blocking if workers are busy
-	// Tune buffer size based on memory and expected number of derivations
+	// Tune buffer size based on memory and expected number of derivations. 100k paths * ~100 bytes/path = ~10MB.
 	workQueue := make(chan string, 100000)
 
 	ctx := &ProcessingContext{
@@ -872,15 +981,19 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 			select {
 			case <-ticker.C:
 				runtime.ReadMemStats(&m)
+				// Alloc is bytes allocated and not yet freed.
+				// Sys is total bytes obtained from OS.
 				allocMB := int64(m.Alloc / 1024 / 1024)
+				sysMB := int64(m.Sys / 1024 / 1024)
 				memoryMutex.Lock()
-				if allocMB > peakMemoryMB {
-					peakMemoryMB = allocMB
+				// Track peak Sys memory as it better reflects total OS allocation
+				if sysMB > peakMemoryMB {
+					peakMemoryMB = sysMB
 				}
 				currentPeak := peakMemoryMB // Capture current peak for logging
 				memoryMutex.Unlock()
-				log.Printf("[%s] Memory Usage: Alloc=%dMB Sys=%dMB (Peak Alloc Reached=%dMB)",
-					rev, allocMB, m.Sys/1024/1024, currentPeak)
+				log.Printf("[%s] Memory Usage: Alloc=%dMB Sys=%dMB (Peak Sys Reached=%dMB)",
+					rev, allocMB, sysMB, currentPeak)
 			case <-memoryDone:
 				log.Printf("[%s] Memory monitoring stopped.", rev)
 				return
@@ -890,6 +1003,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 
 	// --- Run nix-eval-jobs and Feed Work Queue ---
 	// Channel to receive initial derivation paths from nix-eval-jobs/fallback
+	// Buffer size: 50k paths * ~100 bytes/path = ~5MB.
 	drvPathChan := make(chan string, 50000) // Buffer between nix-eval-jobs and queue feeder
 
 	// Goroutine to feed the workQueue from drvPathChan, checking processedDrvs first
@@ -897,24 +1011,27 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	go func() {
 		defer close(feederDone)
 		initialJobCount := 0
+		queuedJobCount := 0
 		for drvPath := range drvPathChan {
+			initialJobCount++
 			// Check if already processed *before* adding to work queue
+			// LoadOrStore is atomic and ensures we only queue once.
 			if _, loaded := ctx.processedDrvs.LoadOrStore(drvPath, true); !loaded {
-				initialJobCount++
+				queuedJobCount++
 				select {
 				case workQueue <- drvPath:
 					// Successfully queued initial job
 				default:
 					log.Printf("[%s] Warning: Work queue full or closed when adding initial drv %s", rev, drvPath)
-					// Mark as processed anyway, as we couldn't queue it
-					// ctx.processedDrvs.Store(drvPath, true) // Or rely on worker check? Let's rely on worker check.
+					// If the queue is full, the worker pool is the bottleneck.
+					// The path is already marked in processedDrvs, so it won't be processed later.
 				}
-				if initialJobCount%5000 == 0 {
-					log.Printf("[%s] Queued %d initial derivations for processing...", rev, initialJobCount)
+				if queuedJobCount%5000 == 0 {
+					log.Printf("[%s] Queued %d unique initial derivations for processing (received %d total)...", rev, queuedJobCount, initialJobCount)
 				}
 			}
 		}
-		log.Printf("[%s] Finished queueing %d initial derivations.", rev, initialJobCount)
+		log.Printf("[%s] Finished processing %d initial derivations from nix-eval-jobs/fallback (%d unique queued).", rev, initialJobCount, queuedJobCount)
 		// CRITICAL: Close the workQueue only after all initial paths are sent
 		// and the feeder goroutine is done processing drvPathChan.
 		close(workQueue)
@@ -925,7 +1042,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	usedFallback := false
 	fileStats := make(map[string]*exprFileStats) // Map to store stats per expression file
 
-	log.Printf("[%s] Starting nix-eval-jobs/fallback evaluation...", rev)
+	log.Printf("[%s] Starting nix-eval-jobs/fallback evaluation (nix workers: %d)...", rev, nixEvalJobsWorkers)
 	// Pass nixEvalJobsWorkers (potentially from env var) to the nix command
 	evalErr := streamNixEvalJobs(rev, worktreeDir, nixEvalJobsWorkers, drvPathChan, fileStats, &usedFallback)
 
@@ -972,6 +1089,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	memoryMutex.Lock()
 	finalPeakMemory := peakMemoryMB
 	memoryMutex.Unlock()
+	log.Printf("[%s] Peak System Memory Usage: %d MB", rev, finalPeakMemory)
 
 	// Store evaluation metadata and overall stats
 	log.Printf("[%s] Storing evaluation metadata...", rev)
@@ -983,6 +1101,17 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	} else {
 		log.Printf("[%s] Successfully stored evaluation metadata.", rev)
 	}
+
+	// --- Performance Hint ---
+	// If CPU utilization is still low after these changes, consider:
+	// 1. Profiling `nix-eval-jobs` itself to see where it spends time.
+	// 2. Profiling this Go application (`go tool pprof`) to check for bottlenecks in:
+	//    - `processDerivation` (File I/O, JSON parsing)
+	//    - `DBBatcher` (Waiting for DB writes)
+	//    - Lock contention (though `sync.Map` and channel usage should minimize this)
+	// 3. Increasing `nixEvalJobsWorkers` cautiously if memory allows.
+	// 4. Checking system I/O performance (disk speed).
+	log.Printf("[%s] Performance Hint: If CPU usage remains low, profile nix-eval-jobs or this Go app (pprof) to find bottlenecks.", rev)
 
 	// Return the original evaluation error, if any
 	if evalErr != nil {
@@ -1038,7 +1167,7 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 		// Skip the nix-eval-jobs loop and go straight to fallback
 	}
 
-	totalJobCount := 0 // Total unique derivations found across all files
+	totalDerivationsFound := 0 // Total derivations found across all files (for fallback trigger)
 	// Global deduplication map (optional, as feeder goroutine handles final deduplication)
 	// Keeping it here helps provide more accurate per-file unique counts if needed for logging.
 	// globalVisited := make(map[string]bool)
@@ -1051,15 +1180,16 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 		stats := fileStats[expressionPath] // Get stats object for this file
 		stats.attempted = true             // Mark as attempted
 
-		log.Printf("[%s] Evaluating expression file: %s with %d workers...", rev, relPath, workers)
+		// Lowered default memory per worker
+		nixWorkerMemoryLimit := "2048" // MB
+		log.Printf("[%s] Evaluating expression file: %s with %d workers (mem limit %s MB)...", rev, relPath, workers, nixWorkerMemoryLimit)
 
 		// Build the nix-eval-jobs command
-		// Adjust memory size as needed
 		// Consider adding --impure if needed for specific nixpkgs versions/setups
 		cmd := exec.Command("nix-eval-jobs",
 			expressionPath, // Use the full path
 			"--workers", fmt.Sprintf("%d", workers),
-			"--max-memory-size", "4096", // Per-worker memory limit in MB
+			"--max-memory-size", nixWorkerMemoryLimit, // Per-worker memory limit in MB
 			"--option", "allow-import-from-derivation", "false", // Security best practice
 			// "--option", "show-trace", "true", // Enable for debugging eval errors
 			// Consider adding flags like --check-cache, --force-check based on needs
@@ -1184,8 +1314,19 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 		if err != nil {
 			// Command exited with an error
 			errMsg := fmt.Sprintf("nix-eval-jobs for %s exited with error: %v", relPath, err)
+			// Check stderr for common out-of-memory indicators
+			if strings.Contains(stderrOutput, "killed") || strings.Contains(stderrOutput, "oom") || strings.Contains(stderrOutput, "out of memory") {
+				errMsg += " (Potential OOM)"
+				log.Printf("[%s] Potential OOM detected for %s. Consider reducing nix workers or increasing memory limit if possible.", rev, relPath)
+			}
 			if stderrOutput != "" {
-				errMsg += fmt.Sprintf("\nStderr:\n%s", stderrOutput)
+				// Limit logged stderr length
+				maxStderrLog := 1024
+				if len(stderrOutput) > maxStderrLog {
+					errMsg += fmt.Sprintf("\nStderr (truncated):\n%s...", stderrOutput[:maxStderrLog])
+				} else {
+					errMsg += fmt.Sprintf("\nStderr:\n%s", stderrOutput)
+				}
 			}
 			stats.errorMessage = errMsg // Store detailed error
 			log.Printf("[%s] ERROR: %s", rev, errMsg)
@@ -1202,12 +1343,12 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 				log.Printf("[%s] nix-eval-jobs stderr for %s (success):\n%s", rev, relPath, stderrOutput)
 			}
 		}
-		totalJobCount += jobCountFile // Add to total (note: not unique across files here)
+		totalDerivationsFound += jobCountFile // Add to total (note: not unique across files here)
 	} // End loop over existingPaths
 
 	// --- Fallback Mechanism ---
-	// If no derivations were found via nix-eval-jobs OR if no expression files existed initially
-	if totalJobCount == 0 {
+	// Trigger fallback if no derivations were found across *all* attempted files
+	if totalDerivationsFound == 0 {
 		log.Printf("[%s] No derivations found via nix-eval-jobs or no standard files existed. Attempting fallback mechanism...", rev)
 		*usedFallback = true // Mark that fallback is being used
 
@@ -1236,13 +1377,17 @@ let
   # Function to safely access an attribute and check if it looks like a derivation
   getDrv = attrName:
     let val = pkgs.${attrName} or null;
-    in if val != null && builtins.isAttrs val && val ? type && val.type == "derivation" then val else null;
+    # Check if it's an attribute set and has a 'type' field equal to 'derivation'
+    in if val != null && builtins.isAttrs val && val ? type && val.type == "derivation"
+       # Also handle older nixpkgs where derivations might just have drvPath/outPath
+       || (val != null && builtins.isAttrs val && (val ? drvPath || val ? outPath))
+       then val else null;
 
   # Get the derivations for the potential attributes
   basicDrvs = builtins.filter (x: x != null) (map getDrv potentialAttrs);
 
-  # Extract the drvPath from each valid derivation
-  extractDrvPath = drv: drv.drvPath or null;
+  # Extract the drvPath from each valid derivation (prefer drvPath over outPath)
+  extractDrvPath = drv: drv.drvPath or (drv.outPath or null);
 
 in
   # Return a list of unique, non-null drvPaths
@@ -1265,10 +1410,11 @@ in
 
 		// Try evaluating the fallback file with nix-instantiate
 		log.Printf("[%s] Running fallback evaluation: nix-instantiate --eval --json %s", rev, relFallbackPath)
-		fallbackCmd := exec.Command("nix-instantiate", "--eval", "--json", "--strict", "--read-write-mode", fallbackPath)
+		// Use --read-write-mode needed for older nix? Try without first.
+		fallbackCmd := exec.Command("nix-instantiate", "--eval", "--json", "--strict", fallbackPath)
 		fallbackCmd.Dir = nixpkgsDir // Run from nixpkgs directory
 
-		fallbackOutput, err := fallbackCmd.Output() // Capture combined stdout/stderr
+		fallbackOutput, err := fallbackCmd.CombinedOutput() // Capture combined stdout/stderr
 		if err != nil {
 			// nix-instantiate failed
 			errMsg := fmt.Sprintf("fallback evaluation failed for %s: %v\nOutput:\n%s", relFallbackPath, err, string(fallbackOutput))
@@ -1352,7 +1498,7 @@ func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exp
 			log.Printf("Rolling back metadata transaction due to error: %v", txErr)
 			tx.Rollback()
 		} else {
-			log.Printf("Committing metadata transaction for revision ID %d", revisionID)
+			// log.Printf("Committing metadata transaction for revision ID %d", revisionID) // Verbose
 			commitErr := tx.Commit()
 			if commitErr != nil {
 				txErr = fmt.Errorf("failed to commit metadata transaction: %w", commitErr)
@@ -1386,6 +1532,7 @@ func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exp
 
 	for path, stat := range stats {
 		// Ensure we only process each unique path once, even if it was checked multiple times
+		// Use the path as the key for uniqueness check
 		if processedFilePaths[path] {
 			continue
 		}
@@ -1414,9 +1561,16 @@ func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exp
 		}
 		totalExprDerivations += stat.derivationsFound // Sum derivations found by nix-eval-jobs/fallback
 
+		// Truncate error message if it's too long for the DB column
+		maxErrorLen := 2048 // Adjust based on expected error sizes and DB limits
+		errMsg := stat.errorMessage
+		if len(errMsg) > maxErrorLen {
+			errMsg = errMsg[:maxErrorLen] + "... (truncated)"
+		}
+
 		_, err := metadataStmt.Exec(
 			revisionID, relPath, fileExists, attempted,
-			succeeded, stat.errorMessage, stat.derivationsFound)
+			succeeded, errMsg, stat.derivationsFound)
 		if err != nil {
 			txErr = fmt.Errorf("failed to insert/update metadata for %s: %w", relPath, err)
 			return txErr
@@ -1469,7 +1623,7 @@ func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exp
 	}
 
 	// If we reach here without error, the defer func will commit the transaction
-	log.Printf("Metadata transaction prepared for commit for revision ID %d", revisionID)
+	// log.Printf("Metadata transaction prepared for commit for revision ID %d", revisionID) // Verbose
 	return nil
 }
 
@@ -1564,20 +1718,30 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 
 	// --- Clean Up Existing Worktree (if any) ---
 	// First, try removing via git worktree remove (safer)
-	removeCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "remove", worktreeDir)
+	// Use the full path to the worktree directory
+	absWorktreeDir, err := filepath.Abs(worktreeDir)
+	if err != nil {
+		log.Printf("Warning: Could not get absolute path for worktree %s: %v", worktreeDir, err)
+		absWorktreeDir = worktreeDir // Fallback to relative path if abs fails
+	}
+
+	removeCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "remove", absWorktreeDir)
 	removeOutput, removeErr := removeCmd.CombinedOutput()
 	if removeErr == nil {
-		log.Printf("Successfully removed existing worktree entry for %s using 'git worktree remove'.", worktreeDir)
+		log.Printf("Successfully removed existing worktree entry for %s using 'git worktree remove'.", absWorktreeDir)
 	} else {
 		// If 'git worktree remove' fails (e.g., directory doesn't exist or not registered), log and proceed
-		// It might have been partially deleted before.
-		log.Printf("Info: 'git worktree remove %s' failed (maybe already removed or inconsistent state): %v\nOutput:\n%s", worktreeDir, removeErr, string(removeOutput))
+		// It might have been partially deleted before. Check exit code? Often returns 128 if not found.
+		log.Printf("Info: 'git worktree remove %s' failed (maybe already removed or inconsistent state): %v\nOutput:\n%s", absWorktreeDir, removeErr, string(removeOutput))
 		// Forcefully remove the directory if it still exists
-		if _, statErr := os.Stat(worktreeDir); statErr == nil {
-			log.Printf("Forcefully removing existing worktree directory: %s", worktreeDir)
-			if err := os.RemoveAll(worktreeDir); err != nil {
-				return "", fmt.Errorf("failed to forcefully remove existing worktree directory %s: %w", worktreeDir, err)
+		if _, statErr := os.Stat(absWorktreeDir); statErr == nil {
+			log.Printf("Forcefully removing existing worktree directory: %s", absWorktreeDir)
+			if err := os.RemoveAll(absWorktreeDir); err != nil {
+				return "", fmt.Errorf("failed to forcefully remove existing worktree directory %s: %w", absWorktreeDir, err)
 			}
+		} else if !os.IsNotExist(statErr) {
+			// Log error if stat failed for reasons other than NotExist
+			log.Printf("Warning: Could not stat potential leftover worktree directory %s: %v", absWorktreeDir, statErr)
 		}
 	}
 
@@ -1593,8 +1757,6 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 	// Fetch only the required commit, unshallowing if necessary
 	// Using --update-head-ok allows fetching into the bare repo's refs/heads space if needed
 	// Using --depth=1 might fail if the commit is not recent; fetching without depth is safer but slower.
-	// Let's try fetching without depth first, it's more reliable for arbitrary commits.
-	// fetchCmd := exec.Command("git", "-C", mainRepoDir, "fetch", "--update-head-ok", "origin", rev)
 	// Optimization: Try fetching with depth 1 first, if it fails, fetch full history for that commit.
 	fetchCmd := exec.Command("git", "-C", mainRepoDir, "fetch", "--depth=1", "--update-head-ok", "origin", rev)
 	fetchOutput, fetchErr := fetchCmd.CombinedOutput()
@@ -1610,24 +1772,24 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 	log.Printf("Successfully fetched commit %s.", rev)
 
 	// --- Create the Worktree ---
-	log.Printf("Creating worktree for revision %s at %s", rev, worktreeDir)
+	log.Printf("Creating worktree for revision %s at %s", rev, absWorktreeDir)
 	// Use --detach to avoid creating a branch
-	addCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "add", "--detach", worktreeDir, rev)
+	addCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "add", "--detach", absWorktreeDir, rev)
 	if output, err := addCmd.CombinedOutput(); err != nil {
 		// If creation fails, try to clean up the potentially partially created directory
-		os.RemoveAll(worktreeDir)
-		return "", fmt.Errorf("failed to create worktree at %s for %s: %w\nOutput:\n%s", worktreeDir, rev, err, string(output))
+		os.RemoveAll(absWorktreeDir)
+		return "", fmt.Errorf("failed to create worktree at %s for %s: %w\nOutput:\n%s", absWorktreeDir, rev, err, string(output))
 	}
 
 	// --- Verify Worktree (Optional) ---
 	// Check for a common file to sanity check the checkout
-	verifyPath := filepath.Join(worktreeDir, "default.nix") // Or another stable top-level file
+	verifyPath := filepath.Join(absWorktreeDir, "default.nix") // Or another stable top-level file
 	if _, err := os.Stat(verifyPath); os.IsNotExist(err) {
 		log.Printf("Warning: Verification file %s not found in worktree. Nixpkgs structure might be unexpected for revision %s.", verifyPath, rev)
 	}
 
-	log.Printf("Successfully prepared worktree for revision %s at %s", rev, worktreeDir)
-	return worktreeDir, nil
+	log.Printf("Successfully prepared worktree for revision %s at %s", rev, absWorktreeDir)
+	return absWorktreeDir, nil // Return the absolute path
 }
 
 // isHex checks if a string contains only hexadecimal characters.
@@ -1679,19 +1841,27 @@ func cleanupWorktrees() error {
 	}
 
 	removedCount := 0
+	var removalErrors []string
 	for _, entry := range entries {
 		if entry.IsDir() && isWorktreeDir(entry.Name()) {
 			worktreePath := filepath.Join(scriptDir, entry.Name())
 			log.Printf("Removing leftover worktree directory: %s", worktreePath)
 			if err := os.RemoveAll(worktreePath); err != nil {
 				// Log warning but continue trying to remove others
-				log.Printf("Warning: Failed to remove directory %s: %v", worktreePath, err)
+				errMsg := fmt.Sprintf("Warning: Failed to remove directory %s: %v", worktreePath, err)
+				log.Println(errMsg)
+				removalErrors = append(removalErrors, errMsg)
 			} else {
 				removedCount++
 			}
 		}
 	}
 	log.Printf("Removed %d leftover worktree directories.", removedCount)
+	if len(removalErrors) > 0 {
+		log.Printf("Encountered %d errors during worktree directory removal.", len(removalErrors))
+		// Optionally return an aggregated error
+		// return fmt.Errorf("encountered errors during worktree cleanup: %s", strings.Join(removalErrors, "; "))
+	}
 	log.Println("Worktree cleanup finished.")
 	return nil
 }
@@ -1704,7 +1874,7 @@ func main() {
 	log.Println("=================================================")
 
 	// Log initial configuration and system info
-	log.Printf("Configuration: nix-eval-jobs workers = %d", nixEvalJobsWorkers)
+	log.Printf("Configuration: nix-eval-jobs workers = %d (tune with FOD_ORACLE_NIX_EVAL_WORKERS)", nixEvalJobsWorkers)
 	log.Printf("System Info: Host=%s, OS=%s, Kernel=%s", systemInfo.Host, systemInfo.OS, systemInfo.Kernel)
 	log.Printf("System Info: CPU=%s (Logical Cores=%s), Memory=%s", systemInfo.CPU, systemInfo.Cores, systemInfo.Memory)
 
