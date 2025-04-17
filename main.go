@@ -590,16 +590,22 @@ func (b *DBBatcher) Close() error {
 
 // ProcessingContext holds the context for processing derivations
 type ProcessingContext struct {
-	batcher     *DBBatcher
-	visited     *sync.Map
-	processedDrvs map[string]bool // Map to quickly check if we've already processed a derivation
-	wg          *sync.WaitGroup
-	workQueue   chan string       // Channel for queuing derivation paths
+	batcher       *DBBatcher
+	visited       *sync.Map
+	processedDrvs sync.Map      // Thread-safe map to check if we've already processed a derivation
+	wg            *sync.WaitGroup
+	workQueue     chan string   // Channel for queuing derivation paths
 }
 
 // processDerivation processes a single derivation
-// It assumes the caller has already checked and marked the derivation as processed
+// The function now handles checking if the derivation has been processed
 func processDerivation(inputFile string, ctx *ProcessingContext) {
+	// Check if we've already processed this derivation
+	if _, loaded := ctx.processedDrvs.LoadOrStore(inputFile, true); loaded {
+		// Already processed this path
+		return
+	}
+
 	ctx.batcher.IncrementDrvCount()
 
 	file, err := os.Open(inputFile)
@@ -634,8 +640,18 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 
 	// Queue input derivations to process
 	for path := range drv.InputDerivations {
-		// Send to the queue - each worker will check if it's been processed
-		ctx.workQueue <- path
+		// Check if we've already seen this path before queueing
+		if _, loaded := ctx.processedDrvs.Load(path); !loaded {
+			// Send to the queue - worker will do the final check before processing
+			select {
+			case ctx.workQueue <- path:
+				// Successfully queued
+			default:
+				// Queue is full, process directly to avoid deadlock
+				// This is rare but helps prevent deadlocks in certain cases
+				go processDerivation(path, ctx)
+			}
+		}
 	}
 }
 
@@ -712,9 +728,6 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	// Create a processing context with a work queue
 	workQueue := make(chan string, 100000) // Large buffer to avoid blocking
 	
-	// Create a map for quick lookup to avoid processing the same path multiple times
-	processedDrvs := make(map[string]bool)
-	
 	// Use number of CPU cores for worker pool size
 	numCPUCores := runtime.NumCPU()
 	log.Printf("[%s] Setting up worker pool with %d workers (matching CPU cores)", rev, numCPUCores)
@@ -722,17 +735,12 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	ctx := &ProcessingContext{
 		batcher:     batcher,
 		visited:     visited,
-		processedDrvs: processedDrvs,
 		wg:          &wg,
 		workQueue:   workQueue,
 	}
 
 	// Create a channel to receive derivation paths from nix-eval-jobs
 	drvPathChan := make(chan string, 50000)
-
-	// Create a separate mutex for the processedDrvs map
-	// since it will be accessed by multiple worker goroutines
-	var processedMutex sync.Mutex
 
 	// Start worker pool with number of workers matching CPU cores
 	workerDone := make(chan struct{})
@@ -742,15 +750,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 			defer wg.Done()
 			
 			for drvPath := range workQueue {
-				// Local check with mutex to avoid processing the same path multiple times
-				processedMutex.Lock()
-				if _, exists := processedDrvs[drvPath]; exists {
-					processedMutex.Unlock()
-					continue
-				}
-				processedDrvs[drvPath] = true
-				processedMutex.Unlock()
-				
+				// processDerivation will check if the path was already processed
 				processDerivation(drvPath, ctx)
 			}
 			
@@ -764,11 +764,16 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	go func() {
 		for drvPath := range drvPathChan {
 			// Check if we've already seen this path before sending to work queue
-			processedMutex.Lock()
-			if _, exists := processedDrvs[drvPath]; !exists {
-				workQueue <- drvPath
+			if _, loaded := ctx.processedDrvs.Load(drvPath); !loaded {
+				// Only try to queue if not already processed
+				select {
+				case workQueue <- drvPath:
+					// Successfully queued
+				default:
+					// Queue is full, mark as processed to avoid requeuing
+					ctx.processedDrvs.Store(drvPath, true)
+				}
 			}
-			processedMutex.Unlock()
 		}
 		
 		// Close the work queue when all inputs have been processed
@@ -822,7 +827,15 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	if err := db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount); err != nil {
 		log.Printf("[%s] Error counting FODs: %v", rev, err)
 	}
-	log.Printf("[%s] Final stats: %d FODs (%d derivations processed)", rev, fodCount, len(processedDrvs))
+	
+	// Count processed derivations
+	var processedCount int
+	ctx.processedDrvs.Range(func(_, _ interface{}) bool {
+		processedCount++
+		return true
+	})
+	
+	log.Printf("[%s] Final stats: %d FODs (%d derivations processed)", rev, fodCount, processedCount)
 
 	// Store the evaluation metadata in the database
 	memoryMutex.Lock()
