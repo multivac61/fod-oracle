@@ -68,14 +68,14 @@ type NeofetchInfo struct {
 	// The raw JSON string is also stored, so we don't lose any fields
 }
 
-// Default number of workers for nix-eval-jobs
-var workers = 16
-
 // systemInfo holds the neofetch JSON data
 var systemInfoJSON string
 
 // systemInfo holds the parsed neofetch data
 var systemInfo NeofetchInfo
+
+// Default number of workers for nix-eval-jobs based on available RAM
+var workers = 1
 
 // getCPUCores extracts the number of cores from neofetch CPU cores field
 func getCPUCores(coresStr string) int {
@@ -99,9 +99,9 @@ func getCPUCores(coresStr string) int {
 	return runtime.NumCPU()
 }
 
-// getSystemInfo collects information about the system using neofetch
+// getSystemInfo collects information about the system
 func getSystemInfo() (NeofetchInfo, string) {
-	// Default fallback info
+	// Default info based on Go runtime
 	info := NeofetchInfo{
 		Host:   "unknown",
 		CPU:    "unknown",
@@ -111,16 +111,15 @@ func getSystemInfo() (NeofetchInfo, string) {
 		OS:     runtime.GOOS + "/" + runtime.GOARCH,
 	}
 
-	// Get hostname as a fallback
+	// Get hostname
 	if hostname, err := os.Hostname(); err == nil {
 		info.Host = hostname
 	}
 
-	// Try to run neofetch via nix
+	// Try to run neofetch for more detailed info
 	cmd := exec.Command("neofetch", "--stdout", "--json")
 	output, err := cmd.Output()
 	if err != nil {
-		log.Printf("Warning: Failed to run neofetch: %v. Using basic system info.", err)
 		jsonData, _ := json.Marshal(info)
 		return info, string(jsonData)
 	}
@@ -128,7 +127,6 @@ func getSystemInfo() (NeofetchInfo, string) {
 	// Parse the JSON output
 	jsonStr := string(output)
 	if err := json.Unmarshal([]byte(jsonStr), &info); err != nil {
-		log.Printf("Warning: Failed to parse neofetch JSON: %v. Using basic system info.", err)
 		jsonData, _ := json.Marshal(info)
 		return info, string(jsonData)
 	}
@@ -139,18 +137,12 @@ func getSystemInfo() (NeofetchInfo, string) {
 // init initializes configuration from environment variables
 func init() {
 	// Collect system information
-	var jsonStr string
-	systemInfo, jsonStr = getSystemInfo()
-	systemInfoJSON = jsonStr
+	systemInfo, systemInfoJSON = getSystemInfo()
 
 	// Check for custom worker count in environment
 	if workersEnv := os.Getenv("FOD_ORACLE_NUM_WORKERS"); workersEnv != "" {
 		if w, err := strconv.Atoi(workersEnv); err == nil && w > 0 {
 			workers = w
-			log.Printf("Using %d workers from FOD_ORACLE_NUM_WORKERS environment variable", workers)
-		} else if err != nil {
-			log.Printf("Warning: Invalid FOD_ORACLE_NUM_WORKERS value '%s': %v. Using default: %d",
-				workersEnv, err, workers)
 		}
 	}
 }
@@ -578,14 +570,23 @@ func (b *DBBatcher) Close() error {
 
 // ProcessingContext holds the context for processing derivations
 type ProcessingContext struct {
-	batcher   *DBBatcher
-	visited   *sync.Map
-	wg        *sync.WaitGroup
-	semaphore chan struct{} // Limit concurrency
+	batcher        *DBBatcher
+	visited        *sync.Map
+	processedPaths *sync.Map // Cache for already processed derivation paths
+	wg             *sync.WaitGroup
+	semaphore      chan struct{} // Limit concurrency
 }
 
 func processDerivation(inputFile string, ctx *ProcessingContext) {
 	ctx.batcher.IncrementDrvCount()
+
+	// Check if we've already processed this derivation
+	if _, alreadyProcessed := ctx.processedPaths.Load(inputFile); alreadyProcessed {
+		return
+	}
+	
+	// Mark this path as processed before we begin
+	ctx.processedPaths.Store(inputFile, true)
 
 	file, err := os.Open(inputFile)
 	if err != nil {
@@ -661,16 +662,14 @@ func getOrCreateRevision(db *sql.DB, rev string) (int64, error) {
 
 func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	revStartTime := time.Now()
-	log.Printf("[%s] Starting to find all FODs...", rev)
+	log.Printf("[%s] Starting to find FODs...", rev)
 
+	// Prepare worktree
 	worktreeDir, err := prepareNixpkgsWorktree(rev)
 	if err != nil {
 		return fmt.Errorf("failed to prepare worktree: %w", err)
 	}
-	defer func() {
-		log.Printf("[%s] Cleaning up worktree at %s", rev, worktreeDir)
-		os.RemoveAll(worktreeDir)
-	}()
+	defer os.RemoveAll(worktreeDir)
 
 	// Initialize the batcher
 	batcher, err := NewDBBatcher(db, 1000, revisionID)
@@ -679,10 +678,9 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	}
 	defer batcher.Close()
 
+	// Setup for concurrency and memory tracking
 	visited := &sync.Map{}
 	var wg sync.WaitGroup
-
-	// Track peak memory usage
 	var peakMemoryMB int
 	var memoryMutex sync.Mutex
 
@@ -693,38 +691,34 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		for range ticker.C {
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
-
-			// Update peak memory if higher
+			
 			allocMB := int(m.Alloc / 1024 / 1024)
 			memoryMutex.Lock()
 			if allocMB > peakMemoryMB {
 				peakMemoryMB = allocMB
 			}
 			memoryMutex.Unlock()
-
-			log.Printf("[%s] Memory: Alloc=%dMB TotalAlloc=%dMB Sys=%dMB (Peak=%dMB)",
-				rev, allocMB, m.TotalAlloc/1024/1024, m.Sys/1024/1024, peakMemoryMB)
 		}
 	}()
 
-	// Create processing context with semaphore to limit concurrency
-	maxConcurrency := 5000
+	// Create processing context
 	ctx := &ProcessingContext{
-		batcher:   batcher,
-		visited:   visited,
-		wg:        &wg,
-		semaphore: make(chan struct{}, maxConcurrency),
+		batcher:        batcher,
+		visited:        visited,
+		processedPaths: &sync.Map{}, // Cache for processed derivations
+		wg:             &wg,
+		semaphore:      make(chan struct{}, 20000), // Increased concurrency limit
 	}
 
-	// Create a channel to receive derivation paths from nix-eval-jobs
-	drvPathChan := make(chan string, 50000)
-
-	// Start a goroutine to process derivation paths as they come in
+	// Channel for derivation paths
+	drvPathChan := make(chan string, 200000) // Increased channel buffer
 	done := make(chan struct{})
+
+	// Start processor goroutine
 	go func() {
 		for drvPath := range drvPathChan {
 			if _, loaded := visited.LoadOrStore(drvPath, true); !loaded {
-				// Process in a goroutine if we can acquire a semaphore
+				// Try to process in new goroutine
 				select {
 				case ctx.semaphore <- struct{}{}:
 					wg.Add(1)
@@ -734,76 +728,58 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 						processDerivation(path, ctx)
 					}(drvPath)
 				default:
-					// Process in the current goroutine if we can't acquire a semaphore
+					// Process in current goroutine if semaphore full
 					processDerivation(drvPath, ctx)
 				}
 			}
 		}
-		// Wait for all processing to complete
 		wg.Wait()
 		close(done)
 	}()
 
-	// Variable to track if fallback was used
+	// Evaluation variables
 	usedFallback := false
-
-	// Variable to hold evaluation metadata
 	fileStats := make(map[string]*exprFileStats)
 
-	// Run nix-eval-jobs and stream results to the channel
-	log.Printf("[%s] Running nix-eval-jobs with %d workers to populate work queue", rev, workers)
+	// Run nix-eval-jobs
+	log.Printf("[%s] Running nix-eval-jobs with %d workers", rev, workers)
 	if err := streamNixEvalJobs(rev, worktreeDir, workers, drvPathChan, fileStats, &usedFallback); err != nil {
 		close(drvPathChan)
-
-		// Store metadata even if there was an error
-		processingTime := time.Since(revStartTime)
+		
+		// Store metadata even on error
 		memoryMutex.Lock()
 		currentPeakMemory := peakMemoryMB
 		memoryMutex.Unlock()
-
-		if storeErr := storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir,
-			processingTime, usedFallback, currentPeakMemory); storeErr != nil {
-			log.Printf("[%s] Error storing evaluation metadata: %v", rev, storeErr)
-		}
-
+		storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir,
+			time.Since(revStartTime), usedFallback, currentPeakMemory)
+			
 		return fmt.Errorf("failed to run nix-eval-jobs: %w", err)
 	}
 	close(drvPathChan)
 
 	// Wait for completion or timeout
-	timeout := time.After(1 * time.Hour)
 	select {
 	case <-done:
 		log.Printf("[%s] All derivations processed", rev)
-	case <-timeout:
+	case <-time.After(1 * time.Hour):
 		log.Printf("[%s] Processing timed out after 1 hour", rev)
 	}
 
+	// Flush and get stats
 	batcher.Flush()
 	revElapsed := time.Since(revStartTime)
-	log.Printf("[%s] Process completed in %v", rev, revElapsed)
-
+	
 	var fodCount int
-	if err := db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount); err != nil {
-		log.Printf("[%s] Error counting FODs: %v", rev, err)
-	}
-	log.Printf("[%s] Final stats: %d FODs", rev, fodCount)
+	db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount)
+	log.Printf("[%s] Found %d FODs in %v", rev, fodCount, revElapsed)
 
-	// Store the evaluation metadata in the database
+	// Store metadata
 	memoryMutex.Lock()
 	finalPeakMemory := peakMemoryMB
 	memoryMutex.Unlock()
-
-	if err := storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir,
-		revElapsed, usedFallback, finalPeakMemory); err != nil {
-		log.Printf("[%s] Error storing evaluation metadata: %v", rev, err)
-	} else {
-		cpuCores := getCPUCores(systemInfo.Cores)
-		log.Printf("[%s] Successfully stored evaluation metadata in database (workers=%d, peak memory=%dMB)",
-			rev, workers, finalPeakMemory)
-		log.Printf("[%s] System info: %s, %s, %s, %d cores",
-			rev, systemInfo.Host, systemInfo.OS, systemInfo.CPU, cpuCores)
-	}
+	
+	storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir,
+		revElapsed, usedFallback, finalPeakMemory)
 
 	return nil
 }
@@ -812,12 +788,12 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan chan<- string,
 	fileStats map[string]*exprFileStats, usedFallback *bool,
 ) error {
-	log.Printf("[%s] Running nix-eval-jobs with nixpkgs at %s (%d worker threads)", rev, nixpkgsDir, workers)
+	log.Printf("[%s] Running nix-eval-jobs with nixpkgs at %s (%d workers)", rev, nixpkgsDir, workers)
 
-	// Define all possible Nix expression files that could be evaluated
+	// Define possible Nix expression files to evaluate
 	possiblePaths := []string{
-		filepath.Join(nixpkgsDir, "pkgs/top-level/release-outpaths.nix"),
 		filepath.Join(nixpkgsDir, "pkgs/top-level/release.nix"),
+		filepath.Join(nixpkgsDir, "pkgs/top-level/release-outpaths.nix"),
 		filepath.Join(nixpkgsDir, "pkgs/top-level/release-small.nix"),
 		filepath.Join(nixpkgsDir, "pkgs/top-level/all-packages.nix"),
 		filepath.Join(nixpkgsDir, "nixos/release.nix"),
@@ -827,10 +803,7 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 		filepath.Join(nixpkgsDir, "default.nix"),
 	}
 
-	// // Begin collecting stats for the expression files
-	// fileStats = make(map[string]*exprFileStats)
-
-	// Check which expression files exist and initialize stats
+	// Check which expression files exist
 	var existingPaths []string
 	for _, path := range possiblePaths {
 		relPath, _ := filepath.Rel(nixpkgsDir, path)
@@ -839,73 +812,70 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 		if _, err := os.Stat(path); err == nil {
 			fileStats[path].exists = true
 			existingPaths = append(existingPaths, path)
-			log.Printf("[%s] Found Nix expression file: %s", rev, relPath)
-		} else {
-			log.Printf("[%s] Expression file does not exist: %s", rev, relPath)
+			log.Printf("[%s] Found: %s", rev, relPath)
 		}
 	}
 
-	// We'll try using the fallback mechanism if no files exist
 	if len(existingPaths) == 0 {
-		log.Printf("[%s] Warning: No suitable Nix expression files found in %s, will try fallback mechanism", rev, nixpkgsDir)
+		log.Printf("[%s] No suitable Nix files found, will try fallback", rev)
 	}
 
+	// Global deduplication map
 	totalJobCount := 0
-	// Global deduplication map across all expression files
 	globalVisited := make(map[string]bool)
 
 	// Evaluate each expression file
 	for _, expressionPath := range existingPaths {
 		relPath, _ := filepath.Rel(nixpkgsDir, expressionPath)
 		stats := fileStats[expressionPath]
-
-		log.Printf("[%s] Attempting to evaluate expression file: %s", rev, relPath)
 		stats.attempted = true
 
-		// Build the command with the specific Nix expression path and arguments
-		cmd := exec.Command("nix-eval-jobs",
+		// Build the command with additional options
+		args := []string{
 			expressionPath,
 			"--arg", "checkMeta", "false",
 			"--workers", fmt.Sprintf("%d", workers),
-			"--max-memory-size", "4096",
-			"--option", "allow-import-from-derivation", "false")
+			"--option", "allow-import-from-derivation", "false",
+			"--option", "system-features", "nixos-test benchmark big-parallel kvm",
+			"--option", "allow-unsupported-system", "true", // Allow evaluating all platforms
+		}
+		
+		// Check for additional options in environment
+		if extraOpts := os.Getenv("FOD_ORACLE_EVAL_OPTS"); extraOpts != "" {
+			extraArgs := strings.Fields(extraOpts)
+			args = append(args, extraArgs...)
+		}
+		
+		cmd := exec.Command("nix-eval-jobs", args...)
 
-		// Capture stdout
+		// Capture stdout and stderr
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			errMsg := fmt.Sprintf("Failed to create stdout pipe: %v", err)
-			stats.errorMessage = errMsg
-			log.Printf("[%s] %s for %s", rev, errMsg, relPath)
+			stats.errorMessage = fmt.Sprintf("Failed to create stdout pipe: %v", err)
 			continue
 		}
 
-		// Capture stderr
 		stderr, err := cmd.StderrPipe()
 		if err != nil {
-			errMsg := fmt.Sprintf("Failed to create stderr pipe: %v", err)
-			stats.errorMessage = errMsg
-			log.Printf("[%s] %s for %s", rev, errMsg, relPath)
+			stats.errorMessage = fmt.Sprintf("Failed to create stderr pipe: %v", err)
 			continue
 		}
 
-		// Start capturing stderr in a goroutine
+		// Start capturing stderr
 		stderrChan := make(chan string, 1)
 		go func() {
 			stderrBytes, _ := io.ReadAll(stderr)
 			stderrChan <- string(stderrBytes)
 		}()
 
-		err = cmd.Start()
-		if err != nil {
-			errMsg := fmt.Sprintf("Failed to start nix-eval-jobs: %v", err)
-			stats.errorMessage = errMsg
-			log.Printf("[%s] %s for %s", rev, errMsg, relPath)
+		if err = cmd.Start(); err != nil {
+			stats.errorMessage = fmt.Sprintf("Failed to start nix-eval-jobs: %v", err)
 			continue
 		}
 
 		// Process stdout
 		scanner := bufio.NewScanner(stdout)
-		const maxScannerSize = 10 * 1024 * 1024
+		const maxScannerSize = 100 * 1024 * 1024 // Increase to 100MB
 		buf := make([]byte, maxScannerSize)
 		scanner.Buffer(buf, maxScannerSize)
 
@@ -918,11 +888,10 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 				DrvPath string `json:"drvPath"`
 			}
 			if err := json.Unmarshal([]byte(line), &result); err != nil {
-				log.Printf("[%s] Failed to parse JSON from %s: %v", rev, relPath, err)
 				continue
 			}
 
-			// Only count each derivation once per file and globally
+			// Add to channel if not already processed
 			if result.DrvPath != "" {
 				fileVisited[result.DrvPath] = true
 				if !globalVisited[result.DrvPath] {
@@ -933,7 +902,7 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 
 				jobCount++
 				if jobCount%1000 == 0 {
-					log.Printf("[%s] Processed %d jobs from %s (unique in this file: %d, global total: %d)",
+					log.Printf("[%s] Processed %d jobs from %s (unique: %d, total: %d)",
 						rev, jobCount, relPath, len(fileVisited), totalJobCount)
 				}
 			}
@@ -942,9 +911,7 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 		stats.derivationsFound = len(fileVisited)
 
 		if err := scanner.Err(); err != nil {
-			errMsg := fmt.Sprintf("Error reading stdout: %v", err)
-			stats.errorMessage = errMsg
-			log.Printf("[%s] %s from %s", rev, errMsg, relPath)
+			stats.errorMessage = fmt.Sprintf("Error reading stdout: %v", err)
 		}
 
 		// Wait for command to complete
@@ -953,54 +920,42 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 
 		if err != nil {
 			if stderrOutput != "" {
-				stats.errorMessage = fmt.Sprintf("Exit error: %v\nStderr: %s", err, stderrOutput)
-				log.Printf("[%s] nix-eval-jobs stderr output for %s: %s", rev, relPath, stderrOutput)
+				stats.errorMessage = fmt.Sprintf("Error: %v\nStderr: %s", err, stderrOutput)
 			} else {
-				stats.errorMessage = fmt.Sprintf("Exit error: %v", err)
+				stats.errorMessage = fmt.Sprintf("Error: %v", err)
 			}
-			log.Printf("[%s] nix-eval-jobs for %s exited with error, but processed %d derivations (found %d unique)",
-				rev, relPath, jobCount, len(fileVisited))
 		} else {
 			stats.succeeded = true
-			log.Printf("[%s] nix-eval-jobs for %s completed successfully with %d derivations (found %d unique)",
-				rev, relPath, jobCount, len(fileVisited))
 		}
 	}
 
-	// Print the summary table of all expression files and their status
+	// Print summary of expression file status
 	printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats)
 
-	// If we found some jobs, consider it a success regardless of errors
+	// If we found some jobs, consider it a success
 	if totalJobCount > 0 {
-		log.Printf("[%s] Total unique derivations found across all expression files: %d", rev, totalJobCount)
+		log.Printf("[%s] Found %d unique derivations across all files", rev, totalJobCount)
 		return nil
 	}
 
-	// If no jobs were found, try the fallback mechanism
-	log.Printf("[%s] No jobs found with nix-eval-jobs, trying fallback with nix-instantiate...", rev)
-
-	// Mark that we're using the fallback mechanism
+	// Try fallback mechanism if no jobs found
+	log.Printf("[%s] No jobs found, trying fallback...", rev)
 	*usedFallback = true
 
-	// Add fallback to stats tracking
+	// Create fallback Nix file
 	fallbackPath := filepath.Join(nixpkgsDir, "fallback-extract.nix")
-	relFallbackPath := "fallback-extract.nix"
 	fallbackStats := &exprFileStats{
 		exists:    false,
 		attempted: true,
 	}
 	fileStats[fallbackPath] = fallbackStats
 
-	// Create a simple Nix file that tries to extract derivations from basic packages
+	// Create a simple Nix file for fallback
 	fallbackNixContent := `
 let
-  # Try to import with different approaches
   pkgsAttempt = builtins.tryEval (import ./. {});
-  
-  # Handle different Nixpkgs structures over the years
   pkgs = if pkgsAttempt.success then pkgsAttempt.value else {};
   
-  # Try to get various basic utilities that exist in most Nixpkgs versions
   basicPkgsList = [
     (pkgs.stdenv or {}).cc or {}
     pkgs.bash or {}
@@ -1009,17 +964,14 @@ let
     pkgs.gzip or {}
     pkgs.gnused or {}
     pkgs.gnugrep or {}
-    # Try older package names too
     pkgs.gcc or {}
     pkgs.binutils or {}
     pkgs.perl or {}
     pkgs.python or {}
   ];
   
-  # Try to handle various package structures over the years
   basicPkgs = builtins.filter (p: p != {}) basicPkgsList;
   
-  # Just extract the derivation paths for these basic packages
   extractDrvPath = p: 
     if p ? drvPath then p.drvPath
     else if p ? outPath then p.outPath
@@ -1028,88 +980,38 @@ let
   drvPaths = map extractDrvPath (builtins.filter (p: p ? drvPath || p ? outPath) basicPkgs);
 in drvPaths
 `
+	// Write fallback file and mark as existing
 	if err := os.WriteFile(fallbackPath, []byte(fallbackNixContent), 0o644); err != nil {
-		errMsg := fmt.Sprintf("Failed to write fallback Nix file: %v", err)
-		fallbackStats.errorMessage = errMsg
-		log.Printf("[%s] %s", rev, errMsg)
-
-		// Print the final status summary including fallback
+		fallbackStats.errorMessage = fmt.Sprintf("Failed to write fallback file: %v", err)
 		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
-
-		return fmt.Errorf("nix-eval-jobs failed and fallback creation failed: %w", err)
+		return fmt.Errorf("nix-eval-jobs failed and fallback failed: %w", err)
 	}
-
 	fallbackStats.exists = true
 
 	// Try to evaluate with nix-instantiate
-	log.Printf("[%s] Running fallback with nix-instantiate on %s", rev, relFallbackPath)
+	log.Printf("[%s] Running fallback with nix-instantiate", rev)
 	fallbackCmd := exec.Command("nix-instantiate", "--eval", "--json", fallbackPath)
-	fallbackCmd.Dir = nixpkgsDir // Set working directory to nixpkgs dir
+	fallbackCmd.Dir = nixpkgsDir
 	fallbackOutput, err := fallbackCmd.Output()
+	
+	// Handle fallback failure
 	if err != nil {
-		errMsg := fmt.Sprintf("Fallback with nix-instantiate failed: %v", err)
-		fallbackStats.errorMessage = errMsg
-		log.Printf("[%s] %s", rev, errMsg)
-
-		// Try one more fallback with a simpler expression for very old Nixpkgs
-		log.Printf("[%s] Trying simpler fallback expression...", rev)
-		simpleFallbackContent := `
-let
-  pkgs = import ./. {};
-  drvPaths = [];
-in drvPaths
-`
-		// Add simple fallback to stats
-		simpleFallbackPath := filepath.Join(nixpkgsDir, "simple-fallback.nix")
-		// simpleFallbackPath_rel := "simple-fallback.nix"
-		simpleFallbackStats := &exprFileStats{
-			exists:    false,
-			attempted: true,
-		}
-		fileStats[simpleFallbackPath] = simpleFallbackStats
-
-		if err := os.WriteFile(simpleFallbackPath, []byte(simpleFallbackContent), 0o644); err != nil {
-			errMsg := fmt.Sprintf("Failed to write simple fallback Nix file: %v", err)
-			simpleFallbackStats.errorMessage = errMsg
-			log.Printf("[%s] %s", rev, errMsg)
-
-			// Print the final status summary including all fallbacks
-			printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath, simpleFallbackPath)
-
-			// At least record that we tried this revision
-			log.Printf("[%s] All evaluation methods failed, but recording revision in database", rev)
-			return nil
-		}
-
-		simpleFallbackStats.exists = true
-
-		// Skip trying to evaluate the simple fallback - it's just a last resort attempt
-		// that would likely fail but makes sure we record the revision in the database
-		log.Printf("[%s] All evaluation methods failed, but recording revision in database", rev)
-
-		// Print the final status summary including all fallbacks
-		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath, simpleFallbackPath)
-
+		fallbackStats.errorMessage = fmt.Sprintf("Fallback failed: %v", err)
+		log.Printf("[%s] All evaluation methods failed, recording revision anyway", rev)
+		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
 		return nil
 	}
 
 	// Parse the output
 	var drvPaths []string
 	if err := json.Unmarshal(fallbackOutput, &drvPaths); err != nil {
-		errMsg := fmt.Sprintf("Failed to parse fallback output: %v", err)
-		fallbackStats.errorMessage = errMsg
-		log.Printf("[%s] %s", rev, errMsg)
-
-		// Print the final status summary including fallback
+		fallbackStats.errorMessage = fmt.Sprintf("Failed to parse fallback output: %v", err)
 		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
-
 		return fmt.Errorf("fallback output parsing failed: %w", err)
 	}
 
-	// Add the paths to our channel
-	fallbackJobCount := 0
+	// Add paths to channel
 	fallbackVisited := make(map[string]bool)
-
 	for _, path := range drvPaths {
 		if path != "" {
 			fallbackVisited[path] = true
@@ -1118,7 +1020,6 @@ in drvPaths
 				totalJobCount++
 				drvPathChan <- path
 			}
-			fallbackJobCount++
 		}
 	}
 
@@ -1126,19 +1027,11 @@ in drvPaths
 
 	if len(fallbackVisited) > 0 {
 		fallbackStats.succeeded = true
-		log.Printf("[%s] Fallback found %d basic derivations (%d unique)",
-			rev, fallbackJobCount, len(fallbackVisited))
-
-		// Print the final status summary including fallback
-		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
-
+		log.Printf("[%s] Fallback found %d derivations", rev, len(fallbackVisited))
 		return nil
 	}
 
-	log.Printf("[%s] Fallback did not find any derivations", rev)
-	// Print the final status summary including fallback
-	printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
-
+	log.Printf("[%s] Fallback found no derivations", rev)
 	return fmt.Errorf("all evaluation methods failed for %s", rev)
 }
 
@@ -1430,29 +1323,29 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Println("Starting FOD finder...")
 
-	// Get CPU cores as an integer
-	// cpuCores := getCPUCores(systemInfo.Cores)
+	log.Printf("Using %d worker threads on %s (%s), %s", 
+		workers, systemInfo.CPU, systemInfo.Cores, systemInfo.OS)
 
-	log.Printf("Configuration: %d worker threads", workers)
-	log.Printf("System: %s, CPU: %s (%s), Memory: %s",
-		systemInfo.Host, systemInfo.CPU, systemInfo.Cores, systemInfo.Memory)
-	log.Printf("OS: %s, Kernel: %s", systemInfo.OS, systemInfo.Kernel)
-
-	// Clean up any leftover worktrees from previous runs
-	if err := cleanupWorktrees(); err != nil {
-		log.Printf("Warning: Failed to clean up worktrees: %v", err)
-	}
+	// Clean up any leftover worktrees
+	cleanupWorktrees()
 
 	db := initDB()
 	defer db.Close()
 
+	// Check command line arguments
 	if len(os.Args) < 2 {
 		log.Fatalf("Usage: %s <nixpkgs-revision> [<nixpkgs-revision2> ...]", os.Args[0])
 	}
+	
+	// Get revisions from command line
 	revisions := os.Args[1:]
-	log.Printf("Processing %d nixpkgs revisions: %v", len(revisions), revisions)
+	log.Printf("Processing %d nixpkgs revisions", len(revisions))
 
 	startTime := time.Now()
+
+	// Check for test mode
+	testDrvPath := os.Getenv("FOD_ORACLE_TEST_DRV_PATH")
+	isTestMode := testDrvPath != ""
 
 	// Process revisions sequentially
 	for _, rev := range revisions {
@@ -1461,27 +1354,88 @@ func main() {
 			log.Printf("Failed to get or create revision %s: %v", rev, err)
 			continue
 		}
-		log.Printf("Using nixpkgs revision: %s (ID: %d)", rev, revisionID)
-
-		if err := findFODsForRevision(rev, revisionID, db); err != nil {
-			log.Printf("Error finding FODs for revision %s: %v", rev, err)
+		
+		// Special handling for test mode
+		if isTestMode {
+			log.Printf("Running in test mode with derivation path: %s", testDrvPath)
+			if err := processTestDerivation(testDrvPath, revisionID, db); err != nil {
+				log.Printf("Error processing test derivation: %v", err)
+			}
+		} else {
+			// Normal mode
+			if err := findFODsForRevision(rev, revisionID, db); err != nil {
+				log.Printf("Error finding FODs for revision %s: %v", rev, err)
+			}
 		}
 	}
 
-	totalElapsed := time.Since(startTime)
-	log.Printf("All revisions processed in %v", totalElapsed)
-
-	log.Println("Optimizing database...")
+	// Optimize database
 	for _, opt := range []string{"PRAGMA optimize", "VACUUM", "ANALYZE"} {
-		if _, err := db.Exec(opt); err != nil {
-			log.Printf("Warning: Failed to execute %s: %v", opt, err)
-		}
+		db.Exec(opt)
 	}
 
 	// Final cleanup
-	if err := cleanupWorktrees(); err != nil {
-		log.Printf("Warning: Failed to clean up worktrees: %v", err)
+	cleanupWorktrees()
+
+	log.Printf("All revisions processed in %v", time.Since(startTime))
+}
+
+// processTestDerivation processes a single derivation for testing purposes
+func processTestDerivation(drvPath string, revisionID int64, db *sql.DB) error {
+	log.Printf("Processing test derivation: %s", drvPath)
+	
+	// Initialize the batcher
+	batcher, err := NewDBBatcher(db, 1000, revisionID)
+	if err != nil {
+		return fmt.Errorf("failed to create database batcher: %w", err)
+	}
+	defer batcher.Close()
+	
+	// Set up a context for processing
+	visited := &sync.Map{}
+	var wg sync.WaitGroup
+	
+	ctx := &ProcessingContext{
+		batcher:        batcher,
+		visited:        visited,
+		processedPaths: &sync.Map{},
+		wg:             &wg,
+		semaphore:      make(chan struct{}, 5),
+	}
+	
+	// Manually read the derivation for debugging
+	file, err := os.Open(drvPath)
+	if err != nil {
+		log.Printf("Error opening file %s: %v", drvPath, err)
+		return fmt.Errorf("error opening file: %w", err)
+	}
+	defer file.Close()
+
+	drv, err := derivation.ReadDerivation(file)
+	if err != nil {
+		log.Printf("Error reading derivation %s: %v", drvPath, err)
+		return fmt.Errorf("error reading derivation: %w", err)
 	}
 
-	log.Println("FOD finder completed successfully")
+	// Debug output - print the outputs and their properties
+	log.Printf("Derivation has %d outputs", len(drv.Outputs))
+	for name, out := range drv.Outputs {
+		log.Printf("Output %s: Path=%s, HashAlgo=%s, Hash=%s", 
+			name, out.Path, out.HashAlgorithm, out.Hash)
+	}
+	
+	// Process the derivation
+	processDerivation(drvPath, ctx)
+	
+	// Flush the batcher
+	batcher.Flush()
+	
+	// Count the FODs
+	var fodCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount); err != nil {
+		log.Printf("Error counting FODs: %v", err)
+	}
+	
+	log.Printf("Found %d FODs for test derivation", fodCount)
+	return nil
 }
