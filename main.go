@@ -823,15 +823,15 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 
 	// Define possible Nix expression files to evaluate
 	possiblePaths := []string{
-		filepath.Join(nixpkgsDir, "pkgs/top-level/release.nix"),
 		filepath.Join(nixpkgsDir, "pkgs/top-level/release-outpaths.nix"),
-		filepath.Join(nixpkgsDir, "pkgs/top-level/release-small.nix"),
-		filepath.Join(nixpkgsDir, "pkgs/top-level/all-packages.nix"),
-		filepath.Join(nixpkgsDir, "nixos/release.nix"),
-		filepath.Join(nixpkgsDir, "nixos/release-small.nix"),
-		filepath.Join(nixpkgsDir, "nixos/release-combined.nix"),
-		filepath.Join(nixpkgsDir, "all-packages.nix"),
-		filepath.Join(nixpkgsDir, "default.nix"),
+		// filepath.Join(nixpkgsDir, "pkgs/top-level/release.nix"),
+		// filepath.Join(nixpkgsDir, "pkgs/top-level/release-small.nix"),
+		// filepath.Join(nixpkgsDir, "pkgs/top-level/all-packages.nix"),
+		// filepath.Join(nixpkgsDir, "nixos/release.nix"),
+		// filepath.Join(nixpkgsDir, "nixos/release-small.nix"),
+		// filepath.Join(nixpkgsDir, "nixos/release-combined.nix"),
+		// filepath.Join(nixpkgsDir, "all-packages.nix"),
+		// filepath.Join(nixpkgsDir, "default.nix"),
 	}
 
 	// Check which expression files exist
