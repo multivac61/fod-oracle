@@ -37,10 +37,60 @@ FOD Oracle is a tool for tracking and analyzing fixed-output derivations (FODs) 
 To scan a nixpkgs revision:
 
 ```bash
-nix run github:multivac61/fod-oracle -- <nixpkgs-revision>
+# Build the tool
+./build.sh
+
+# Process a simple package name
+./fod-oracle -expr hello
+
+# Process a complex Nix expression
+./fod-oracle -expr "let pkgs = import <nixpkgs> {}; in pkgs.hello"
+
+# Process a specific nixpkgs revision
+./fod-oracle 1d250f4
+
+# Output to JSON format
+./fod-oracle -format=json -output=./output.json -expr hello
+
+# Output to CSV format
+./fod-oracle -format=csv -output=./output.csv -expr hello
+
+# Output to Parquet format
+./fod-oracle -format=parquet -output=./output.parquet -expr hello
 ```
 
-This took around 7 minutes on a 7950 AMD Ryzen 9 16-core processor.
+Scanning a complete nixpkgs revision takes around 7 minutes on a 7950 AMD Ryzen 9 16-core processor.
+
+### Command-line Arguments
+
+```
+Usage: ./fod-oracle [options] <nixpkgs-revision> [<nixpkgs-revision2> ...]
+
+Options:
+  -drv string
+    	Derivation path for test mode
+  -expr
+    	Process a Nix expression instead of a revision
+  -format string
+    	Output format (sqlite, json, csv, parquet) (default "sqlite")
+  -help
+    	Show help
+  -output string
+    	Output path for non-SQLite formats
+  -test
+    	Test mode - process a single derivation
+  -workers int
+    	Number of worker threads (default 1)
+```
+
+### Environment Variables
+
+- `FOD_ORACLE_NUM_WORKERS` - Number of worker threads (default: 1)
+- `FOD_ORACLE_DB_PATH` - Path to SQLite database (default: ./db/fods.db)
+- `FOD_ORACLE_OUTPUT_FORMAT` - Output format (default: sqlite)
+- `FOD_ORACLE_OUTPUT_PATH` - Output path for non-SQLite formats
+- `FOD_ORACLE_TEST_DRV_PATH` - Path to derivation for test mode
+- `FOD_ORACLE_EVAL_OPTS` - Additional options for nix-eval-jobs
 
 ## API Endpoints
 

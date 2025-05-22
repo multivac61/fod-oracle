@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -139,11 +140,36 @@ func init() {
 	// Collect system information
 	systemInfo, systemInfoJSON = getSystemInfo()
 
+	// Initialize config with defaults
+	config = Config{
+		IsNixExpr:    false,
+		OutputFormat: "sqlite",
+		OutputPath:   "",
+		WorkerCount:  1,
+	}
+
 	// Check for custom worker count in environment
 	if workersEnv := os.Getenv("FOD_ORACLE_NUM_WORKERS"); workersEnv != "" {
 		if w, err := strconv.Atoi(workersEnv); err == nil && w > 0 {
 			workers = w
+			config.WorkerCount = w
 		}
+	}
+	
+	// Check for output format in environment
+	if outputFormat := os.Getenv("FOD_ORACLE_OUTPUT_FORMAT"); outputFormat != "" {
+		// Validate output format
+		switch outputFormat {
+		case "sqlite", "json", "csv", "parquet":
+			config.OutputFormat = outputFormat
+		default:
+			log.Printf("Warning: Invalid output format '%s', using 'sqlite'", outputFormat)
+		}
+	}
+	
+	// Check for output path in environment
+	if outputPath := os.Getenv("FOD_ORACLE_OUTPUT_PATH"); outputPath != "" {
+		config.OutputPath = outputPath
 	}
 }
 
@@ -570,9 +596,9 @@ func (b *DBBatcher) Close() error {
 
 // ProcessingContext holds the context for processing derivations
 type ProcessingContext struct {
-	batcher        *DBBatcher
+	batcher        Writer       // Interface for adding FODs
 	visited        *sync.Map
-	processedPaths *sync.Map // Cache for already processed derivation paths
+	processedPaths *sync.Map    // Cache for already processed derivation paths
 	wg             *sync.WaitGroup
 	semaphore      chan struct{} // Limit concurrency
 }
@@ -671,12 +697,12 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	}
 	defer os.RemoveAll(worktreeDir)
 
-	// Initialize the batcher
-	batcher, err := NewDBBatcher(db, 1000, revisionID)
+	// Initialize the writer based on output format
+	writer, err := GetWriter(db, revisionID, rev)
 	if err != nil {
-		return fmt.Errorf("failed to create database batcher: %w", err)
+		return fmt.Errorf("failed to create writer: %w", err)
 	}
-	defer batcher.Close()
+	defer writer.Close()
 
 	// Setup for concurrency and memory tracking
 	visited := &sync.Map{}
@@ -703,7 +729,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 
 	// Create processing context
 	ctx := &ProcessingContext{
-		batcher:        batcher,
+		batcher:        writer, // Use the writer interface
 		visited:        visited,
 		processedPaths: &sync.Map{}, // Cache for processed derivations
 		wg:             &wg,
@@ -766,14 +792,19 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	}
 
 	// Flush and get stats
-	batcher.Flush()
+	writer.Flush()
 	revElapsed := time.Since(revStartTime)
 	
-	var fodCount int
-	db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount)
-	log.Printf("[%s] Found %d FODs in %v", rev, fodCount, revElapsed)
+	// Only get count from database if using SQLite
+	if config.OutputFormat == "sqlite" {
+		var fodCount int
+		db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount)
+		log.Printf("[%s] Found %d FODs in %v", rev, fodCount, revElapsed)
+	} else {
+		log.Printf("[%s] Processing completed in %v", rev, revElapsed)
+	}
 
-	// Store metadata
+	// Always store metadata in SQLite for reporting purposes
 	memoryMutex.Lock()
 	finalPeakMemory := peakMemoryMB
 	memoryMutex.Unlock()
@@ -1323,8 +1354,58 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Println("Starting FOD finder...")
 
+	// Parse command-line flags
+	var (
+		formatFlag  = flag.String("format", config.OutputFormat, "Output format (sqlite, json, csv, parquet)")
+		outputFlag  = flag.String("output", config.OutputPath, "Output path for non-SQLite formats")
+		workersFlag = flag.Int("workers", workers, "Number of worker threads")
+		testMode    = flag.Bool("test", false, "Test mode - process a single derivation")
+		testDrv     = flag.String("drv", "", "Derivation path for test mode")
+		nixExpr     = flag.Bool("expr", false, "Process a Nix expression instead of a revision")
+		helpFlag    = flag.Bool("help", false, "Show help")
+	)
+	
+	flag.Parse()
+	
+	if *helpFlag {
+		fmt.Printf("FOD Oracle - A tool for finding Fixed-Output Derivations in Nix packages\n\n")
+		fmt.Printf("Usage: %s [options] <nixpkgs-revision> [<nixpkgs-revision2> ...]\n\n", os.Args[0])
+		fmt.Printf("Options:\n")
+		flag.PrintDefaults()
+		fmt.Printf("\nEnvironment Variables:\n")
+		fmt.Printf("  FOD_ORACLE_NUM_WORKERS   Number of worker threads (default: 1)\n")
+		fmt.Printf("  FOD_ORACLE_DB_PATH       Path to SQLite database (default: ./db/fods.db)\n")
+		fmt.Printf("  FOD_ORACLE_OUTPUT_FORMAT Output format (default: sqlite)\n")
+		fmt.Printf("  FOD_ORACLE_OUTPUT_PATH   Output path for non-SQLite formats\n")
+		fmt.Printf("  FOD_ORACLE_TEST_DRV_PATH Path to derivation for test mode\n")
+		fmt.Printf("  FOD_ORACLE_EVAL_OPTS     Additional options for nix-eval-jobs\n")
+		return
+	}
+	
+	// Apply command-line options to config
+	if *formatFlag != "" {
+		config.OutputFormat = *formatFlag
+	}
+	
+	if *outputFlag != "" {
+		config.OutputPath = *outputFlag
+	}
+	
+	if *workersFlag > 0 {
+		workers = *workersFlag
+		config.WorkerCount = *workersFlag
+	}
+	
+	if *nixExpr {
+		config.IsNixExpr = true
+	}
+	
 	log.Printf("Using %d worker threads on %s (%s), %s", 
 		workers, systemInfo.CPU, systemInfo.Cores, systemInfo.OS)
+	log.Printf("Output format: %s", config.OutputFormat)
+	if config.OutputPath != "" {
+		log.Printf("Output path: %s", config.OutputPath)
+	}
 
 	// Clean up any leftover worktrees
 	cleanupWorktrees()
@@ -1332,19 +1413,23 @@ func main() {
 	db := initDB()
 	defer db.Close()
 
-	// Check command line arguments
-	if len(os.Args) < 2 {
-		log.Fatalf("Usage: %s <nixpkgs-revision> [<nixpkgs-revision2> ...]", os.Args[0])
+	// Get revisions from command line
+	revisions := flag.Args()
+	if len(revisions) < 1 && !*testMode {
+		log.Fatalf("Usage: %s [options] <nixpkgs-revision> [<nixpkgs-revision2> ...]\nUse --help for more information", os.Args[0])
 	}
 	
-	// Get revisions from command line
-	revisions := os.Args[1:]
 	log.Printf("Processing %d nixpkgs revisions", len(revisions))
 
 	startTime := time.Now()
 
 	// Check for test mode
 	testDrvPath := os.Getenv("FOD_ORACLE_TEST_DRV_PATH")
+	if *testMode {
+		if *testDrv != "" {
+			testDrvPath = *testDrv
+		}
+	}
 	isTestMode := testDrvPath != ""
 
 	// Process revisions sequentially
@@ -1361,8 +1446,13 @@ func main() {
 			if err := processTestDerivation(testDrvPath, revisionID, db); err != nil {
 				log.Printf("Error processing test derivation: %v", err)
 			}
+		} else if *nixExpr {
+			// Process as Nix expression rather than as a Git revision
+			if err := processNixExpression(rev, revisionID, db); err != nil {
+				log.Printf("Error processing Nix expression: %v", err)
+			}
 		} else {
-			// Normal mode
+			// Normal mode - process as a Git revision
 			if err := findFODsForRevision(rev, revisionID, db); err != nil {
 				log.Printf("Error finding FODs for revision %s: %v", rev, err)
 			}
@@ -1384,19 +1474,22 @@ func main() {
 func processTestDerivation(drvPath string, revisionID int64, db *sql.DB) error {
 	log.Printf("Processing test derivation: %s", drvPath)
 	
-	// Initialize the batcher
-	batcher, err := NewDBBatcher(db, 1000, revisionID)
+	// Mark this as a test/Nix expression
+	config.IsNixExpr = true
+	
+	// Initialize the writer
+	writer, err := GetWriter(db, revisionID, "test")
 	if err != nil {
-		return fmt.Errorf("failed to create database batcher: %w", err)
+		return fmt.Errorf("failed to create writer: %w", err)
 	}
-	defer batcher.Close()
+	defer writer.Close()
 	
 	// Set up a context for processing
 	visited := &sync.Map{}
 	var wg sync.WaitGroup
 	
 	ctx := &ProcessingContext{
-		batcher:        batcher,
+		batcher:        writer,
 		visited:        visited,
 		processedPaths: &sync.Map{},
 		wg:             &wg,
@@ -1427,15 +1520,19 @@ func processTestDerivation(drvPath string, revisionID int64, db *sql.DB) error {
 	// Process the derivation
 	processDerivation(drvPath, ctx)
 	
-	// Flush the batcher
-	batcher.Flush()
+	// Flush the writer
+	writer.Flush()
 	
-	// Count the FODs
-	var fodCount int
-	if err := db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount); err != nil {
-		log.Printf("Error counting FODs: %v", err)
+	// Count the FODs if using SQLite
+	if config.OutputFormat == "sqlite" {
+		var fodCount int
+		if err := db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount); err != nil {
+			log.Printf("Error counting FODs: %v", err)
+		}
+		log.Printf("Found %d FODs for test derivation", fodCount)
+	} else {
+		log.Printf("Processed test derivation successfully")
 	}
 	
-	log.Printf("Found %d FODs for test derivation", fodCount)
 	return nil
 }
