@@ -1,4 +1,4 @@
-package main
+package tests
 
 import (
 	"fmt"
@@ -8,7 +8,7 @@ import (
 	"github.com/nix-community/go-nix/pkg/derivation"
 )
 
-func main() {
+func RunTestFOD() {
 	if len(os.Args) != 2 {
 		fmt.Println("Usage: test_fod <derivation_path>")
 		os.Exit(1)
@@ -36,15 +36,15 @@ func main() {
 
 	// Check outputs
 	log.Printf("Derivation has %d outputs", len(drv.Outputs))
-	
+
 	isFOD := false
 	for name, out := range drv.Outputs {
-		log.Printf("Output %s: Path=%s, HashAlgo=%s, Hash=%s", 
+		log.Printf("Output %s: Path=%s, HashAlgo=%s, Hash=%s",
 			name, out.Path, out.HashAlgorithm, out.Hash)
-		
+
 		if out.HashAlgorithm != "" {
 			isFOD = true
-			log.Printf("This is a FOD with hash algorithm: %s and hash: %s", 
+			log.Printf("This is a FOD with hash algorithm: %s and hash: %s",
 				out.HashAlgorithm, out.Hash)
 		}
 	}

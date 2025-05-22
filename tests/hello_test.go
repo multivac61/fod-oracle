@@ -2,7 +2,6 @@ package tests
 
 import (
 	"database/sql"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +13,10 @@ import (
 
 // TestHelloPackageFOD tests that the hello package is correctly identified as a FOD
 func TestHelloPackageFOD(t *testing.T) {
+	// Skip this test in Nix build environment as it requires nix-build
+	if os.Getenv("NIX_BUILD_TOP") != "" {
+		t.Skip("Skipping test in Nix build environment")
+	}
 	// Create test directory
 	testDir, err := os.MkdirTemp("", "fod-oracle-test")
 	if err != nil {
@@ -103,70 +106,70 @@ func TestHelloPackageFOD(t *testing.T) {
 	// Set environment variables for the test
 	os.Setenv("FOD_ORACLE_DB_PATH", dbPath)
 	os.Setenv("FOD_ORACLE_NUM_WORKERS", "2") // Use minimal workers for test
-	
+
 	// Run nix-build to get the derivation path for hello
 	cmd := exec.Command("nix-build", "--no-out-link", "<nixpkgs>", "-A", "hello")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("Failed to build hello package: %v\nOutput: %s", err, output)
 	}
-	
+
 	outPath := strings.TrimSpace(string(output))
 	t.Logf("Hello package output path: %s", outPath)
-	
+
 	// Get the derivation path
 	cmd = exec.Command("nix-store", "--query", "--deriver", outPath)
 	output, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("Failed to get derivation path: %v\nOutput: %s", err, output)
 	}
-	
+
 	drvPath := strings.TrimSpace(string(output))
 	t.Logf("Hello package derivation path: %s", drvPath)
-	
+
 	// Get current nixpkgs revision
 	cmd = exec.Command("nix-instantiate", "--eval", "--expr", "builtins.nixVersion")
 	output, err = cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("Failed to get Nix version: %v\nOutput: %s", err, output)
 	}
-	
+
 	nixVersion := strings.Trim(string(output), "\"\n ")
 	t.Logf("Nix version: %s", nixVersion)
-	
+
 	// Use the nixVersion as a pseudo-revision
 	testRevision := "test-" + nixVersion
-	
+
 	// Create a minimal test to run just the processing on the hello derivation
 	// This avoids the complexity of the full nix-eval-jobs workflow
-	
+
 	// Run the main program with the test revision
 	mainCmd := exec.Command("./fod-oracle", testRevision)
-	mainCmd.Env = append(os.Environ(), 
+	mainCmd.Env = append(os.Environ(),
 		"FOD_ORACLE_DB_PATH="+dbPath,
 		"FOD_ORACLE_NUM_WORKERS=2",
 		"FOD_ORACLE_TEST_DRV_PATH="+drvPath)
-	
+
 	output, err = mainCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("Failed to run main program: %v\nOutput: %s", err, output)
 	}
-	
+
 	t.Logf("Main program output: %s", output)
-	
+
 	// Query the database to see if the hello package was correctly identified as a FOD
 	var count int
 	err = db.QueryRow("SELECT COUNT(*) FROM fods WHERE drv_path = ?", drvPath).Scan(&count)
 	if err != nil {
 		t.Fatalf("Failed to query database: %v", err)
 	}
-	
+
 	if count == 0 {
 		t.Errorf("Hello package was not identified as a FOD")
 	} else {
 		t.Logf("Hello package was correctly identified as a FOD")
 	}
-	
+
 	// Also check if the derivation was correctly associated with the revision
 	var revisionCount int
 	err = db.QueryRow(`
@@ -174,11 +177,10 @@ func TestHelloPackageFOD(t *testing.T) {
 		JOIN revisions ON drv_revisions.revision_id = revisions.id
 		WHERE revisions.rev = ? AND drv_revisions.drv_path = ?
 	`, testRevision, drvPath).Scan(&revisionCount)
-	
 	if err != nil {
 		t.Fatalf("Failed to query database for revision association: %v", err)
 	}
-	
+
 	if revisionCount == 0 {
 		t.Errorf("Hello package was not associated with the test revision")
 	} else {

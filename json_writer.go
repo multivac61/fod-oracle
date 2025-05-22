@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -27,7 +26,7 @@ type JSONWriter struct {
 func NewJSONWriter(outputPath string, revisionID int64) (*JSONWriter, error) {
 	// Create directory if it doesn't exist
 	dir := filepath.Dir(outputPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 
@@ -58,9 +57,9 @@ func NewJSONWriter(outputPath string, revisionID int64) (*JSONWriter, error) {
 func (w *JSONWriter) AddFOD(fod FOD) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	w.fods = append(w.fods, fod)
-	
+
 	// Flush to disk when batch size is reached
 	if len(w.fods) >= w.batchSize {
 		w.writeBatch()
@@ -75,7 +74,7 @@ func (w *JSONWriter) writeBatch() {
 
 	// Prepare the batch for JSON serialization
 	var records interface{}
-	
+
 	if config.IsNixExpr {
 		// For Nix expressions, don't include revision ID
 		records = w.fods
@@ -85,7 +84,7 @@ func (w *JSONWriter) writeBatch() {
 			FOD
 			RevisionID int64 `json:"revision_id"`
 		}
-		
+
 		jsonRecords := make([]JSONRecord, len(w.fods))
 		for i, fod := range w.fods {
 			jsonRecords[i] = JSONRecord{
@@ -95,14 +94,14 @@ func (w *JSONWriter) writeBatch() {
 		}
 		records = jsonRecords
 	}
-	
+
 	// Marshal to JSON
 	data, err := json.Marshal(records)
 	if err != nil {
 		log.Printf("Warning: failed to marshal FODs to JSON: %v", err)
 		return
 	}
-	
+
 	// Write to file
 	if !w.isFirst {
 		// If not the first batch, prepend with a comma and newline
@@ -113,25 +112,25 @@ func (w *JSONWriter) writeBatch() {
 	} else {
 		w.isFirst = false
 	}
-	
+
 	// Remove the opening and closing brackets from the JSON array since we're writing
 	// in batches and will add our own brackets at the beginning and end
 	dataStr := string(data)
 	if len(dataStr) > 2 {
 		dataStr = dataStr[1 : len(dataStr)-1] // Remove [ and ]
 	}
-	
+
 	if _, err := w.file.WriteString(dataStr); err != nil {
 		log.Printf("Warning: failed to write JSON data: %v", err)
 		return
 	}
-	
+
 	// Update total count
 	w.totalCount += len(w.fods)
-	
+
 	// Log progress
 	log.Printf("Wrote batch of %d FODs to JSON file (total: %d)", len(w.fods), w.totalCount)
-	
+
 	// Clear the batch
 	w.fods = w.fods[:0]
 }
@@ -145,7 +144,7 @@ func (w *JSONWriter) IncrementDrvCount() {
 func (w *JSONWriter) Flush() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	w.writeBatch()
 }
 
@@ -153,23 +152,23 @@ func (w *JSONWriter) Flush() {
 func (w *JSONWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	if !w.isOpen {
 		return nil
 	}
-	
+
 	// Write any remaining FODs
 	w.writeBatch()
-	
+
 	// Write the closing bracket for the JSON array
 	if _, err := w.file.WriteString("\n]"); err != nil {
 		log.Printf("Warning: failed to write JSON closing bracket: %v", err)
 	}
-	
+
 	// Close the file
 	err := w.file.Close()
 	w.isOpen = false
-	
+
 	log.Printf("Wrote total of %d FODs to JSON file: %s", w.totalCount, w.outputPath)
 	return err
 }

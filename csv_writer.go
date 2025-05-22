@@ -27,7 +27,7 @@ type CSVWriter struct {
 func NewCSVWriter(outputPath string, revisionID int64) (*CSVWriter, error) {
 	// Create directory if it doesn't exist
 	dir := filepath.Dir(outputPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 
@@ -69,9 +69,9 @@ func NewCSVWriter(outputPath string, revisionID int64) (*CSVWriter, error) {
 func (w *CSVWriter) AddFOD(fod FOD) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	w.fods = append(w.fods, fod)
-	
+
 	// Flush to disk when batch size is reached
 	if len(w.fods) >= w.batchSize {
 		w.writeBatch()
@@ -103,22 +103,22 @@ func (w *CSVWriter) writeBatch() {
 				strconv.FormatInt(w.revisionID, 10),
 			}
 		}
-		
+
 		if err := w.csvWriter.Write(record); err != nil {
 			log.Printf("Warning: failed to write CSV record: %v", err)
 			continue
 		}
 	}
-	
+
 	// Flush to disk
 	w.csvWriter.Flush()
-	
+
 	// Update total count
 	w.totalCount += len(w.fods)
-	
+
 	// Log progress
 	log.Printf("Wrote batch of %d FODs to CSV file (total: %d)", len(w.fods), w.totalCount)
-	
+
 	// Clear the batch
 	w.fods = w.fods[:0]
 }
@@ -132,7 +132,7 @@ func (w *CSVWriter) IncrementDrvCount() {
 func (w *CSVWriter) Flush() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	w.writeBatch()
 }
 
@@ -140,19 +140,19 @@ func (w *CSVWriter) Flush() {
 func (w *CSVWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	if !w.isOpen {
 		return nil
 	}
-	
+
 	// Write any remaining FODs
 	w.writeBatch()
-	
+
 	// Close the writer and file
 	w.csvWriter.Flush()
 	err := w.file.Close()
 	w.isOpen = false
-	
+
 	log.Printf("Wrote total of %d FODs to CSV file: %s", w.totalCount, w.outputPath)
 	return err
 }

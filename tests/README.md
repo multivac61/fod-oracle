@@ -38,7 +38,21 @@ go test -tags=integration ./tests/...
 2. **Utility Tests**: Tests for utility functions like `getCPUCores`
 3. **Metadata Tests**: Tests for evaluation metadata storage
 4. **Nix-related Tests**: Tests for Nix-specific functions (require git to be installed)
-5. **NixOS VM Tests**: Complete system tests that run in NixOS VMs
+5. **Output Format Tests**: Tests for the different output formats (CSV, JSON, Parquet)
+6. **NixOS VM Tests**: Complete system tests that run in NixOS VMs
+
+### Output Format Tests
+
+The `test_all_formats.sh` script tests all three output formats (CSV, JSON, and Parquet) to ensure they work correctly. This is especially useful to verify that the Parquet writer is properly configured.
+
+To run the test:
+
+```bash
+cd /path/to/fod-oracle
+./tests/test_all_formats.sh
+```
+
+The test creates temporary files in each format and verifies that they are created correctly with the expected content.
 
 ## NixOS VM Testing
 

@@ -3,7 +3,7 @@ pkgs.buildGoModule {
   pname = "fod-oracle";
   version = "0.0";
   src = flake;
-  vendorHash = "sha256-LELvkZBeqcqoRjF7kjy+8lLBjghHTXo53N6VrDpH/XE=";
+  vendorHash = "sha256-RsONSrgfiOUKgIoiQf9yXff1pYH2TFecr3zaotUuImw=";
 
   # Add proper Go test execution
   doCheck = true;

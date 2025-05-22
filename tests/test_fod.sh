@@ -14,7 +14,7 @@ echo "Test directory: $TEST_DIR"
 
 # Test first with the test_fod.go script
 echo "Testing if $FOD_DRV_PATH is a FOD with test_fod.go..."
-go run "$(dirname "$0")/test_fod.go" "$FOD_DRV_PATH"
+go run -tags=integration "$(dirname "$0")/test_fod_main.go" "$FOD_DRV_PATH"
 
 # Test with each output format of the main program
 echo -e "\nTesting with SQLite output:"
@@ -34,22 +34,22 @@ CSV_PATH="$TEST_DIR/test.csv"
 FOD_ORACLE_TEST_DRV_PATH="$FOD_DRV_PATH" go run "$(dirname "$0")/../main.go" -format=csv -output="$CSV_PATH" test-revision
 
 echo "CSV output contents:"
-cat "$CSV_PATH" | head -n 5
+head -n 5 "$CSV_PATH"
 
 echo -e "\nTesting with Parquet (JSON) output:"
 PARQUET_PATH="$TEST_DIR/test.parquet"
 FOD_ORACLE_TEST_DRV_PATH="$FOD_DRV_PATH" go run "$(dirname "$0")/../main.go" -format=parquet -output="$PARQUET_PATH" test-revision
 
 echo "Parquet (JSON) output preview:"
-cat "$PARQUET_PATH" | head -n 20
+head -n 20 "$PARQUET_PATH"
 
 # Test with a direct Nix expression
 echo -e "\nTesting with a Nix expression using -expr flag:"
-NIX_EXPR="let pkgs = import <nixpkgs> {}; in pkgs.fetchurl { url = \"https://example.com/test.txt\"; sha256 = \"0iwz771g1d6sh75v76k2rqgbwkxgmqvq6q5k78qpyzw8k3g7drsc\"; }"
+NIX_EXPR='let pkgs = import <nixpkgs> {}; in pkgs.fetchurl { url = "https://example.com/test.txt"; sha256 = "0iwz771g1d6sh75v76k2rqgbwkxgmqvq6q5k78qpyzw8k3g7drsc"; }'
 go run "$(dirname "$0")/../main.go" -format=csv -output="$TEST_DIR/expr-test.csv" -expr "$NIX_EXPR"
 
 echo "Nix expression test CSV output:"
-cat "$TEST_DIR/expr-test.csv" | head -n 5
+head -n 5 "$TEST_DIR/expr-test.csv"
 
 # Cleanup
 echo -e "\nCleaning up..."

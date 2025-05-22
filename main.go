@@ -155,7 +155,7 @@ func init() {
 			config.WorkerCount = w
 		}
 	}
-	
+
 	// Check for output format in environment
 	if outputFormat := os.Getenv("FOD_ORACLE_OUTPUT_FORMAT"); outputFormat != "" {
 		// Validate output format
@@ -166,7 +166,7 @@ func init() {
 			log.Printf("Warning: Invalid output format '%s', using 'sqlite'", outputFormat)
 		}
 	}
-	
+
 	// Check for output path in environment
 	if outputPath := os.Getenv("FOD_ORACLE_OUTPUT_PATH"); outputPath != "" {
 		config.OutputPath = outputPath
@@ -596,9 +596,9 @@ func (b *DBBatcher) Close() error {
 
 // ProcessingContext holds the context for processing derivations
 type ProcessingContext struct {
-	batcher        Writer       // Interface for adding FODs
+	batcher        Writer // Interface for adding FODs
 	visited        *sync.Map
-	processedPaths *sync.Map    // Cache for already processed derivation paths
+	processedPaths *sync.Map // Cache for already processed derivation paths
 	wg             *sync.WaitGroup
 	semaphore      chan struct{} // Limit concurrency
 }
@@ -610,7 +610,7 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 	if _, alreadyProcessed := ctx.processedPaths.Load(inputFile); alreadyProcessed {
 		return
 	}
-	
+
 	// Mark this path as processed before we begin
 	ctx.processedPaths.Store(inputFile, true)
 
@@ -717,7 +717,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 		for range ticker.C {
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
-			
+
 			allocMB := int(m.Alloc / 1024 / 1024)
 			memoryMutex.Lock()
 			if allocMB > peakMemoryMB {
@@ -771,14 +771,14 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	log.Printf("[%s] Running nix-eval-jobs with %d workers", rev, workers)
 	if err := streamNixEvalJobs(rev, worktreeDir, workers, drvPathChan, fileStats, &usedFallback); err != nil {
 		close(drvPathChan)
-		
+
 		// Store metadata even on error
 		memoryMutex.Lock()
 		currentPeakMemory := peakMemoryMB
 		memoryMutex.Unlock()
 		storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir,
 			time.Since(revStartTime), usedFallback, currentPeakMemory)
-			
+
 		return fmt.Errorf("failed to run nix-eval-jobs: %w", err)
 	}
 	close(drvPathChan)
@@ -794,7 +794,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	// Flush and get stats
 	writer.Flush()
 	revElapsed := time.Since(revStartTime)
-	
+
 	// Only get count from database if using SQLite
 	if config.OutputFormat == "sqlite" {
 		var fodCount int
@@ -808,7 +808,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	memoryMutex.Lock()
 	finalPeakMemory := peakMemoryMB
 	memoryMutex.Unlock()
-	
+
 	storeEvaluationMetadata(db, revisionID, fileStats, worktreeDir,
 		revElapsed, usedFallback, finalPeakMemory)
 
@@ -870,13 +870,13 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 			"--option", "system-features", "nixos-test benchmark big-parallel kvm",
 			"--option", "allow-unsupported-system", "true", // Allow evaluating all platforms
 		}
-		
+
 		// Check for additional options in environment
 		if extraOpts := os.Getenv("FOD_ORACLE_EVAL_OPTS"); extraOpts != "" {
 			extraArgs := strings.Fields(extraOpts)
 			args = append(args, extraArgs...)
 		}
-		
+
 		cmd := exec.Command("nix-eval-jobs", args...)
 
 		// Capture stdout and stderr
@@ -1024,7 +1024,6 @@ in drvPaths
 	fallbackCmd := exec.Command("nix-instantiate", "--eval", "--json", fallbackPath)
 	fallbackCmd.Dir = nixpkgsDir
 	fallbackOutput, err := fallbackCmd.Output()
-	
 	// Handle fallback failure
 	if err != nil {
 		fallbackStats.errorMessage = fmt.Sprintf("Fallback failed: %v", err)
@@ -1364,11 +1363,11 @@ func main() {
 		nixExpr     = flag.Bool("expr", false, "Process a Nix expression instead of a revision")
 		helpFlag    = flag.Bool("help", false, "Show help")
 	)
-	
+
 	// Use custom flag parsing to separate flags from positional arguments
 	// This ensures flags like -format and their values don't get treated as revisions
 	flag.Parse()
-	
+
 	if *helpFlag {
 		fmt.Printf("FOD Oracle - A tool for finding Fixed-Output Derivations in Nix packages\n\n")
 		fmt.Printf("Usage: %s [options] <nixpkgs-revision> [<nixpkgs-revision2> ...]\n\n", os.Args[0])
@@ -1383,7 +1382,7 @@ func main() {
 		fmt.Printf("  FOD_ORACLE_EVAL_OPTS     Additional options for nix-eval-jobs\n")
 		return
 	}
-	
+
 	// Apply command-line options to config
 	if *formatFlag != "" {
 		// Validate output format
@@ -1394,26 +1393,26 @@ func main() {
 			log.Fatalf("Invalid output format: %s. Valid formats are: sqlite, json, csv, parquet", *formatFlag)
 		}
 	}
-	
+
 	if *outputFlag != "" {
 		config.OutputPath = *outputFlag
 	}
-	
+
 	// For non-SQLite formats, output path is required
 	if config.OutputFormat != "sqlite" && config.OutputPath == "" {
 		log.Fatalf("Output path (-output) is required when using format: %s", config.OutputFormat)
 	}
-	
+
 	if *workersFlag > 0 {
 		workers = *workersFlag
 		config.WorkerCount = *workersFlag
 	}
-	
+
 	if *nixExpr {
 		config.IsNixExpr = true
 	}
-	
-	log.Printf("Using %d worker threads on %s (%s), %s", 
+
+	log.Printf("Using %d worker threads on %s (%s), %s",
 		workers, systemInfo.CPU, systemInfo.Cores, systemInfo.OS)
 	log.Printf("Output format: %s", config.OutputFormat)
 	if config.OutputPath != "" {
@@ -1428,7 +1427,7 @@ func main() {
 
 	// Get revisions from command line
 	revisions := flag.Args()
-	
+
 	// Validate that the provided arguments appear to be Git commit hashes
 	// and not misinterpreted flags
 	validRevisions := []string{}
@@ -1440,13 +1439,13 @@ func main() {
 		}
 		validRevisions = append(validRevisions, rev)
 	}
-	
+
 	if len(validRevisions) < 1 && !*testMode && !*nixExpr {
 		log.Fatalf("Usage: %s [options] <nixpkgs-revision> [<nixpkgs-revision2> ...]\nUse --help for more information", os.Args[0])
 	}
-	
+
 	log.Printf("Processing %d nixpkgs revisions", len(validRevisions))
-	
+
 	// Replace revisions with validRevisions
 	revisions = validRevisions
 
@@ -1468,7 +1467,7 @@ func main() {
 			log.Printf("Failed to get or create revision %s: %v", rev, err)
 			continue
 		}
-		
+
 		// Special handling for test mode
 		if isTestMode {
 			log.Printf("Running in test mode with derivation path: %s", testDrvPath)
@@ -1502,21 +1501,21 @@ func main() {
 // processTestDerivation processes a single derivation for testing purposes
 func processTestDerivation(drvPath string, revisionID int64, db *sql.DB) error {
 	log.Printf("Processing test derivation: %s", drvPath)
-	
+
 	// Mark this as a test/Nix expression
 	config.IsNixExpr = true
-	
+
 	// Initialize the writer
 	writer, err := GetWriter(db, revisionID, "test")
 	if err != nil {
 		return fmt.Errorf("failed to create writer: %w", err)
 	}
 	defer writer.Close()
-	
+
 	// Set up a context for processing
 	visited := &sync.Map{}
 	var wg sync.WaitGroup
-	
+
 	ctx := &ProcessingContext{
 		batcher:        writer,
 		visited:        visited,
@@ -1524,7 +1523,7 @@ func processTestDerivation(drvPath string, revisionID int64, db *sql.DB) error {
 		wg:             &wg,
 		semaphore:      make(chan struct{}, 5),
 	}
-	
+
 	// Manually read the derivation for debugging
 	file, err := os.Open(drvPath)
 	if err != nil {
@@ -1542,16 +1541,16 @@ func processTestDerivation(drvPath string, revisionID int64, db *sql.DB) error {
 	// Debug output - print the outputs and their properties
 	log.Printf("Derivation has %d outputs", len(drv.Outputs))
 	for name, out := range drv.Outputs {
-		log.Printf("Output %s: Path=%s, HashAlgo=%s, Hash=%s", 
+		log.Printf("Output %s: Path=%s, HashAlgo=%s, Hash=%s",
 			name, out.Path, out.HashAlgorithm, out.Hash)
 	}
-	
+
 	// Process the derivation
 	processDerivation(drvPath, ctx)
-	
+
 	// Flush the writer
 	writer.Flush()
-	
+
 	// Count the FODs if using SQLite
 	if config.OutputFormat == "sqlite" {
 		var fodCount int
@@ -1562,6 +1561,6 @@ func processTestDerivation(drvPath string, revisionID int64, db *sql.DB) error {
 	} else {
 		log.Printf("Processed test derivation successfully")
 	}
-	
+
 	return nil
 }

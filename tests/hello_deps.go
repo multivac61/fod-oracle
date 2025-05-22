@@ -1,4 +1,4 @@
-package main
+package tests
 
 import (
 	"database/sql"
@@ -21,7 +21,7 @@ type FOD struct {
 	Hash          string
 }
 
-func main() {
+func RunHelloDeps() {
 	// Get hello derivation path
 	helloDrvCmd := exec.Command("nix-instantiate", "<nixpkgs>", "-A", "hello")
 	helloDrvOutput, err := helloDrvCmd.Output()

@@ -9,6 +9,7 @@ import (
 
 	"github.com/xitongsys/parquet-go-source/local"
 	"github.com/xitongsys/parquet-go/parquet"
+	"github.com/xitongsys/parquet-go/source"
 	"github.com/xitongsys/parquet-go/writer"
 )
 
@@ -24,22 +25,22 @@ type ParquetFOD struct {
 
 // ParquetWriter handles writing FODs to a Parquet file with batching support
 type ParquetWriter struct {
-	outputPath  string
-	fods        []ParquetFOD
-	revisionID  int64
-	batchSize   int
-	fileWriter  *local.LocalFileWriter
+	outputPath    string
+	fods          []ParquetFOD
+	revisionID    int64
+	batchSize     int
+	fileWriter    source.ParquetFile
 	parquetWriter *writer.ParquetWriter
-	mu          sync.Mutex
-	totalCount  int
-	isOpen      bool
+	mu            sync.Mutex
+	totalCount    int
+	isOpen        bool
 }
 
 // NewParquetWriter creates a new Parquet writer
 func NewParquetWriter(outputPath string, revisionID int64) (*ParquetWriter, error) {
 	// Create directory if it doesn't exist
 	dir := filepath.Dir(outputPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 
@@ -58,17 +59,17 @@ func NewParquetWriter(outputPath string, revisionID int64) (*ParquetWriter, erro
 
 	// Set compression and other options
 	pw.CompressionType = parquet.CompressionCodec_SNAPPY
-	pw.PageSize = 32 * 1024           // 32K page size for better compression
+	pw.PageSize = 32 * 1024            // 32K page size for better compression
 	pw.RowGroupSize = 16 * 1024 * 1024 // 16MB row groups (smaller is better for this data size)
 
 	return &ParquetWriter{
-		outputPath:     outputPath,
-		fods:           make([]ParquetFOD, 0, 8000),
-		revisionID:     revisionID,
-		batchSize:      8000, // Flush to disk every 8,000 FODs
-		fileWriter:     fw,
-		parquetWriter:  pw,
-		isOpen:         true,
+		outputPath:    outputPath,
+		fods:          make([]ParquetFOD, 0, 8000),
+		revisionID:    revisionID,
+		batchSize:     8000, // Flush to disk every 8,000 FODs
+		fileWriter:    fw,
+		parquetWriter: pw,
+		isOpen:        true,
 	}, nil
 }
 
@@ -76,33 +77,33 @@ func NewParquetWriter(outputPath string, revisionID int64) (*ParquetWriter, erro
 func (w *ParquetWriter) AddFOD(fod FOD) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	if !w.isOpen {
 		log.Printf("Warning: Attempted to add FOD to closed Parquet writer")
 		return
 	}
-	
+
 	// Ensure we have valid strings for all fields (Parquet can be picky)
 	drvPath := fod.DrvPath
 	if drvPath == "" {
 		drvPath = "unknown"
 	}
-	
+
 	outputPath := fod.OutputPath
 	if outputPath == "" {
 		outputPath = "unknown"
 	}
-	
+
 	hashAlgo := fod.HashAlgorithm
 	if hashAlgo == "" {
 		hashAlgo = "unknown"
 	}
-	
+
 	hash := fod.Hash
 	if hash == "" {
 		hash = "unknown"
 	}
-	
+
 	// Convert to ParquetFOD format
 	parquetFod := ParquetFOD{
 		DrvPath:       drvPath,
@@ -110,14 +111,14 @@ func (w *ParquetWriter) AddFOD(fod FOD) {
 		HashAlgorithm: hashAlgo,
 		Hash:          hash,
 	}
-	
+
 	// Only add revision ID if not in Nix expression mode
 	if !config.IsNixExpr {
 		parquetFod.RevisionID = w.revisionID
 	}
-	
+
 	w.fods = append(w.fods, parquetFod)
-	
+
 	// Flush to disk when batch size is reached
 	if len(w.fods) >= w.batchSize {
 		w.writeBatch()
@@ -140,10 +141,10 @@ func (w *ParquetWriter) writeBatch() {
 
 	// Update total count
 	w.totalCount += len(w.fods)
-	
+
 	// Log progress
 	log.Printf("Wrote batch of %d FODs to Parquet file (total: %d)", len(w.fods), w.totalCount)
-	
+
 	// Clear the batch
 	w.fods = w.fods[:0]
 }
@@ -157,7 +158,7 @@ func (w *ParquetWriter) IncrementDrvCount() {
 func (w *ParquetWriter) Flush() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	w.writeBatch()
 }
 
@@ -165,26 +166,26 @@ func (w *ParquetWriter) Flush() {
 func (w *ParquetWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	if !w.isOpen {
 		return nil
 	}
-	
+
 	// Write any remaining FODs
 	w.writeBatch()
-	
+
 	// Close the Parquet writer properly
 	if err := w.parquetWriter.WriteStop(); err != nil {
 		log.Printf("Warning: failed to finalize Parquet file: %v", err)
 	}
-	
+
 	// Close the file writer
 	if err := w.fileWriter.Close(); err != nil {
 		log.Printf("Warning: failed to close Parquet file: %v", err)
 	}
-	
+
 	w.isOpen = false
-	
+
 	log.Printf("Wrote total of %d FODs to Parquet file: %s", w.totalCount, w.outputPath)
 	return nil
 }

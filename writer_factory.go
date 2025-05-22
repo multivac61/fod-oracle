@@ -24,7 +24,7 @@ func GetWriter(db *sql.DB, revisionID int64, rev string) (Writer, error) {
 			return nil, fmt.Errorf("failed to create database batcher: %w", err)
 		}
 		return batcher, nil
-		
+
 	case "json":
 		// Determine output path for JSON
 		outputPath := config.OutputPath
@@ -32,7 +32,7 @@ func GetWriter(db *sql.DB, revisionID int64, rev string) (Writer, error) {
 			outputPath = fmt.Sprintf("output/%s/fods.json", rev)
 		}
 		return NewJSONWriter(outputPath, revisionID)
-		
+
 	case "csv":
 		// Determine output path for CSV
 		outputPath := config.OutputPath
@@ -40,7 +40,7 @@ func GetWriter(db *sql.DB, revisionID int64, rev string) (Writer, error) {
 			outputPath = fmt.Sprintf("output/%s/fods.csv", rev)
 		}
 		return NewCSVWriter(outputPath, revisionID)
-		
+
 	case "parquet":
 		// Determine output path for Parquet
 		outputPath := config.OutputPath
@@ -52,7 +52,7 @@ func GetWriter(db *sql.DB, revisionID int64, rev string) (Writer, error) {
 			outputPath += ".parquet"
 		}
 		return NewParquetWriter(outputPath, revisionID)
-		
+
 	default:
 		// Default to SQLite
 		batcher, err := NewDBBatcher(db, 1000, revisionID)

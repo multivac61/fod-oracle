@@ -75,3 +75,9 @@ _testmain.go
 
 nixpkgs-*
 bin/
+
+# output file extensions
+*.parquet
+*.csv
+*.db
+*.json
