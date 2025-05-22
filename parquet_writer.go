@@ -22,12 +22,17 @@ type ParquetFOD struct {
 	RevisionID    int64  `parquet:"name=revision_id, type=INT64, repetitiontype=OPTIONAL"`
 }
 
-// ParquetWriter handles writing FODs to a Parquet file
+// ParquetWriter handles writing FODs to a Parquet file with batching support
 type ParquetWriter struct {
-	outputPath string
-	fods       []ParquetFOD
-	revisionID int64
-	mu         sync.Mutex
+	outputPath  string
+	fods        []ParquetFOD
+	revisionID  int64
+	batchSize   int
+	fileWriter  *local.LocalFileWriter
+	parquetWriter *writer.ParquetWriter
+	mu          sync.Mutex
+	totalCount  int
+	isOpen      bool
 }
 
 // NewParquetWriter creates a new Parquet writer
@@ -38,10 +43,32 @@ func NewParquetWriter(outputPath string, revisionID int64) (*ParquetWriter, erro
 		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 
+	// Create Parquet file using the local file source
+	fw, err := local.NewLocalFileWriter(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Parquet file: %w", err)
+	}
+
+	// Define Parquet writer with proper schema
+	pw, err := writer.NewParquetWriter(fw, new(ParquetFOD), 4)
+	if err != nil {
+		fw.Close()
+		return nil, fmt.Errorf("failed to create Parquet writer: %w", err)
+	}
+
+	// Set compression and other options
+	pw.CompressionType = parquet.CompressionCodec_SNAPPY
+	pw.PageSize = 32 * 1024           // 32K page size for better compression
+	pw.RowGroupSize = 16 * 1024 * 1024 // 16MB row groups (smaller is better for this data size)
+
 	return &ParquetWriter{
-		outputPath: outputPath,
-		fods:       make([]ParquetFOD, 0),
-		revisionID: revisionID,
+		outputPath:     outputPath,
+		fods:           make([]ParquetFOD, 0, 8000),
+		revisionID:     revisionID,
+		batchSize:      8000, // Flush to disk every 8,000 FODs
+		fileWriter:     fw,
+		parquetWriter:  pw,
+		isOpen:         true,
 	}, nil
 }
 
@@ -49,6 +76,11 @@ func NewParquetWriter(outputPath string, revisionID int64) (*ParquetWriter, erro
 func (w *ParquetWriter) AddFOD(fod FOD) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	
+	if !w.isOpen {
+		log.Printf("Warning: Attempted to add FOD to closed Parquet writer")
+		return
+	}
 	
 	// Ensure we have valid strings for all fields (Parquet can be picky)
 	drvPath := fod.DrvPath
@@ -86,9 +118,34 @@ func (w *ParquetWriter) AddFOD(fod FOD) {
 	
 	w.fods = append(w.fods, parquetFod)
 	
-	if len(w.fods)%1000 == 0 {
-		log.Printf("Collected %d FODs for Parquet file", len(w.fods))
+	// Flush to disk when batch size is reached
+	if len(w.fods) >= w.batchSize {
+		w.writeBatch()
 	}
+}
+
+// writeBatch writes the current batch to disk and clears the memory buffer
+func (w *ParquetWriter) writeBatch() {
+	if !w.isOpen || len(w.fods) == 0 {
+		return
+	}
+
+	// Write each FOD to the Parquet file
+	for _, fod := range w.fods {
+		if err := w.parquetWriter.Write(fod); err != nil {
+			log.Printf("Warning: failed to write FOD to Parquet: %v", err)
+			continue
+		}
+	}
+
+	// Update total count
+	w.totalCount += len(w.fods)
+	
+	// Log progress
+	log.Printf("Wrote batch of %d FODs to Parquet file (total: %d)", len(w.fods), w.totalCount)
+	
+	// Clear the batch
+	w.fods = w.fods[:0]
 }
 
 // IncrementDrvCount is a no-op for Parquet but implemented for compatibility
@@ -96,51 +153,38 @@ func (w *ParquetWriter) IncrementDrvCount() {
 	// No-op for Parquet writer
 }
 
-// Flush is a no-op for Parquet but implemented for compatibility
+// Flush writes any pending FODs to disk
 func (w *ParquetWriter) Flush() {
-	// Will write on Close
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	
+	w.writeBatch()
 }
 
-// Close writes the collected FODs to a Parquet file
+// Close writes any remaining FODs and closes the file
 func (w *ParquetWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	
-	if len(w.fods) == 0 {
-		log.Printf("No FODs to write to Parquet file")
+	if !w.isOpen {
 		return nil
 	}
 	
-	// Create Parquet file using the local file source
-	fw, err := local.NewLocalFileWriter(w.outputPath)
-	if err != nil {
-		return fmt.Errorf("failed to create Parquet file: %w", err)
-	}
-	defer fw.Close()
+	// Write any remaining FODs
+	w.writeBatch()
 	
-	// Define Parquet writer with proper schema
-	pw, err := writer.NewParquetWriter(fw, new(ParquetFOD), 4)
-	if err != nil {
-		return fmt.Errorf("failed to create Parquet writer: %w", err)
+	// Close the Parquet writer properly
+	if err := w.parquetWriter.WriteStop(); err != nil {
+		log.Printf("Warning: failed to finalize Parquet file: %v", err)
 	}
 	
-	// Set compression and other options
-	pw.CompressionType = parquet.CompressionCodec_SNAPPY
-	pw.PageSize = 32 * 1024          // 32K page size for better compression
-	pw.RowGroupSize = 16 * 1024 * 1024 // 16MB row groups (smaller is better for this data size)
-	
-	// Write data
-	for i, fod := range w.fods {
-		if err := pw.Write(fod); err != nil {
-			return fmt.Errorf("failed to write FOD #%d to Parquet: %w", i, err)
-		}
+	// Close the file writer
+	if err := w.fileWriter.Close(); err != nil {
+		log.Printf("Warning: failed to close Parquet file: %v", err)
 	}
 	
-	// Close writer
-	if err := pw.WriteStop(); err != nil {
-		return fmt.Errorf("failed to finalize Parquet file: %w", err)
-	}
+	w.isOpen = false
 	
-	log.Printf("Wrote %d FODs to Parquet file: %s", len(w.fods), w.outputPath)
+	log.Printf("Wrote total of %d FODs to Parquet file: %s", w.totalCount, w.outputPath)
 	return nil
 }

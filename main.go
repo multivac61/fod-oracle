@@ -1365,6 +1365,8 @@ func main() {
 		helpFlag    = flag.Bool("help", false, "Show help")
 	)
 	
+	// Use custom flag parsing to separate flags from positional arguments
+	// This ensures flags like -format and their values don't get treated as revisions
 	flag.Parse()
 	
 	if *helpFlag {
@@ -1384,11 +1386,22 @@ func main() {
 	
 	// Apply command-line options to config
 	if *formatFlag != "" {
-		config.OutputFormat = *formatFlag
+		// Validate output format
+		switch *formatFlag {
+		case "sqlite", "json", "csv", "parquet":
+			config.OutputFormat = *formatFlag
+		default:
+			log.Fatalf("Invalid output format: %s. Valid formats are: sqlite, json, csv, parquet", *formatFlag)
+		}
 	}
 	
 	if *outputFlag != "" {
 		config.OutputPath = *outputFlag
+	}
+	
+	// For non-SQLite formats, output path is required
+	if config.OutputFormat != "sqlite" && config.OutputPath == "" {
+		log.Fatalf("Output path (-output) is required when using format: %s", config.OutputFormat)
 	}
 	
 	if *workersFlag > 0 {
@@ -1415,11 +1428,27 @@ func main() {
 
 	// Get revisions from command line
 	revisions := flag.Args()
-	if len(revisions) < 1 && !*testMode {
+	
+	// Validate that the provided arguments appear to be Git commit hashes
+	// and not misinterpreted flags
+	validRevisions := []string{}
+	for _, rev := range revisions {
+		// Skip arguments that look like flags (-flag) or are too short to be git hashes
+		if strings.HasPrefix(rev, "-") || len(rev) < 7 {
+			log.Printf("Warning: Skipping invalid revision: %s (appears to be a flag or invalid hash)", rev)
+			continue
+		}
+		validRevisions = append(validRevisions, rev)
+	}
+	
+	if len(validRevisions) < 1 && !*testMode && !*nixExpr {
 		log.Fatalf("Usage: %s [options] <nixpkgs-revision> [<nixpkgs-revision2> ...]\nUse --help for more information", os.Args[0])
 	}
 	
-	log.Printf("Processing %d nixpkgs revisions", len(revisions))
+	log.Printf("Processing %d nixpkgs revisions", len(validRevisions))
+	
+	// Replace revisions with validRevisions
+	revisions = validRevisions
 
 	startTime := time.Now()
 
