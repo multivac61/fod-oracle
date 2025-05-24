@@ -212,6 +212,7 @@ var createTables = `
         FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_drv_path ON drv_revisions(drv_path);
+    CREATE INDEX IF NOT EXISTS idx_drv_rev_revision_id ON drv_revisions(revision_id);
     
     -- Table for storing expression file evaluation metadata
     CREATE TABLE IF NOT EXISTS evaluation_metadata (
@@ -272,18 +273,22 @@ var createTables = `
     CREATE INDEX IF NOT EXISTS idx_queue_drv_path ON rebuild_queue(drv_path);
     CREATE INDEX IF NOT EXISTS idx_queue_revision_id ON rebuild_queue(revision_id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_drv_rev ON rebuild_queue(drv_path, revision_id);
+    
+    -- Add indexing for better joining performance in reports and file conversions
+    CREATE INDEX IF NOT EXISTS idx_rebuild_queue_drv_path_revision_id ON rebuild_queue(drv_path, revision_id);
 `
 
-// initInMemoryDB initializes an in-memory SQLite database
+// initInMemoryDB initializes an in-memory SQLite database with temp file storage
 func initInMemoryDB() *sql.DB {
-	log.Printf("Initializing in-memory SQLite database")
+	log.Printf("Initializing in-memory SQLite database with temp file storage")
 
 	// Connection string for in-memory database with shared cache
-	connString := "file::memory:?cache=shared" +
+	// But using FILE for temp_store to prevent OOM with large datasets
+	connString := "file:?mode=memory&cache=shared" +
 		"&_journal_mode=MEMORY" +
 		"&_synchronous=OFF" +
 		"&_cache_size=100000" +
-		"&_temp_store=MEMORY" +
+		"&_temp_store=FILE" + // Use FILE instead of MEMORY for temp storage
 		"&_busy_timeout=10000" + // 10 second timeout
 		"&_locking_mode=NORMAL"
 
@@ -297,12 +302,12 @@ func initInMemoryDB() *sql.DB {
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxLifetime(time.Minute * 10)
 
-	// Apply optimizations for in-memory database
+	// Apply optimizations for in-memory database with file-based temp storage
 	pragmas := []string{
 		"PRAGMA journal_mode=MEMORY",
 		"PRAGMA synchronous=OFF",
 		"PRAGMA cache_size=100000",
-		"PRAGMA temp_store=MEMORY",
+		"PRAGMA temp_store=FILE", // Ensure temp_store is set to FILE
 		"PRAGMA foreign_keys=ON",
 	}
 
@@ -316,6 +321,34 @@ func initInMemoryDB() *sql.DB {
 	_, err = db.Exec(createTables)
 	if err != nil {
 		log.Fatalf("Failed to create tables in in-memory database: %v", err)
+	}
+
+	// Create a connection-specific copy of rebuild_queue table if it doesn't exist
+	// This ensures the table exists for all concurrent goroutines
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS rebuild_queue (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			drv_path TEXT NOT NULL,
+			revision_id INTEGER NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			queue_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+			started_at DATETIME,
+			finished_at DATETIME,
+			expected_hash TEXT,
+			actual_hash TEXT,
+			log TEXT,
+			attempts INTEGER DEFAULT 0,
+			error_message TEXT,
+			FOREIGN KEY (drv_path) REFERENCES fods(drv_path) ON DELETE CASCADE,
+			FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
+		);
+		CREATE INDEX IF NOT EXISTS idx_queue_status ON rebuild_queue(status);
+		CREATE INDEX IF NOT EXISTS idx_queue_drv_path ON rebuild_queue(drv_path);
+		CREATE INDEX IF NOT EXISTS idx_queue_revision_id ON rebuild_queue(revision_id);
+		CREATE INDEX IF NOT EXISTS idx_queue_drv_rev ON rebuild_queue(drv_path, revision_id);
+	`)
+	if err != nil {
+		log.Printf("Warning: Failed to create rebuild_queue table: %v", err)
 	}
 
 	return db
@@ -340,13 +373,14 @@ func initDB() *sql.DB {
 		log.Fatalf("Failed to create database directory %s: %v", dbDir, err)
 	}
 
-	log.Printf("Using database at: %s", dbPath)
+	log.Printf("Using database at: %s with file-based temp storage", dbPath)
 
 	// Add busy_timeout and other optimizations
+	// Use FILE for temp_store to prevent OOM with large datasets
 	connString := dbPath + "?_journal_mode=WAL" +
 		"&_synchronous=NORMAL" +
 		"&_cache_size=100000" +
-		"&_temp_store=MEMORY" +
+		"&_temp_store=FILE" + // Use FILE instead of MEMORY for temp storage
 		"&_busy_timeout=10000" + // 10 second timeout
 		"&_locking_mode=NORMAL"
 
@@ -364,7 +398,7 @@ func initDB() *sql.DB {
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=NORMAL",
 		"PRAGMA cache_size=100000",
-		"PRAGMA temp_store=MEMORY",
+		"PRAGMA temp_store=FILE", // Ensure temp_store is set to FILE
 		"PRAGMA mmap_size=30000000000",
 		"PRAGMA page_size=32768",
 		"PRAGMA foreign_keys=ON",
@@ -380,6 +414,34 @@ func initDB() *sql.DB {
 	_, err = db.Exec(createTables)
 	if err != nil {
 		log.Fatalf("Failed to create tables: %v", err)
+	}
+
+	// Create a connection-specific copy of rebuild_queue table if it doesn't exist
+	// This ensures the table exists for all concurrent goroutines
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS rebuild_queue (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			drv_path TEXT NOT NULL,
+			revision_id INTEGER NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			queue_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+			started_at DATETIME,
+			finished_at DATETIME,
+			expected_hash TEXT,
+			actual_hash TEXT,
+			log TEXT,
+			attempts INTEGER DEFAULT 0,
+			error_message TEXT,
+			FOREIGN KEY (drv_path) REFERENCES fods(drv_path) ON DELETE CASCADE,
+			FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
+		);
+		CREATE INDEX IF NOT EXISTS idx_queue_status ON rebuild_queue(status);
+		CREATE INDEX IF NOT EXISTS idx_queue_drv_path ON rebuild_queue(drv_path);
+		CREATE INDEX IF NOT EXISTS idx_queue_revision_id ON rebuild_queue(revision_id);
+		CREATE INDEX IF NOT EXISTS idx_queue_drv_rev ON rebuild_queue(drv_path, revision_id);
+	`)
+	if err != nil {
+		log.Printf("Warning: Failed to create rebuild_queue table: %v", err)
 	}
 
 	return db

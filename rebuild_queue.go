@@ -66,43 +66,9 @@ func NewRebuildQueue(db *sql.DB, concurrency int, delaySeconds int) *RebuildQueu
 
 // QueueFODsForRevision adds all FODs for a revision to the rebuild queue
 func (q *RebuildQueue) QueueFODsForRevision(revisionID int64) (int, error) {
-	// First check if the rebuild_queue table exists
-	var tableName string
-	err := q.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='rebuild_queue'`).Scan(&tableName)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			// Table doesn't exist, create it
-			log.Printf("Creating rebuild_queue table...")
-			_, err = q.db.Exec(`
-				CREATE TABLE IF NOT EXISTS rebuild_queue (
-					id INTEGER PRIMARY KEY AUTOINCREMENT,
-					drv_path TEXT NOT NULL,
-					revision_id INTEGER NOT NULL,
-					status TEXT NOT NULL DEFAULT 'pending',
-					queue_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-					started_at DATETIME,
-					finished_at DATETIME,
-					expected_hash TEXT,
-					actual_hash TEXT,
-					log TEXT,
-					attempts INTEGER DEFAULT 0,
-					error_message TEXT,
-					FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
-				);
-				CREATE INDEX IF NOT EXISTS idx_queue_status ON rebuild_queue(status);
-				CREATE INDEX IF NOT EXISTS idx_queue_drv_path ON rebuild_queue(drv_path);
-				CREATE INDEX IF NOT EXISTS idx_queue_revision_id ON rebuild_queue(revision_id);
-			`)
-			if err != nil {
-				return 0, fmt.Errorf("failed to create rebuild_queue table: %w", err)
-			}
-		} else {
-			return 0, fmt.Errorf("failed to check if rebuild_queue table exists: %w", err)
-		}
-	}
-
 	// First count how many FODs we have for this revision
 	var totalCount int
+	var err error
 	if config.IsNixExpr {
 		// For Nix expressions, just count all FODs
 		err = q.db.QueryRow(`SELECT COUNT(*) FROM fods`).Scan(&totalCount)
@@ -228,6 +194,13 @@ func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 	q.running = true
 	q.mutex.Unlock()
 
+	// Make sure the rebuild_queue table exists before we start
+	// This prevents errors when workers start fetching jobs
+	err := q.ensureRebuildQueueTableExists()
+	if err != nil {
+		log.Printf("Error ensuring rebuild_queue table exists: %v", err)
+	}
+
 	// Start worker goroutines
 	for i := 0; i < concurrency; i++ {
 		q.wg.Add(1)
@@ -243,7 +216,55 @@ func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 			}
 		}(i)
 	}
+	
+	// Start the job fetcher goroutine
+	q.startJobFetcher()
+}
 
+// ensureRebuildQueueTableExists creates the rebuild_queue table if it doesn't exist
+func (q *RebuildQueue) ensureRebuildQueueTableExists() error {
+	// Check if the rebuild_queue table exists
+	var tableName string
+	err := q.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='rebuild_queue'`).Scan(&tableName)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// Table doesn't exist, create it
+			log.Printf("Creating rebuild_queue table...")
+			_, err = q.db.Exec(`
+				CREATE TABLE IF NOT EXISTS rebuild_queue (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					drv_path TEXT NOT NULL,
+					revision_id INTEGER NOT NULL,
+					status TEXT NOT NULL DEFAULT 'pending',
+					queue_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+					started_at DATETIME,
+					finished_at DATETIME,
+					expected_hash TEXT,
+					actual_hash TEXT,
+					log TEXT,
+					attempts INTEGER DEFAULT 0,
+					error_message TEXT,
+					FOREIGN KEY (drv_path) REFERENCES fods(drv_path) ON DELETE CASCADE,
+					FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
+				);
+				CREATE INDEX IF NOT EXISTS idx_queue_status ON rebuild_queue(status);
+				CREATE INDEX IF NOT EXISTS idx_queue_drv_path ON rebuild_queue(drv_path);
+				CREATE INDEX IF NOT EXISTS idx_queue_revision_id ON rebuild_queue(revision_id);
+				CREATE INDEX IF NOT EXISTS idx_queue_drv_rev ON rebuild_queue(drv_path, revision_id);
+				CREATE INDEX IF NOT EXISTS idx_rebuild_queue_drv_path_revision_id ON rebuild_queue(drv_path, revision_id);
+			`)
+			if err != nil {
+				return fmt.Errorf("failed to create rebuild_queue table: %w", err)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to check if rebuild_queue table exists: %w", err)
+	}
+	return nil
+}
+
+// Start starts the job fetcher goroutine
+func (q *RebuildQueue) startJobFetcher() {
 	// Start job fetcher
 	go func() {
 		defer func() {
@@ -339,9 +360,25 @@ func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 
 // countPendingJobs returns the number of pending jobs
 func (q *RebuildQueue) countPendingJobs() (int, error) {
+	// First check if the table exists
+	var tableCount int
+	err := q.db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='rebuild_queue'").Scan(&tableCount)
+	if err != nil || tableCount == 0 {
+		// Table doesn't exist or there was an error checking
+		return 0, nil // Return 0 as if no pending jobs
+	}
+
+	// Count pending jobs
 	var count int
-	err := q.db.QueryRow(`SELECT COUNT(*) FROM rebuild_queue WHERE status = ?`, StatusPending).Scan(&count)
-	return count, err
+	err = q.db.QueryRow(`SELECT COUNT(*) FROM rebuild_queue WHERE status = ?`, StatusPending).Scan(&count)
+	if err != nil {
+		if strings.Contains(err.Error(), "no such table") {
+			// Table doesn't exist anymore
+			return 0, nil
+		}
+		return 0, fmt.Errorf("failed to count pending jobs: %w", err)
+	}
+	return count, nil
 }
 
 // IsRunning returns whether the queue is still running
@@ -381,9 +418,16 @@ func (q *RebuildQueue) Wait() {
 
 // fetchNextJob gets the next job from the queue
 func (q *RebuildQueue) fetchNextJob() (*RebuildJob, error) {
+	// First check if the table exists
+	var tableCount int
+	err := q.db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='rebuild_queue'").Scan(&tableCount)
+	if err != nil || tableCount == 0 {
+		// Table doesn't exist or there was an error checking
+		return nil, sql.ErrNoRows // Return as if no rows found
+	}
+
 	// Add retries for database transactions to handle contention
 	var job *RebuildJob
-	var err error
 
 	for attempt := 0; attempt < 5; attempt++ {
 		if attempt > 0 {
@@ -396,8 +440,14 @@ func (q *RebuildQueue) fetchNextJob() (*RebuildJob, error) {
 		}
 
 		job, err = q.attemptFetchNextJob()
+		
 		if err == nil || err == sql.ErrNoRows {
 			return job, nil
+		}
+
+		// Handle case where table doesn't exist anymore
+		if strings.Contains(err.Error(), "no such table") {
+			return nil, sql.ErrNoRows
 		}
 
 		// Only retry on database locks or busy errors
@@ -571,6 +621,22 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 			}
 		}
 
+		// First check if the table exists
+		var tableCount int
+		err := q.db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='rebuild_queue'").Scan(&tableCount)
+		if err != nil || tableCount == 0 {
+			// Table doesn't exist or there was an error checking - don't try to update
+			// This can happen during in-memory database conversion to file formats
+			// Just log it once and continue with the rest of the process
+			if attempt == 0 {
+				// Only log on the first attempt to reduce noise
+				log.Printf("Cannot update job #%d: rebuild_queue table no longer exists, continuing with job results", job.ID)
+			}
+			dbErr = nil
+			break
+		}
+
+		// Table exists, proceed with update
 		tx, err := q.db.Begin()
 		if err != nil {
 			log.Printf("Error beginning transaction for job #%d: %v", job.ID, err)
@@ -593,7 +659,16 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 		if err != nil {
 			tx.Rollback()
 			if strings.Contains(err.Error(), "database is locked") ||
-				strings.Contains(err.Error(), "database is busy") {
+				strings.Contains(err.Error(), "database is busy") ||
+				strings.Contains(err.Error(), "no such table") {
+				if strings.Contains(err.Error(), "no such table") {
+					// Table has been dropped (may happen during database conversion)
+					if attempt == 0 {
+						log.Printf("rebuild_queue table no longer exists for job #%d, continuing with job results", job.ID)
+					}
+					dbErr = nil
+					break
+				}
 				log.Printf("Database locked, retrying update for job #%d (attempt %d/5)", job.ID, attempt+1)
 				dbErr = err
 				continue
@@ -794,32 +869,8 @@ func isHexString(s string) bool {
 // ForceQueueAllFODs adds all FODs for a revision to the rebuild queue, even if they were already queued before
 // This is particularly useful for non-SQLite output formats with in-memory databases
 func (q *RebuildQueue) ForceQueueAllFODs(revisionID int64) (int, error) {
-	// First ensure the rebuild_queue table exists
-	_, err := q.db.Exec(`
-		CREATE TABLE IF NOT EXISTS rebuild_queue (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			drv_path TEXT NOT NULL,
-			revision_id INTEGER NOT NULL,
-			status TEXT NOT NULL DEFAULT 'pending',
-			queue_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-			started_at DATETIME,
-			finished_at DATETIME,
-			expected_hash TEXT,
-			actual_hash TEXT,
-			log TEXT,
-			attempts INTEGER DEFAULT 0,
-			error_message TEXT,
-			FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
-		);
-		CREATE INDEX IF NOT EXISTS idx_queue_status ON rebuild_queue(status);
-		CREATE INDEX IF NOT EXISTS idx_queue_drv_path ON rebuild_queue(drv_path);
-		CREATE INDEX IF NOT EXISTS idx_queue_revision_id ON rebuild_queue(revision_id);
-	`)
-	if err != nil {
-		return 0, fmt.Errorf("failed to create rebuild_queue table: %w", err)
-	}
-
 	// Clear any existing queue entries for this revision
+	var err error
 	_, err = q.db.Exec(`DELETE FROM rebuild_queue WHERE revision_id = ?`, revisionID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to clear existing queue entries: %w", err)
