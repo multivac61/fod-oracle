@@ -487,68 +487,6 @@ func (b *DBBatcher) IncrementDrvCount() {
 	}
 }
 
-func (b *DBBatcher) commitBatch() {
-	// Already locked by caller
-	if len(b.fodBatch) == 0 {
-		return
-	}
-
-	// Copy the batches to local variables
-	fodBatch := make([]FOD, len(b.fodBatch))
-	copy(fodBatch, b.fodBatch)
-	relationBatch := make([]DrvRevision, len(b.relationBatch))
-	copy(relationBatch, b.relationBatch)
-
-	// Clear the batches
-	b.fodBatch = b.fodBatch[:0]
-	b.relationBatch = b.relationBatch[:0]
-
-	// Release the lock before database operations
-	b.mu.Unlock()
-	defer b.mu.Lock()
-
-	tx, err := b.db.Begin()
-	if err != nil {
-		log.Printf("Failed to begin transaction: %v", err)
-		return
-	}
-
-	success := false
-	defer func() {
-		if !success {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil {
-				log.Printf("Failed to rollback transaction: %v", rollbackErr)
-			}
-		}
-	}()
-
-	fodStmt := tx.Stmt(b.fodStmt)
-	relStmt := tx.Stmt(b.relStmt)
-
-	for _, fod := range fodBatch {
-		_, err = fodStmt.Exec(
-			fod.DrvPath, fod.OutputPath, fod.HashAlgorithm, fod.Hash,
-			fod.OutputPath, fod.HashAlgorithm, fod.Hash,
-		)
-		if err != nil {
-			log.Printf("Failed to insert FOD %s: %v", fod.DrvPath, err)
-		}
-	}
-
-	for _, rel := range relationBatch {
-		_, err = relStmt.Exec(rel.DrvPath, rel.RevisionID)
-		if err != nil {
-			log.Printf("Failed to insert relation for %s: %v", rel.DrvPath, err)
-		}
-	}
-
-	if err = tx.Commit(); err != nil {
-		log.Printf("Failed to commit transaction: %v", err)
-		return
-	}
-	success = true
-}
-
 // Modify Flush to use the writer goroutine
 func (b *DBBatcher) Flush() {
 	b.mu.Lock()
