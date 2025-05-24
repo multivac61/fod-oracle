@@ -5,11 +5,10 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
-	
-	"github.com/multivac61/fod-oracle/pkg/fod"
 )
 
 // RebuildJob represents a job to rebuild a FOD
@@ -40,14 +39,15 @@ const (
 
 // RebuildQueue manages the queue of FODs to rebuild
 type RebuildQueue struct {
-	db        *sql.DB
-	buildChan chan RebuildJob
-	delay     time.Duration
-	lastEnd   time.Time
-	wg        *sync.WaitGroup
-	stopped   bool
-	running   bool
-	mutex     sync.Mutex
+	db                   *sql.DB
+	buildChan            chan RebuildJob
+	delay                time.Duration
+	lastEnd              time.Time
+	wg                   *sync.WaitGroup
+	stopped              bool
+	running              bool
+	mutex                sync.Mutex
+	hasShownRebuildMessage bool // Track if we've shown the rebuild message
 }
 
 // NewRebuildQueue creates a new rebuild queue
@@ -101,15 +101,27 @@ func (q *RebuildQueue) QueueFODsForRevision(revisionID int64) (int, error) {
 
 	// First count how many FODs we have for this revision
 	var totalCount int
-	err = q.db.QueryRow(`
-		SELECT COUNT(*) FROM drv_revisions 
-		WHERE revision_id = ?
-	`, revisionID).Scan(&totalCount)
+	if config.IsNixExpr {
+		// For Nix expressions, just count all FODs
+		err = q.db.QueryRow(`SELECT COUNT(*) FROM fods`).Scan(&totalCount)
+		log.Printf("DEBUG: Using IsNixExpr path, found %d FODs", totalCount)
+	} else {
+		// For regular revisions, count FODs associated with this revision
+		err = q.db.QueryRow(`
+			SELECT COUNT(*) FROM drv_revisions 
+			WHERE revision_id = ?
+		`, revisionID).Scan(&totalCount)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("failed to count total FODs: %w", err)
 	}
 
 	if totalCount == 0 {
+		if config.IsNixExpr {
+			log.Printf("No FODs found for expression")
+		} else {
+			log.Printf("No FODs found for revision ID %d", revisionID)
+		}
 		return 0, nil
 	}
 
@@ -169,15 +181,28 @@ func (q *RebuildQueue) QueueFODsForRevision(revisionID int64) (int, error) {
 		return 0, nil
 	}
 
-	// Insert all FODs for this revision into the queue that aren't already there
-	result, err := q.db.Exec(`
-		INSERT INTO rebuild_queue (drv_path, revision_id, expected_hash, status)
-		SELECT dr.drv_path, dr.revision_id, f.hash, ?
-		FROM drv_revisions dr
-		JOIN fods f ON dr.drv_path = f.drv_path
-		WHERE dr.revision_id = ?
-		AND dr.drv_path NOT IN (SELECT drv_path FROM rebuild_queue WHERE revision_id = ?)
-	`, StatusPending, revisionID, revisionID)
+	// Insert all FODs for this revision into the queue
+	var result sql.Result
+	if config.IsNixExpr {
+		// For Nix expressions, queue all FODs
+		log.Printf("Queuing all FODs for expression (total: %d)", totalCount)
+		result, err = q.db.Exec(`
+			INSERT INTO rebuild_queue (drv_path, revision_id, expected_hash, status)
+			SELECT f.drv_path, ?, f.hash, ?
+			FROM fods f
+			WHERE f.drv_path NOT IN (SELECT drv_path FROM rebuild_queue WHERE revision_id = ?)
+		`, revisionID, StatusPending, revisionID)
+	} else {
+		// For regular revisions, only queue FODs associated with this revision
+		result, err = q.db.Exec(`
+			INSERT INTO rebuild_queue (drv_path, revision_id, expected_hash, status)
+			SELECT dr.drv_path, dr.revision_id, f.hash, ?
+			FROM drv_revisions dr
+			JOIN fods f ON dr.drv_path = f.drv_path
+			WHERE dr.revision_id = ?
+			AND dr.drv_path NOT IN (SELECT drv_path FROM rebuild_queue WHERE revision_id = ?)
+		`, StatusPending, revisionID, revisionID)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("failed to queue FODs: %w", err)
 	}
@@ -193,7 +218,7 @@ func (q *RebuildQueue) QueueFODsForRevision(revisionID int64) (int, error) {
 }
 
 // Start starts the rebuild queue runner
-func (q *RebuildQueue) Start(concurrency int) {
+func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 	q.mutex.Lock()
 	if q.stopped {
 		q.stopped = false
@@ -208,7 +233,11 @@ func (q *RebuildQueue) Start(concurrency int) {
 			defer q.wg.Done()
 			log.Printf("Starting rebuild worker %d", workerID)
 			for job := range q.buildChan {
-				q.processJob(job)
+				status, actualHash, errorMsg := q.processJob(job)
+				
+				// Pass rebuild data to the writer
+				log.Printf("DEBUG: Adding rebuild info to writer: %s, status: %s, hash: %s", job.DrvPath, status, actualHash)
+				writer.AddRebuildInfo(job.DrvPath, status, actualHash, errorMsg)
 			}
 		}(i)
 	}
@@ -462,7 +491,8 @@ func (q *RebuildQueue) markBuildComplete() {
 }
 
 // processJob handles a single rebuild job
-func (q *RebuildQueue) processJob(job RebuildJob) {
+// Returns status, actualHash, and errorMessage for use by writers
+func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 	log.Printf("Processing job #%d: %s", job.ID, job.DrvPath)
 
 	// Run the rebuild-fod command
@@ -583,6 +613,8 @@ func (q *RebuildQueue) processJob(job RebuildJob) {
 	}
 
 	log.Printf("Job #%d completed with status: %s", job.ID, status)
+	
+	return status, actualHash, errorMessage
 }
 
 // rebuildFOD runs the rebuild-fod implementation for a derivation
@@ -591,33 +623,56 @@ func (q *RebuildQueue) rebuildFOD(drvPath string) (string, error) {
 	log.Printf("Rebuilding FOD: %s", drvPath)
 
 	// Set a timeout to prevent hanging - shorter timeout for testing
-	timeout := 5 * time.Minute
+	timeoutSeconds := 300 // 5 minutes
 	if q.delay <= 0 {
-		timeout = 30 * time.Second // Shorter timeout for testing
+		timeoutSeconds = 30 // 30 seconds in testing mode
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
 
-	// Use our Go implementation directly
-	rebuildResult, err := fod.RebuildFOD(ctx, drvPath)
-	if err != nil {
-		return "", fmt.Errorf("rebuild failed: %w", err)
+	// Check if we're in a non-SQLite format with first FOD - print helpful message
+	if config.OutputFormat != "sqlite" && !q.hasShownRebuildMessage {
+		q.hasShownRebuildMessage = true
+		log.Printf("INFO: Using rebuild-fod script for %s output format", 
+			config.OutputFormat)
 	}
+
+	// Use the shell script
+	scriptPath := "./nix/packages/rebuild-fod/rebuild_fod.sh"
+	cmd := exec.CommandContext(ctx, scriptPath, drvPath, fmt.Sprintf("%d", timeoutSeconds))
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
 
 	totalDuration := time.Since(startTime)
 	if totalDuration > 1*time.Second {
 		log.Printf("Rebuild took %v to complete", totalDuration)
 	}
 
-	if rebuildResult.Status != "success" {
-		if rebuildResult.HashMismatch {
-			return rebuildResult.Log, fmt.Errorf("hash mismatch: expected %s, got %s", 
-				rebuildResult.ExpectedHash, rebuildResult.ActualHash)
+	if err != nil {
+		// Check if it's a timeout
+		if ctx.Err() == context.DeadlineExceeded {
+			return outputStr, fmt.Errorf("build timed out after %d seconds", timeoutSeconds)
 		}
-		return rebuildResult.Log, fmt.Errorf("rebuild failed with status: %s", rebuildResult.Status)
+		return outputStr, fmt.Errorf("rebuild failed: %w", err)
 	}
 
-	return rebuildResult.Log, nil
+	// Parse the status from the output
+	status := "success"
+	if strings.Contains(outputStr, "STATUS=timeout") {
+		status = "timeout"
+	} else if strings.Contains(outputStr, "STATUS=failure") {
+		status = "failure"
+	} else if strings.Contains(outputStr, "Hash mismatch") || 
+	         strings.Contains(outputStr, "STATUS=hash_mismatch") {
+		status = "hash_mismatch"
+	}
+
+	// If status is not success, return an error
+	if status != "success" {
+		return outputStr, fmt.Errorf("rebuild failed with status: %s", status)
+	}
+
+	return outputStr, nil
 }
 
 // extractHashFromOutput tries to extract the actual hash from the rebuild output
@@ -711,6 +766,74 @@ func isHexString(s string) bool {
 		}
 	}
 	return true
+}
+
+// ForceQueueAllFODs adds all FODs for a revision to the rebuild queue, even if they were already queued before
+// This is particularly useful for non-SQLite output formats with in-memory databases
+func (q *RebuildQueue) ForceQueueAllFODs(revisionID int64) (int, error) {
+	// First ensure the rebuild_queue table exists
+	_, err := q.db.Exec(`
+		CREATE TABLE IF NOT EXISTS rebuild_queue (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			drv_path TEXT NOT NULL,
+			revision_id INTEGER NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			queue_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+			started_at DATETIME,
+			finished_at DATETIME,
+			expected_hash TEXT,
+			actual_hash TEXT,
+			log TEXT,
+			attempts INTEGER DEFAULT 0,
+			error_message TEXT,
+			FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
+		);
+		CREATE INDEX IF NOT EXISTS idx_queue_status ON rebuild_queue(status);
+		CREATE INDEX IF NOT EXISTS idx_queue_drv_path ON rebuild_queue(drv_path);
+		CREATE INDEX IF NOT EXISTS idx_queue_revision_id ON rebuild_queue(revision_id);
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create rebuild_queue table: %w", err)
+	}
+	
+	// Clear any existing queue entries for this revision
+	_, err = q.db.Exec(`DELETE FROM rebuild_queue WHERE revision_id = ?`, revisionID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to clear existing queue entries: %w", err)
+	}
+	
+	// Add all FODs to the queue
+	var result sql.Result
+	if config.IsNixExpr {
+		// For Nix expressions, force queue all FODs
+		log.Printf("Force queuing all FODs for expression")
+		result, err = q.db.Exec(`
+			INSERT INTO rebuild_queue (drv_path, revision_id, expected_hash, status)
+			SELECT f.drv_path, ?, f.hash, ?
+			FROM fods f
+		`, revisionID, StatusPending)
+	} else {
+		// For regular revisions, force queue FODs associated with this revision
+		result, err = q.db.Exec(`
+			INSERT INTO rebuild_queue (drv_path, revision_id, expected_hash, status)
+			SELECT dr.drv_path, dr.revision_id, f.hash, ?
+			FROM drv_revisions dr
+			JOIN fods f ON dr.drv_path = f.drv_path
+			WHERE dr.revision_id = ?
+		`, StatusPending, revisionID)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("failed to force queue FODs: %w", err)
+	}
+	
+	// Get the number of rows inserted
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	
+	log.Printf("Force queued %d FODs for rebuild for revision ID %d", rowsAffected, revisionID)
+	return int(rowsAffected), nil
 }
 
 // GetQueueStats returns statistics about the rebuild queue

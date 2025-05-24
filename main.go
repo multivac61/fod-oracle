@@ -185,61 +185,8 @@ func init() {
 	}
 }
 
-// initDB initializes the SQLite database
-func initDB() *sql.DB {
-	dbPath := os.Getenv("FOD_ORACLE_DB_PATH")
-	if dbPath == "" {
-		// Default to the db directory in the current working directory
-		currentDir, err := os.Getwd()
-		if err != nil {
-			log.Fatalf("Failed to get current directory: %v", err)
-		}
-		dbPath = filepath.Join(currentDir, "db", "fods.db")
-	}
-
-	// Create the database directory if it doesn't exist
-	dbDir := filepath.Dir(dbPath)
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
-		log.Fatalf("Failed to create database directory %s: %v", dbDir, err)
-	}
-
-	log.Printf("Using database at: %s", dbPath)
-
-	// Add busy_timeout and other optimizations
-	connString := dbPath + "?_journal_mode=WAL" +
-		"&_synchronous=NORMAL" +
-		"&_cache_size=100000" +
-		"&_temp_store=MEMORY" +
-		"&_busy_timeout=10000" + // 10 second timeout
-		"&_locking_mode=NORMAL"
-
-	db, err := sql.Open("sqlite3", connString)
-	if err != nil {
-		log.Fatalf("Failed to open database: %v", err)
-	}
-
-	// Reduce connection pool size
-	db.SetMaxOpenConns(8) // Significantly reduced
-	db.SetMaxIdleConns(4)
-	db.SetConnMaxLifetime(time.Minute * 10)
-
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA cache_size=100000",
-		"PRAGMA temp_store=MEMORY",
-		"PRAGMA mmap_size=30000000000",
-		"PRAGMA page_size=32768",
-		"PRAGMA foreign_keys=ON",
-	}
-
-	for _, pragma := range pragmas {
-		if _, err := db.Exec(pragma); err != nil {
-			log.Printf("Warning: Failed to set pragma %s: %v", pragma, err)
-		}
-	}
-
-	createTables := `
+// SQL schema for creating tables
+var createTables = `
     CREATE TABLE IF NOT EXISTS revisions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         rev TEXT NOT NULL UNIQUE,
@@ -325,7 +272,111 @@ func initDB() *sql.DB {
     CREATE INDEX IF NOT EXISTS idx_queue_drv_path ON rebuild_queue(drv_path);
     CREATE INDEX IF NOT EXISTS idx_queue_revision_id ON rebuild_queue(revision_id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_drv_rev ON rebuild_queue(drv_path, revision_id);
-    `
+`
+
+// initInMemoryDB initializes an in-memory SQLite database
+func initInMemoryDB() *sql.DB {
+	log.Printf("Initializing in-memory SQLite database")
+	
+	// Connection string for in-memory database with shared cache
+	connString := "file::memory:?cache=shared" +
+		"&_journal_mode=MEMORY" +
+		"&_synchronous=OFF" +
+		"&_cache_size=100000" +
+		"&_temp_store=MEMORY" +
+		"&_busy_timeout=10000" + // 10 second timeout
+		"&_locking_mode=NORMAL"
+	
+	db, err := sql.Open("sqlite3", connString)
+	if err != nil {
+		log.Fatalf("Failed to open in-memory database: %v", err)
+	}
+	
+	// Set connection pool limits
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(time.Minute * 10)
+	
+	// Apply optimizations for in-memory database
+	pragmas := []string{
+		"PRAGMA journal_mode=MEMORY",
+		"PRAGMA synchronous=OFF",
+		"PRAGMA cache_size=100000",
+		"PRAGMA temp_store=MEMORY",
+		"PRAGMA foreign_keys=ON",
+	}
+	
+	for _, pragma := range pragmas {
+		if _, err := db.Exec(pragma); err != nil {
+			log.Printf("Warning: Failed to set pragma %s: %v", pragma, err)
+		}
+	}
+	
+	// Create the tables
+	_, err = db.Exec(createTables)
+	if err != nil {
+		log.Fatalf("Failed to create tables in in-memory database: %v", err)
+	}
+	
+	return db
+}
+
+// initDB initializes the SQLite database
+func initDB() *sql.DB {
+	// For SQLite output format, use the normal file-based database
+	dbPath := os.Getenv("FOD_ORACLE_DB_PATH")
+	if dbPath == "" {
+		// Default to the db directory in the current working directory
+		currentDir, err := os.Getwd()
+		if err != nil {
+			log.Fatalf("Failed to get current directory: %v", err)
+		}
+		dbPath = filepath.Join(currentDir, "db", "fods.db")
+	}
+
+	// Create the database directory if it doesn't exist
+	dbDir := filepath.Dir(dbPath)
+	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		log.Fatalf("Failed to create database directory %s: %v", dbDir, err)
+	}
+
+	log.Printf("Using database at: %s", dbPath)
+
+	// Add busy_timeout and other optimizations
+	connString := dbPath + "?_journal_mode=WAL" +
+		"&_synchronous=NORMAL" +
+		"&_cache_size=100000" +
+		"&_temp_store=MEMORY" +
+		"&_busy_timeout=10000" + // 10 second timeout
+		"&_locking_mode=NORMAL"
+
+	db, err := sql.Open("sqlite3", connString)
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+
+	// Reduce connection pool size
+	db.SetMaxOpenConns(8) // Significantly reduced
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(time.Minute * 10)
+
+	pragmas := []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=NORMAL",
+		"PRAGMA cache_size=100000",
+		"PRAGMA temp_store=MEMORY",
+		"PRAGMA mmap_size=30000000000",
+		"PRAGMA page_size=32768",
+		"PRAGMA foreign_keys=ON",
+	}
+
+	for _, pragma := range pragmas {
+		if _, err := db.Exec(pragma); err != nil {
+			log.Printf("Warning: Failed to set pragma %s: %v", pragma, err)
+		}
+	}
+
+	// Using the createTables variable defined at package level
 	_, err = db.Exec(createTables)
 	if err != nil {
 		log.Fatalf("Failed to create tables: %v", err)
@@ -516,6 +567,13 @@ func (b *DBBatcher) AddFOD(fod FOD) {
 	}
 }
 
+// AddRebuildInfo adds rebuild information for a FOD
+// For DBBatcher, this is a no-op as the data is already in the SQLite database
+func (b *DBBatcher) AddRebuildInfo(drvPath string, status, actualHash, errorMessage string) {
+	// No-op for DBBatcher since the rebuild data is already in the database
+	// The data will be retrieved directly from the rebuild_queue table as needed
+}
+
 func (b *DBBatcher) IncrementDrvCount() {
 	b.mu.Lock()
 	b.stats.drvs++
@@ -666,7 +724,7 @@ func getOrCreateRevision(db *sql.DB, rev string) (int64, error) {
 	return id, nil
 }
 
-func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
+func findFODsForRevision(rev string, revisionID int64, db *sql.DB, writer Writer) error {
 	revStartTime := time.Now()
 	log.Printf("[%s] Starting to find FODs...", rev)
 
@@ -677,12 +735,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB) error {
 	}
 	defer os.RemoveAll(worktreeDir)
 
-	// Initialize the writer based on output format
-	writer, err := GetWriter(db, revisionID, rev)
-	if err != nil {
-		return fmt.Errorf("failed to create writer: %w", err)
-	}
-	defer writer.Close()
+	// Use the writer passed from main
 
 	// Setup for concurrency and memory tracking
 	visited := &sync.Map{}
@@ -1350,6 +1403,10 @@ func main() {
 	// Use custom flag parsing to separate flags from positional arguments
 	// This ensures flags like -format and their values don't get treated as revisions
 	flag.Parse()
+	
+	// Debug: Print all flag values
+	log.Printf("DEBUG: Flag values - format: %s, output: %s, reevaluate: %v", 
+		*formatFlag, *outputFlag, *reevaluateFlag)
 
 	if *helpFlag {
 		fmt.Printf("FOD Oracle - A tool for finding Fixed-Output Derivations in Nix packages\n\n")
@@ -1369,18 +1426,75 @@ func main() {
 	}
 
 	// Apply command-line options to config
-	if *formatFlag != "" {
+	// Check if -format was explicitly passed, either with = or as a separate argument
+	formatExplicitlySet := false
+	for i, arg := range os.Args {
+		if arg == "-format" && i+1 < len(os.Args) {
+			formatExplicitlySet = true
+			// The format value is in the next argument
+			format := os.Args[i+1]
+			switch format {
+			case "sqlite", "json", "csv", "parquet":
+				config.OutputFormat = format
+				log.Printf("DEBUG: Set output format to %s from explicit -format arg", format)
+			default:
+				log.Fatalf("Invalid output format: %s. Valid formats are: sqlite, json, csv, parquet", format)
+			}
+			break
+		} else if strings.HasPrefix(arg, "-format=") || strings.HasPrefix(arg, "--format=") {
+			formatExplicitlySet = true
+			// Extract the format value after the equals sign
+			parts := strings.SplitN(arg, "=", 2)
+			if len(parts) == 2 {
+				format := parts[1]
+				switch format {
+				case "sqlite", "json", "csv", "parquet":
+					config.OutputFormat = format
+					log.Printf("DEBUG: Set output format to %s from -format= arg", format)
+				default:
+					log.Fatalf("Invalid output format: %s. Valid formats are: sqlite, json, csv, parquet", format)
+				}
+			}
+			break
+		}
+	}
+	
+	// Only use the flag.Parse() value if we didn't find an explicit format in the args
+	if !formatExplicitlySet && *formatFlag != "" {
 		// Validate output format
 		switch *formatFlag {
 		case "sqlite", "json", "csv", "parquet":
 			config.OutputFormat = *formatFlag
+			log.Printf("DEBUG: Set output format to %s from flag.Parse()", config.OutputFormat)
 		default:
 			log.Fatalf("Invalid output format: %s. Valid formats are: sqlite, json, csv, parquet", *formatFlag)
 		}
 	}
 
-	if *outputFlag != "" {
+	// Check if -output was explicitly passed, similar to format
+	outputExplicitlySet := false
+	for i, arg := range os.Args {
+		if arg == "-output" && i+1 < len(os.Args) {
+			outputExplicitlySet = true
+			config.OutputPath = os.Args[i+1]
+			log.Printf("DEBUG: Set output path to %s from explicit -output arg", config.OutputPath)
+			break
+		} else if strings.HasPrefix(arg, "-output=") || strings.HasPrefix(arg, "--output=") {
+			outputExplicitlySet = true
+			// Extract the output value after the equals sign
+			parts := strings.SplitN(arg, "=", 2)
+			if len(parts) == 2 {
+				config.OutputPath = parts[1]
+				log.Printf("DEBUG: Set output path to %s from -output= arg", config.OutputPath)
+			}
+			break
+		}
+	}
+	
+	// Only use the flag.Parse() value if we didn't find an explicit output in the args
+	if !outputExplicitlySet && *outputFlag != "" {
 		config.OutputPath = *outputFlag
+		log.Printf("DEBUG: Set output path to %s from flag.Parse()", config.OutputPath)
 	}
 
 	// For non-SQLite formats, output path is required
@@ -1397,9 +1511,19 @@ func main() {
 		config.IsNixExpr = true
 	}
 
-	if *reevaluateFlag {
-		config.Reevaluate = true
+	// Check if reevaluate is explicitly set or if it appears in the command line args
+	config.Reevaluate = *reevaluateFlag
+	
+	// Always check the raw args because flag parsing doesn't handle --flag style well
+	for _, arg := range os.Args {
+		if arg == "-reevaluate" || arg == "--reevaluate" {
+			config.Reevaluate = true
+			log.Printf("DEBUG: Set reevaluate=true from explicit command line arg")
+			break
+		}
 	}
+	
+	log.Printf("DEBUG: Reevaluate flag state: %v", config.Reevaluate)
 
 	// Apply the build delay from the flag, overriding environment and default values
 	if *buildDelayFlag != config.BuildDelay {
@@ -1426,7 +1550,14 @@ func main() {
 	// Clean up any leftover worktrees
 	cleanupWorktrees()
 
-	db := initDB()
+	// For non-SQLite output formats, always use an in-memory database
+	var db *sql.DB
+	if config.OutputFormat != "sqlite" {
+		log.Printf("Using %s output format: Using in-memory database", config.OutputFormat)
+		db = initInMemoryDB()
+	} else {
+		db = initDB()
+	}
 	defer db.Close()
 
 	// Get revisions from command line
@@ -1498,36 +1629,60 @@ func main() {
 
 	// Process revisions sequentially
 	for _, rev := range revisions {
+		
 		revisionID, err := getOrCreateRevision(db, rev)
 		if err != nil {
 			log.Printf("Failed to get or create revision %s: %v", rev, err)
 			continue
 		}
 
-		// Special handling for test mode
+		// Create the writer (always a DBBatcher now)
+		writer, err := GetWriter(db, revisionID, rev)
+		if err != nil {
+			log.Printf("Error creating writer: %v", err)
+			continue
+		}
+		
+		// Handle different processing modes
 		if isTestMode {
 			log.Printf("Running in test mode with derivation path: %s", testDrvPath)
-			if err := processTestDerivation(testDrvPath, revisionID, db); err != nil {
+			if err := processTestDerivation(testDrvPath, revisionID, db, writer); err != nil {
 				log.Printf("Error processing test derivation: %v", err)
 			}
 		} else if *nixExpr {
 			// Process as Nix expression rather than as a Git revision
 			// Set IsNixExpr before processing to ensure reevaluation works correctly
 			config.IsNixExpr = true
-			if err := processNixExpression(rev, revisionID, db); err != nil {
+			if err := processNixExpression(rev, revisionID, db, writer); err != nil {
 				log.Printf("Error processing Nix expression: %v", err)
 			}
 		} else {
 			// Normal mode - process as a Git revision
-			if err := findFODsForRevision(rev, revisionID, db); err != nil {
+			if err := findFODsForRevision(rev, revisionID, db, writer); err != nil {
 				log.Printf("Error finding FODs for revision %s: %v", rev, err)
 			}
 		}
 
 		// Handle reevaluation if requested
 		if config.Reevaluate {
-			if err := reevaluateFODs(db, revisionID, rev); err != nil {
+			if err := reevaluateFODs(db, revisionID, rev, writer); err != nil {
 				log.Printf("Error reevaluating FODs for revision %s: %v", rev, err)
+			}
+		}
+		
+		// Close the writer
+		writer.Close()
+		
+		// If using a non-SQLite output format, convert the database to the desired format
+		if config.OutputFormat != "sqlite" {
+			outputPath := config.OutputPath
+			if outputPath == "" {
+				// Use default output path if not specified
+				outputPath = fmt.Sprintf("output/%s/fods.%s", rev, config.OutputFormat)
+			}
+			
+			if err := ConvertToFormat(db, config.OutputFormat, outputPath, revisionID); err != nil {
+				log.Printf("Error converting to %s format: %v", config.OutputFormat, err)
 			}
 		}
 	}
@@ -1544,18 +1699,13 @@ func main() {
 }
 
 // processTestDerivation processes a single derivation for testing purposes
-func processTestDerivation(drvPath string, revisionID int64, db *sql.DB) error {
+func processTestDerivation(drvPath string, revisionID int64, db *sql.DB, writer Writer) error {
 	log.Printf("Processing test derivation: %s", drvPath)
 
 	// Mark this as a test/Nix expression
 	config.IsNixExpr = true
 
-	// Initialize the writer
-	writer, err := GetWriter(db, revisionID, "test")
-	if err != nil {
-		return fmt.Errorf("failed to create writer: %w", err)
-	}
-	defer writer.Close()
+	// Use the writer passed from main
 
 	// Set up a context for processing
 	visited := &sync.Map{}
@@ -1611,7 +1761,7 @@ func processTestDerivation(drvPath string, revisionID int64, db *sql.DB) error {
 }
 
 // reevaluateFODs handles the reevaluation of FODs for a given revision or expression
-func reevaluateFODs(db *sql.DB, revisionID int64, rev string) error {
+func reevaluateFODs(db *sql.DB, revisionID int64, rev string, writer Writer) error {
 	identifier := rev
 	if config.IsNixExpr {
 		identifier = "expr"
@@ -1622,10 +1772,31 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string) error {
 	// Create the rebuild queue with the configured parallel workers and build delay
 	queue := NewRebuildQueue(db, config.ParallelWorkers, config.BuildDelay)
 
-	// Queue FODs for this revision
-	count, err := queue.QueueFODsForRevision(revisionID)
-	if err != nil {
-		return fmt.Errorf("failed to queue FODs: %w", err)
+	// Queue FODs for reevaluation
+	count, queueErr := queue.QueueFODsForRevision(revisionID)
+	if queueErr != nil {
+		return fmt.Errorf("failed to queue FODs: %w", queueErr)
+	}
+	
+	// If no FODs were queued but we know there should be some, try force queuing
+	if count == 0 {
+		var fodCount int
+		if config.IsNixExpr {
+			queueErr = db.QueryRow("SELECT COUNT(*) FROM fods").Scan(&fodCount)
+		} else {
+			queueErr = db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount)
+		}
+		
+		if queueErr != nil {
+			log.Printf("Error counting FODs: %v", queueErr)
+		} else if fodCount > 0 {
+			// Force queue FODs if there are some in the database
+			log.Printf("[%s] Found %d FODs in database but none in queue. Force queuing them...", identifier, fodCount)
+			count, queueErr = queue.ForceQueueAllFODs(revisionID)
+			if queueErr != nil {
+				return fmt.Errorf("failed to force queue FODs: %w", queueErr)
+			}
+		}
 	}
 
 	if count == 0 {
@@ -1647,8 +1818,8 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string) error {
 			identifier, count, delayMessage)
 	}
 
-	// Start the queue runner with the configured concurrency
-	queue.Start(config.ParallelWorkers)
+	// Start the queue runner with the configured concurrency and pass the writer
+	queue.Start(config.ParallelWorkers, writer)
 
 	// Setup for progress reporting
 	var maxWaitTime time.Duration = 10 * time.Minute

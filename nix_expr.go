@@ -68,7 +68,7 @@ func evalNixExpression(expr string) (string, error) {
 }
 
 // processNixExpression processes a Nix expression directly
-func processNixExpression(expr string, revisionID int64, db *sql.DB) error {
+func processNixExpression(expr string, revisionID int64, db *sql.DB, writer Writer) error {
 	log.Printf("Processing Nix expression: %s", expr)
 
 	// Mark this as a Nix expression
@@ -82,12 +82,7 @@ func processNixExpression(expr string, revisionID int64, db *sql.DB) error {
 
 	log.Printf("Expression evaluated to derivation: %s", drvPath)
 
-	// Initialize the writer
-	writer, err := GetWriter(db, revisionID, "expr")
-	if err != nil {
-		return fmt.Errorf("failed to create writer: %w", err)
-	}
-	defer writer.Close()
+	// Use the writer passed from main
 
 	// Set up a context for processing
 	visited := &sync.Map{}
