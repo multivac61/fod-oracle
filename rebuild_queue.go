@@ -1,14 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"log"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/multivac61/fod-oracle/pkg/fod"
 )
 
 // RebuildJob represents a job to rebuild a FOD
@@ -496,7 +498,7 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 	log.Printf("Processing job #%d: %s", job.ID, job.DrvPath)
 
 	// Run the rebuild-fod command
-	result, err := q.rebuildFOD(job.DrvPath)
+	outputLog, err := q.rebuildFOD(job.DrvPath)
 	q.markBuildComplete()
 
 	// Get the current time for finished_at
@@ -512,47 +514,49 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 
 	if err != nil {
 		// Handle timeout
-		if strings.Contains(err.Error(), "signal: killed") || strings.Contains(err.Error(), "context deadline exceeded") {
+		if strings.Contains(err.Error(), "signal: killed") || 
+		   strings.Contains(err.Error(), "context deadline exceeded") ||
+		   strings.Contains(err.Error(), "timeout") {
 			status = StatusTimeout
 			errorMessage = "Build timed out"
 		} else {
 			status = StatusFailure
 			errorMessage = err.Error()
+		}
+	}
 
-			// If command not found error for rebuild-fod, add more details
-			if strings.Contains(err.Error(), "executable file not found") {
-				errorMessage = "rebuild-fod command not found. Try installing it with 'nix build .#rebuild-fod'"
+	// Extract information from the output log
+	for _, line := range strings.Split(outputLog, "\n") {
+		// Extract status if present
+		if strings.HasPrefix(line, "STATUS=") {
+			outStatus := strings.TrimPrefix(line, "STATUS=")
+			if outStatus == "timeout" {
+				status = StatusTimeout
+			} else if outStatus == "failure" {
+				status = StatusFailure
+			} else if outStatus == "hash_mismatch" {
+				status = StatusHashMismatch
 			}
 		}
-	} else {
-		// Check if the output contains a failure or hash mismatch message
-		if strings.Contains(result, "Hash mismatch detected") {
-			status = StatusHashMismatch
-			errorMessage = "Hash mismatch detected during build"
+		
+		// Extract actual hash if present
+		if strings.HasPrefix(line, "ACTUAL_HASH=") {
+			actualHash = strings.TrimPrefix(line, "ACTUAL_HASH=")
 		}
-
-		// Extract the actual hash from the result
-		actualHash = extractHashFromOutput(result, job.ExpectedHash)
-
-		// Check if the hash matches the expected hash
-		if actualHash != "" && actualHash != job.ExpectedHash {
-			status = StatusHashMismatch
-			errorMessage = fmt.Sprintf("Hash mismatch: expected %s, got %s", job.ExpectedHash, actualHash)
-		}
-
-		// If we couldn't extract a hash but the command succeeded, that might still be valid
-		// Check if the output contains any hash info first
-		if actualHash == "" {
-			if strings.Contains(result, "hex hash") ||
-				strings.Contains(result, "SHA") ||
-				strings.Contains(result, "SUMMARY OF HEX HASHES") {
-				status = StatusFailure
-				errorMessage = "Could not parse hash from rebuild output, but hash information was present"
-			} else if strings.Contains(result, "No hex hash could be determined") {
-				status = StatusFailure
-				errorMessage = "No hash could be determined through any method"
+		
+		// Extract error message if present
+		if strings.HasPrefix(line, "ERROR_MESSAGE=") {
+			newErrorMsg := strings.TrimPrefix(line, "ERROR_MESSAGE=")
+			if newErrorMsg != "" {
+				errorMessage = newErrorMsg
 			}
 		}
+	}
+	
+	// Check if the hash matches the expected hash
+	if status == StatusSuccess && actualHash != "" && actualHash != job.ExpectedHash {
+		status = StatusHashMismatch
+		errorMessage = fmt.Sprintf("Hash mismatch: expected %s, got %s", job.ExpectedHash, actualHash)
 	}
 
 	// Update the job in the database with retries for database locks
@@ -585,7 +589,7 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 			UPDATE rebuild_queue
 			SET status = ?, finished_at = ?, actual_hash = ?, log = ?, error_message = ?
 			WHERE id = ?
-		`, status, now, actualHash, result, errorMessage, job.ID)
+		`, status, now, actualHash, outputLog, errorMessage, job.ID)
 		if err != nil {
 			tx.Rollback()
 			if strings.Contains(err.Error(), "database is locked") ||
@@ -633,45 +637,64 @@ func (q *RebuildQueue) rebuildFOD(drvPath string) (string, error) {
 	// Check if we're in a non-SQLite format with first FOD - print helpful message
 	if config.OutputFormat != "sqlite" && !q.hasShownRebuildMessage {
 		q.hasShownRebuildMessage = true
-		log.Printf("INFO: Using rebuild-fod script for %s output format", 
-			config.OutputFormat)
+		log.Printf("INFO: Rebuilding FODs for %s output format", config.OutputFormat)
 	}
 
-	// Use the shell script
-	scriptPath := "./nix/packages/rebuild-fod/rebuild_fod.sh"
-	cmd := exec.CommandContext(ctx, scriptPath, drvPath, fmt.Sprintf("%d", timeoutSeconds))
-	output, err := cmd.CombinedOutput()
-	outputStr := string(output)
-
+	// Use the fod package's RebuildFOD function directly
+	// This ensures we're using the same code as the rebuild-fod command
+	result, err := fod.RebuildFOD(ctx, drvPath)
+	
+	// Create an output buffer for compatibility with the old approach
+	var outputBuf bytes.Buffer
+	
+	// Add the result to the output buffer
+	if result != nil {
+		fmt.Fprintf(&outputBuf, "%s\n", result.Log)
+		
+		if result.Status == "success" {
+			fmt.Fprintf(&outputBuf, "STATUS=success\n")
+			fmt.Fprintf(&outputBuf, "ACTUAL_HASH=%s\n", result.ActualHash)
+			fmt.Fprintf(&outputBuf, "ERROR_MESSAGE=\n")
+		} else if result.Status == "timeout" {
+			fmt.Fprintf(&outputBuf, "STATUS=timeout\n")
+			fmt.Fprintf(&outputBuf, "ACTUAL_HASH=\n")
+			fmt.Fprintf(&outputBuf, "ERROR_MESSAGE=%s\n", result.ErrorMessage)
+		} else {
+			fmt.Fprintf(&outputBuf, "STATUS=%s\n", result.Status)
+			fmt.Fprintf(&outputBuf, "ACTUAL_HASH=%s\n", result.ActualHash)
+			fmt.Fprintf(&outputBuf, "ERROR_MESSAGE=%s\n", result.ErrorMessage)
+		}
+	} else if err != nil {
+		// Handle error case when result is nil
+		fmt.Fprintf(&outputBuf, "Rebuild failed: %v\n", err)
+		fmt.Fprintf(&outputBuf, "STATUS=failure\n")
+		fmt.Fprintf(&outputBuf, "ACTUAL_HASH=\n")
+		fmt.Fprintf(&outputBuf, "ERROR_MESSAGE=%v\n", err)
+	}
+	
 	totalDuration := time.Since(startTime)
 	if totalDuration > 1*time.Second {
 		log.Printf("Rebuild took %v to complete", totalDuration)
 	}
-
-	if err != nil {
-		// Check if it's a timeout
-		if ctx.Err() == context.DeadlineExceeded {
-			return outputStr, fmt.Errorf("build timed out after %d seconds", timeoutSeconds)
-		}
-		return outputStr, fmt.Errorf("rebuild failed: %w", err)
+	
+	outputStr := outputBuf.String()
+	
+	// Get status for the return values
+	status := "failure"
+	
+	if result != nil {
+		status = result.Status
 	}
-
-	// Parse the status from the output
-	status := "success"
-	if strings.Contains(outputStr, "STATUS=timeout") {
-		status = "timeout"
-	} else if strings.Contains(outputStr, "STATUS=failure") {
-		status = "failure"
-	} else if strings.Contains(outputStr, "Hash mismatch") || 
-	         strings.Contains(outputStr, "STATUS=hash_mismatch") {
-		status = "hash_mismatch"
-	}
-
+	
 	// If status is not success, return an error
 	if status != "success" {
-		return outputStr, fmt.Errorf("rebuild failed with status: %s", status)
+		errorMsg := "rebuild failed"
+		if result != nil && result.ErrorMessage != "" {
+			errorMsg = result.ErrorMessage
+		}
+		return outputStr, fmt.Errorf("rebuild failed with status %s: %s", status, errorMsg)
 	}
-
+	
 	return outputStr, nil
 }
 
