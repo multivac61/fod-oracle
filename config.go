@@ -13,13 +13,13 @@ type Config struct {
 
 	// WorkerCount specifies how many worker threads to use
 	WorkerCount int
-	
+
 	// Reevaluate indicates if we should reevaluate FODs by rebuilding them
 	Reevaluate bool
-	
+
 	// BuildDelay specifies the delay between builds in seconds
 	BuildDelay int
-	
+
 	// ParallelWorkers is the number of parallel rebuild workers
 	ParallelWorkers int
 }

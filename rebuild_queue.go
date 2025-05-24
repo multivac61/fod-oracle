@@ -41,14 +41,14 @@ const (
 
 // RebuildQueue manages the queue of FODs to rebuild
 type RebuildQueue struct {
-	db                   *sql.DB
-	buildChan            chan RebuildJob
-	delay                time.Duration
-	lastEnd              time.Time
-	wg                   *sync.WaitGroup
-	stopped              bool
-	running              bool
-	mutex                sync.Mutex
+	db                     *sql.DB
+	buildChan              chan RebuildJob
+	delay                  time.Duration
+	lastEnd                time.Time
+	wg                     *sync.WaitGroup
+	stopped                bool
+	running                bool
+	mutex                  sync.Mutex
 	hasShownRebuildMessage bool // Track if we've shown the rebuild message
 }
 
@@ -236,7 +236,7 @@ func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 			log.Printf("Starting rebuild worker %d", workerID)
 			for job := range q.buildChan {
 				status, actualHash, errorMsg := q.processJob(job)
-				
+
 				// Pass rebuild data to the writer
 				log.Printf("DEBUG: Adding rebuild info to writer: %s, status: %s, hash: %s", job.DrvPath, status, actualHash)
 				writer.AddRebuildInfo(job.DrvPath, status, actualHash, errorMsg)
@@ -251,14 +251,14 @@ func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 			q.mutex.Lock()
 			q.running = false
 			q.mutex.Unlock()
-			
+
 			// Close the channel to signal workers to exit
 			close(q.buildChan)
 		}()
-		
+
 		// Track consecutive empty job attempts
 		emptyAttempts := 0
-		
+
 		for {
 			q.mutex.Lock()
 			stopped := q.stopped
@@ -274,17 +274,17 @@ func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 				if err != sql.ErrNoRows {
 					log.Printf("Error fetching next job: %v", err)
 				}
-				
+
 				// Use a shorter wait time if delay is set to 0 (testing mode)
 				if q.delay <= 0 {
 					time.Sleep(100 * time.Millisecond) // Much faster for testing
 				} else {
 					time.Sleep(1 * time.Second)
 				}
-				
+
 				// Increment empty attempts
 				emptyAttempts++
-				
+
 				// After 5 consecutive empty attempts, check if we're done
 				if emptyAttempts >= 5 {
 					pending, err := q.countPendingJobs()
@@ -295,7 +295,7 @@ func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 						break
 					}
 				}
-				
+
 				continue
 			}
 
@@ -307,10 +307,10 @@ func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 				} else {
 					time.Sleep(1 * time.Second)
 				}
-				
+
 				// Increment empty attempts
 				emptyAttempts++
-				
+
 				// After 5 consecutive empty attempts, check if we're done
 				if emptyAttempts >= 5 {
 					pending, err := q.countPendingJobs()
@@ -321,13 +321,13 @@ func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 						break
 					}
 				}
-				
+
 				continue
 			}
 
 			// Reset empty attempts counter when we find a job
 			emptyAttempts = 0
-			
+
 			// Apply build delay if needed
 			q.applyBuildDelay()
 
@@ -356,14 +356,14 @@ func (q *RebuildQueue) Stop() {
 	q.mutex.Lock()
 	q.stopped = true
 	q.mutex.Unlock()
-	
+
 	// Wait for workers to complete with a timeout
 	done := make(chan struct{})
 	go func() {
 		q.wg.Wait()
 		close(done)
 	}()
-	
+
 	// Wait with timeout
 	select {
 	case <-done:
@@ -514,9 +514,9 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 
 	if err != nil {
 		// Handle timeout
-		if strings.Contains(err.Error(), "signal: killed") || 
-		   strings.Contains(err.Error(), "context deadline exceeded") ||
-		   strings.Contains(err.Error(), "timeout") {
+		if strings.Contains(err.Error(), "signal: killed") ||
+			strings.Contains(err.Error(), "context deadline exceeded") ||
+			strings.Contains(err.Error(), "timeout") {
 			status = StatusTimeout
 			errorMessage = "Build timed out"
 		} else {
@@ -538,12 +538,12 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 				status = StatusHashMismatch
 			}
 		}
-		
+
 		// Extract actual hash if present
 		if strings.HasPrefix(line, "ACTUAL_HASH=") {
 			actualHash = strings.TrimPrefix(line, "ACTUAL_HASH=")
 		}
-		
+
 		// Extract error message if present
 		if strings.HasPrefix(line, "ERROR_MESSAGE=") {
 			newErrorMsg := strings.TrimPrefix(line, "ERROR_MESSAGE=")
@@ -552,7 +552,7 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 			}
 		}
 	}
-	
+
 	// Check if the hash matches the expected hash
 	if status == StatusSuccess && actualHash != "" && actualHash != job.ExpectedHash {
 		status = StatusHashMismatch
@@ -617,7 +617,7 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 	}
 
 	log.Printf("Job #%d completed with status: %s", job.ID, status)
-	
+
 	return status, actualHash, errorMessage
 }
 
@@ -643,14 +643,14 @@ func (q *RebuildQueue) rebuildFOD(drvPath string) (string, error) {
 	// Use the fod package's RebuildFOD function directly
 	// This ensures we're using the same code as the rebuild-fod command
 	result, err := fod.RebuildFOD(ctx, drvPath)
-	
+
 	// Create an output buffer for compatibility with the old approach
 	var outputBuf bytes.Buffer
-	
+
 	// Add the result to the output buffer
 	if result != nil {
 		fmt.Fprintf(&outputBuf, "%s\n", result.Log)
-		
+
 		if result.Status == "success" {
 			fmt.Fprintf(&outputBuf, "STATUS=success\n")
 			fmt.Fprintf(&outputBuf, "ACTUAL_HASH=%s\n", result.ActualHash)
@@ -671,21 +671,21 @@ func (q *RebuildQueue) rebuildFOD(drvPath string) (string, error) {
 		fmt.Fprintf(&outputBuf, "ACTUAL_HASH=\n")
 		fmt.Fprintf(&outputBuf, "ERROR_MESSAGE=%v\n", err)
 	}
-	
+
 	totalDuration := time.Since(startTime)
 	if totalDuration > 1*time.Second {
 		log.Printf("Rebuild took %v to complete", totalDuration)
 	}
-	
+
 	outputStr := outputBuf.String()
-	
+
 	// Get status for the return values
 	status := "failure"
-	
+
 	if result != nil {
 		status = result.Status
 	}
-	
+
 	// If status is not success, return an error
 	if status != "success" {
 		errorMsg := "rebuild failed"
@@ -694,7 +694,7 @@ func (q *RebuildQueue) rebuildFOD(drvPath string) (string, error) {
 		}
 		return outputStr, fmt.Errorf("rebuild failed with status %s: %s", status, errorMsg)
 	}
-	
+
 	return outputStr, nil
 }
 
@@ -818,13 +818,13 @@ func (q *RebuildQueue) ForceQueueAllFODs(revisionID int64) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to create rebuild_queue table: %w", err)
 	}
-	
+
 	// Clear any existing queue entries for this revision
 	_, err = q.db.Exec(`DELETE FROM rebuild_queue WHERE revision_id = ?`, revisionID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to clear existing queue entries: %w", err)
 	}
-	
+
 	// Add all FODs to the queue
 	var result sql.Result
 	if config.IsNixExpr {
@@ -848,13 +848,13 @@ func (q *RebuildQueue) ForceQueueAllFODs(revisionID int64) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to force queue FODs: %w", err)
 	}
-	
+
 	// Get the number of rows inserted
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("failed to get rows affected: %w", err)
 	}
-	
+
 	log.Printf("Force queued %d FODs for rebuild for revision ID %d", rowsAffected, revisionID)
 	return int(rowsAffected), nil
 }

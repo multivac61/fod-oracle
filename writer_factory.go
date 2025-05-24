@@ -8,11 +8,11 @@ import (
 // FODWithRebuild extends FOD with rebuild information
 type FODWithRebuild struct {
 	FOD
-	RevisionID   int64  `json:"revision_id,omitempty"`
+	RevisionID    int64  `json:"revision_id,omitempty"`
 	RebuildStatus string `json:"rebuild_status,omitempty"`
-	ActualHash   string `json:"actual_hash,omitempty"`
-	HashMismatch bool   `json:"hash_mismatch,omitempty"`
-	ErrorMessage string `json:"error_message,omitempty"`
+	ActualHash    string `json:"actual_hash,omitempty"`
+	HashMismatch  bool   `json:"hash_mismatch,omitempty"`
+	ErrorMessage  string `json:"error_message,omitempty"`
 }
 
 // Writer is an interface for writing FOD data

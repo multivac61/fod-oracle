@@ -61,18 +61,18 @@ func main() {
 	// Default timeout
 	timeoutSeconds := defaultTimeoutSeconds
 	var drvPath string
-	
+
 	// Parse arguments
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		
+
 		// Check for help flag
 		if arg == "--help" || arg == "-h" {
 			printHelp()
 			return
 		}
-		
+
 		// Handle timeout flag
 		if arg == "--timeout" || arg == "-t" {
 			if i+1 < len(args) {
@@ -98,7 +98,7 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	
+
 	// Check if we got a derivation path
 	if drvPath == "" {
 		fmt.Fprintf(os.Stderr, "Error: Missing derivation path\n\n")
@@ -106,21 +106,21 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Use --help for more information\n")
 		os.Exit(1)
 	}
-	
+
 	// Set up a context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
-	
+
 	// Run the rebuild
 	result, err := fod.RebuildFOD(ctx, drvPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	// Print the full log
 	fmt.Println(result.Log)
-	
+
 	// Exit with appropriate status code
 	if result.Status != "success" {
 		os.Exit(1)

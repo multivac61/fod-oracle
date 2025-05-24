@@ -52,8 +52,8 @@ func RebuildFOD(ctx context.Context, drvPath string) (*RebuildFODResult, error) 
 
 	// Initialize the result
 	result := &RebuildFODResult{
-		DrvPath:   drvPath,
-		Status:    "failure", // Default to failure, will change to success if everything works
+		DrvPath:    drvPath,
+		Status:     "failure", // Default to failure, will change to success if everything works
 		FinishedAt: time.Now(),
 	}
 
@@ -238,7 +238,7 @@ func getHashFromJSON(drvPath string, output *bytes.Buffer) (string, error) {
 		outputHashMode = "recursive"
 	}
 
-	fmt.Fprintf(output, "💠 [Method 1] Raw hash from JSON: %s (Algo: %s, Mode: %s)\n", 
+	fmt.Fprintf(output, "💠 [Method 1] Raw hash from JSON: %s (Algo: %s, Mode: %s)\n",
 		outputHash, outputHashAlgo, outputHashMode)
 
 	// Try to convert to hex format
@@ -283,7 +283,7 @@ func getHashFromNixStore(drvPath string, output *bytes.Buffer) (string, error) {
 		mode = "recursive"
 	}
 
-	fmt.Fprintf(output, "🔷 [Method 2] Raw hash from nix-store: %s (Algo: %s, Mode: %s)\n", 
+	fmt.Fprintf(output, "🔷 [Method 2] Raw hash from nix-store: %s (Algo: %s, Mode: %s)\n",
 		hashStr, algo, mode)
 
 	// Try to convert to hex format
@@ -311,7 +311,7 @@ func getHashFromOutputPath(ctx context.Context, drvPath string, output *bytes.Bu
 	// Check if the output path exists
 	if !fileExists(outputPath) {
 		fmt.Fprintf(output, "📦 Output path %s does not exist in store. Build may be required.\n", outputPath)
-		
+
 		// Try to build it without substitutes
 		fmt.Fprintf(output, "🏗️ Attempting to build %s without substitutes...\n", drvPath)
 		buildCmd := exec.CommandContext(ctx, "nix-build", "--no-out-link", "--no-substitute", drvPath)
@@ -320,38 +320,38 @@ func getHashFromOutputPath(ctx context.Context, drvPath string, output *bytes.Bu
 			fmt.Fprintf(output, "Build output: %s\n", string(buildOutput))
 			return outputPath, "", fmt.Errorf("build failed: %w", err)
 		}
-		
+
 		// Check if it exists now
 		if !fileExists(outputPath) {
 			return outputPath, "", fmt.Errorf("output still doesn't exist after build")
 		}
-		
+
 		fmt.Fprintf(output, "✅ Build successful. Computing hash of new output...\n")
 	} else {
 		fmt.Fprintf(output, "📦 Output path: %s\n", outputPath)
 	}
-	
+
 	// Compute hash
 	hash, err := computeHashFromPath(outputPath)
 	if err != nil {
 		return outputPath, "", fmt.Errorf("failed to compute hash: %w", err)
 	}
-	
+
 	return outputPath, hash, nil
 }
 
 // attemptBuildAndExtractHash tries to build the derivation and extract hash information
 func attemptBuildAndExtractHash(ctx context.Context, drvPath string) (string, string, string, error) {
 	var output bytes.Buffer
-	
+
 	cmd := exec.CommandContext(ctx, "nix-build", "--no-out-link", drvPath)
 	buildOutput, err := cmd.CombinedOutput()
 	output.Write(buildOutput)
-	
+
 	// Extract hashes from build output if there was a hash mismatch
 	expectedHash := ""
 	actualHash := ""
-	
+
 	if err != nil {
 		// Look for hash mismatch pattern
 		if strings.Contains(string(buildOutput), "hash mismatch") {
@@ -365,7 +365,7 @@ func attemptBuildAndExtractHash(ctx context.Context, drvPath string) (string, st
 					expectedHash = hexHash
 				}
 			}
-			
+
 			// Extract actual hash
 			actualRegex := regexp.MustCompile(`got:.*hash '([^']*)'`)
 			actualMatches := actualRegex.FindStringSubmatch(string(buildOutput))
@@ -377,10 +377,10 @@ func attemptBuildAndExtractHash(ctx context.Context, drvPath string) (string, st
 				}
 			}
 		}
-		
+
 		return expectedHash, actualHash, output.String(), fmt.Errorf("build failed: %w", err)
 	}
-	
+
 	// If build succeeded, try to extract the output path
 	pathRegex := regexp.MustCompile(`(?m)^(/nix/store/[a-z0-9]{32}-[^/\n]+)$`)
 	pathMatches := pathRegex.FindStringSubmatch(string(buildOutput))
@@ -403,7 +403,7 @@ func attemptBuildAndExtractHash(ctx context.Context, drvPath string) (string, st
 			}
 		}
 	}
-	
+
 	return expectedHash, actualHash, output.String(), nil
 }
 
@@ -414,7 +414,7 @@ func computeHashFromPath(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to compute hash: %w", err)
 	}
-	
+
 	return strings.TrimSpace(string(hashBytes)), nil
 }
 
@@ -424,18 +424,18 @@ func convertToHex(hashInput string, algo string) (string, error) {
 	if hashInput == "" {
 		return "", fmt.Errorf("empty hash input")
 	}
-	
+
 	// Check if it's already hex (at least 32 characters, only hex chars)
 	hexPattern := regexp.MustCompile(`^[0-9a-fA-F]{32,}$`)
 	if hexPattern.MatchString(hashInput) {
 		return hashInput, nil
 	}
-	
+
 	// Normalize SRI format
 	hashInput = strings.ReplaceAll(hashInput, "sha1:", "sha1-")
 	hashInput = strings.ReplaceAll(hashInput, "sha256:", "sha256-")
 	hashInput = strings.ReplaceAll(hashInput, "sha512:", "sha512-")
-	
+
 	// Extract base64 part from SRI format
 	var base64Part string
 	if strings.HasPrefix(hashInput, "sha256-") {
@@ -454,15 +454,15 @@ func convertToHex(hashInput string, algo string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("failed to convert hash with nix-hash: %w", err)
 		}
-		
+
 		sriHash := strings.TrimSpace(string(sriBytes))
 		return convertToHex(sriHash, algo)
 	}
-	
+
 	if base64Part == "" {
 		return "", fmt.Errorf("failed to extract base64 part from hash")
 	}
-	
+
 	// Convert base64 to binary then to hex
 	data, err := base64.StdEncoding.DecodeString(base64Part)
 	if err != nil {
@@ -472,7 +472,7 @@ func convertToHex(hashInput string, algo string) (string, error) {
 			return "", fmt.Errorf("failed to decode base64: %w", err)
 		}
 	}
-	
+
 	return hex.EncodeToString(data), nil
 }
 
@@ -481,4 +481,3 @@ func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
 }
-

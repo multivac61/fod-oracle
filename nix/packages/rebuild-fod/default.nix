@@ -17,7 +17,7 @@ pkgs.buildGoModule {
 
   # Build-time dependencies
   nativeBuildInputs = [ pkgs.makeWrapper ];
-  
+
   # Runtime dependencies
   buildInputs = [
     pkgs.nix

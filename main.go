@@ -277,7 +277,7 @@ var createTables = `
 // initInMemoryDB initializes an in-memory SQLite database
 func initInMemoryDB() *sql.DB {
 	log.Printf("Initializing in-memory SQLite database")
-	
+
 	// Connection string for in-memory database with shared cache
 	connString := "file::memory:?cache=shared" +
 		"&_journal_mode=MEMORY" +
@@ -286,17 +286,17 @@ func initInMemoryDB() *sql.DB {
 		"&_temp_store=MEMORY" +
 		"&_busy_timeout=10000" + // 10 second timeout
 		"&_locking_mode=NORMAL"
-	
+
 	db, err := sql.Open("sqlite3", connString)
 	if err != nil {
 		log.Fatalf("Failed to open in-memory database: %v", err)
 	}
-	
+
 	// Set connection pool limits
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxLifetime(time.Minute * 10)
-	
+
 	// Apply optimizations for in-memory database
 	pragmas := []string{
 		"PRAGMA journal_mode=MEMORY",
@@ -305,19 +305,19 @@ func initInMemoryDB() *sql.DB {
 		"PRAGMA temp_store=MEMORY",
 		"PRAGMA foreign_keys=ON",
 	}
-	
+
 	for _, pragma := range pragmas {
 		if _, err := db.Exec(pragma); err != nil {
 			log.Printf("Warning: Failed to set pragma %s: %v", pragma, err)
 		}
 	}
-	
+
 	// Create the tables
 	_, err = db.Exec(createTables)
 	if err != nil {
 		log.Fatalf("Failed to create tables in in-memory database: %v", err)
 	}
-	
+
 	return db
 }
 
@@ -336,7 +336,7 @@ func initDB() *sql.DB {
 
 	// Create the database directory if it doesn't exist
 	dbDir := filepath.Dir(dbPath)
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
+	if err := os.MkdirAll(dbDir, 0o755); err != nil {
 		log.Fatalf("Failed to create database directory %s: %v", dbDir, err)
 	}
 
@@ -1403,9 +1403,9 @@ func main() {
 	// Use custom flag parsing to separate flags from positional arguments
 	// This ensures flags like -format and their values don't get treated as revisions
 	flag.Parse()
-	
+
 	// Debug: Print all flag values
-	log.Printf("DEBUG: Flag values - format: %s, output: %s, reevaluate: %v", 
+	log.Printf("DEBUG: Flag values - format: %s, output: %s, reevaluate: %v",
 		*formatFlag, *outputFlag, *reevaluateFlag)
 
 	if *helpFlag {
@@ -1458,7 +1458,7 @@ func main() {
 			break
 		}
 	}
-	
+
 	// Only use the flag.Parse() value if we didn't find an explicit format in the args
 	if !formatExplicitlySet && *formatFlag != "" {
 		// Validate output format
@@ -1490,7 +1490,7 @@ func main() {
 			break
 		}
 	}
-	
+
 	// Only use the flag.Parse() value if we didn't find an explicit output in the args
 	if !outputExplicitlySet && *outputFlag != "" {
 		config.OutputPath = *outputFlag
@@ -1513,7 +1513,7 @@ func main() {
 
 	// Check if reevaluate is explicitly set or if it appears in the command line args
 	config.Reevaluate = *reevaluateFlag
-	
+
 	// Always check the raw args because flag parsing doesn't handle --flag style well
 	for _, arg := range os.Args {
 		if arg == "-reevaluate" || arg == "--reevaluate" {
@@ -1522,7 +1522,7 @@ func main() {
 			break
 		}
 	}
-	
+
 	log.Printf("DEBUG: Reevaluate flag state: %v", config.Reevaluate)
 
 	// Apply the build delay from the flag, overriding environment and default values
@@ -1629,7 +1629,7 @@ func main() {
 
 	// Process revisions sequentially
 	for _, rev := range revisions {
-		
+
 		revisionID, err := getOrCreateRevision(db, rev)
 		if err != nil {
 			log.Printf("Failed to get or create revision %s: %v", rev, err)
@@ -1642,7 +1642,7 @@ func main() {
 			log.Printf("Error creating writer: %v", err)
 			continue
 		}
-		
+
 		// Handle different processing modes
 		if isTestMode {
 			log.Printf("Running in test mode with derivation path: %s", testDrvPath)
@@ -1669,10 +1669,10 @@ func main() {
 				log.Printf("Error reevaluating FODs for revision %s: %v", rev, err)
 			}
 		}
-		
+
 		// Close the writer
 		writer.Close()
-		
+
 		// If using a non-SQLite output format, convert the database to the desired format
 		if config.OutputFormat != "sqlite" {
 			outputPath := config.OutputPath
@@ -1680,7 +1680,7 @@ func main() {
 				// Use default output path if not specified
 				outputPath = fmt.Sprintf("output/%s/fods.%s", rev, config.OutputFormat)
 			}
-			
+
 			if err := ConvertToFormat(db, config.OutputFormat, outputPath, revisionID); err != nil {
 				log.Printf("Error converting to %s format: %v", config.OutputFormat, err)
 			}
@@ -1777,7 +1777,7 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string, writer Writer) err
 	if queueErr != nil {
 		return fmt.Errorf("failed to queue FODs: %w", queueErr)
 	}
-	
+
 	// If no FODs were queued but we know there should be some, try force queuing
 	if count == 0 {
 		var fodCount int
@@ -1786,7 +1786,7 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string, writer Writer) err
 		} else {
 			queueErr = db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount)
 		}
-		
+
 		if queueErr != nil {
 			log.Printf("Error counting FODs: %v", queueErr)
 		} else if fodCount > 0 {
