@@ -146,6 +146,8 @@ func init() {
 		OutputFormat: "sqlite",
 		OutputPath:   "",
 		WorkerCount:  1,
+		Reevaluate:   false,
+		BuildDelay:   0, // Default build delay set to 0 for testing (no delay)
 	}
 
 	// Check for custom worker count in environment
@@ -171,6 +173,16 @@ func init() {
 	if outputPath := os.Getenv("FOD_ORACLE_OUTPUT_PATH"); outputPath != "" {
 		config.OutputPath = outputPath
 	}
+
+	// Check for build delay in environment
+	if buildDelayStr := os.Getenv("FOD_ORACLE_BUILD_DELAY"); buildDelayStr != "" {
+		if delay, err := strconv.Atoi(buildDelayStr); err == nil {
+			config.BuildDelay = delay
+			log.Printf("Using build delay from environment: %d seconds", delay)
+		} else {
+			log.Printf("Warning: Invalid build delay value in environment: %s", buildDelayStr)
+		}
+	}
 }
 
 // initDB initializes the SQLite database
@@ -184,6 +196,14 @@ func initDB() *sql.DB {
 		}
 		dbPath = filepath.Join(currentDir, "db", "fods.db")
 	}
+
+	// Create the database directory if it doesn't exist
+	dbDir := filepath.Dir(dbPath)
+	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		log.Fatalf("Failed to create database directory %s: %v", dbDir, err)
+	}
+
+	log.Printf("Using database at: %s", dbPath)
 
 	// Add busy_timeout and other optimizations
 	connString := dbPath + "?_journal_mode=WAL" +
@@ -283,6 +303,28 @@ func initDB() *sql.DB {
         evaluation_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
     );
+
+    -- Table for FOD rebuild queue and results
+    CREATE TABLE IF NOT EXISTS rebuild_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        drv_path TEXT NOT NULL,
+        revision_id INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'running', 'success', 'failure', 'timeout', 'hash_mismatch'
+        queue_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        started_at DATETIME,
+        finished_at DATETIME,
+        expected_hash TEXT,                    -- From FOD table
+        actual_hash TEXT,                      -- Computed during rebuild
+        log TEXT,                              -- Output from rebuild-fod
+        attempts INTEGER DEFAULT 0,            -- Number of attempts made
+        error_message TEXT,                    -- Error message if failed
+        FOREIGN KEY (drv_path) REFERENCES fods(drv_path) ON DELETE CASCADE,
+        FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_queue_status ON rebuild_queue(status);
+    CREATE INDEX IF NOT EXISTS idx_queue_drv_path ON rebuild_queue(drv_path);
+    CREATE INDEX IF NOT EXISTS idx_queue_revision_id ON rebuild_queue(revision_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_drv_rev ON rebuild_queue(drv_path, revision_id);
     `
 	_, err = db.Exec(createTables)
 	if err != nil {
@@ -1293,13 +1335,16 @@ func main() {
 
 	// Parse command-line flags
 	var (
-		formatFlag  = flag.String("format", config.OutputFormat, "Output format (sqlite, json, csv, parquet)")
-		outputFlag  = flag.String("output", config.OutputPath, "Output path for non-SQLite formats")
-		workersFlag = flag.Int("workers", workers, "Number of worker threads")
-		testMode    = flag.Bool("test", false, "Test mode - process a single derivation")
-		testDrv     = flag.String("drv", "", "Derivation path for test mode")
-		nixExpr     = flag.Bool("expr", false, "Process a Nix expression instead of a revision")
-		helpFlag    = flag.Bool("help", false, "Show help")
+		formatFlag     = flag.String("format", config.OutputFormat, "Output format (sqlite, json, csv, parquet)")
+		outputFlag     = flag.String("output", config.OutputPath, "Output path for non-SQLite formats")
+		workersFlag    = flag.Int("workers", workers, "Number of worker threads")
+		testMode       = flag.Bool("test", false, "Test mode - process a single derivation")
+		testDrv        = flag.String("drv", "", "Derivation path for test mode")
+		nixExpr        = flag.Bool("expr", false, "Process a Nix expression instead of a revision")
+		reevaluateFlag = flag.Bool("reevaluate", false, "Reevaluate FODs by rebuilding them")
+		buildDelayFlag = flag.Int("build-delay", config.BuildDelay, "Delay between builds in seconds")
+		parallelFlag   = flag.Int("parallel", 1, "Number of parallel rebuild workers (default: 1, use higher values for testing)")
+		helpFlag       = flag.Bool("help", false, "Show help")
 	)
 
 	// Use custom flag parsing to separate flags from positional arguments
@@ -1308,7 +1353,8 @@ func main() {
 
 	if *helpFlag {
 		fmt.Printf("FOD Oracle - A tool for finding Fixed-Output Derivations in Nix packages\n\n")
-		fmt.Printf("Usage: %s [options] <nixpkgs-revision> [<nixpkgs-revision2> ...]\n\n", os.Args[0])
+		fmt.Printf("Usage: %s [options] <nixpkgs-revision> [<nixpkgs-revision2> ...]\n", os.Args[0])
+		fmt.Printf("       %s --expr \"let pkgs = import <nixpkgs> {}; in pkgs.hello\" [--reevaluate]\n\n", os.Args[0])
 		fmt.Printf("Options:\n")
 		flag.PrintDefaults()
 		fmt.Printf("\nEnvironment Variables:\n")
@@ -1318,6 +1364,7 @@ func main() {
 		fmt.Printf("  FOD_ORACLE_OUTPUT_PATH   Output path for non-SQLite formats\n")
 		fmt.Printf("  FOD_ORACLE_TEST_DRV_PATH Path to derivation for test mode\n")
 		fmt.Printf("  FOD_ORACLE_EVAL_OPTS     Additional options for nix-eval-jobs\n")
+		fmt.Printf("  FOD_ORACLE_BUILD_DELAY   Delay between builds in seconds (default: 0)\n")
 		return
 	}
 
@@ -1350,6 +1397,25 @@ func main() {
 		config.IsNixExpr = true
 	}
 
+	if *reevaluateFlag {
+		config.Reevaluate = true
+	}
+
+	// Apply the build delay from the flag, overriding environment and default values
+	if *buildDelayFlag != config.BuildDelay {
+		log.Printf("Setting build delay to %d seconds (from command-line flag)", *buildDelayFlag)
+		config.BuildDelay = *buildDelayFlag
+	}
+	// Set parallel workers
+	if *parallelFlag > 0 {
+		config.ParallelWorkers = *parallelFlag
+		if config.ParallelWorkers > 1 {
+			log.Printf("Using %d parallel rebuild workers (faster testing mode)", config.ParallelWorkers)
+		}
+	} else {
+		config.ParallelWorkers = 1
+	}
+
 	log.Printf("Using %d worker threads on %s (%s), %s",
 		workers, systemInfo.CPU, systemInfo.Cores, systemInfo.OS)
 	log.Printf("Output format: %s", config.OutputFormat)
@@ -1370,11 +1436,43 @@ func main() {
 	// and not misinterpreted flags
 	validRevisions := []string{}
 	for _, rev := range revisions {
-		// Skip arguments that look like flags (-flag) or are too short to be git hashes
-		if strings.HasPrefix(rev, "-") || len(rev) < 7 {
-			log.Printf("Warning: Skipping invalid revision: %s (appears to be a flag or invalid hash)", rev)
+		// Skip any flags that got parsed as positional arguments
+		if rev == "--reevaluate" {
+			config.Reevaluate = true
+			continue
+		} else if rev == "--build-delay" || strings.HasPrefix(rev, "--build-delay=") {
+			// Skip the --build-delay flag
+			continue
+		} else if strings.HasPrefix(rev, "-") {
+			// Skip other flags
+			continue
+		} else if i, err := strconv.Atoi(rev); err == nil && i >= 0 {
+			// This is a number, likely the value for build-delay, skip it
 			continue
 		}
+
+		// If we are in Nix expression mode, do not validate the revision length
+		if *nixExpr {
+			validRevisions = append(validRevisions, rev)
+			continue
+		}
+
+		// If we are in Nix expression mode, do not validate the revision length
+		if *nixExpr {
+			validRevisions = append(validRevisions, rev)
+			continue
+		}
+
+		// Skip arguments that are too short to be git hashes (only in Git revision mode)
+		if len(rev) < 7 {
+			// Only warn if it's not a number (which would be a flag value)
+			_, err := strconv.Atoi(rev)
+			if err != nil {
+				log.Printf("Warning: Skipping invalid revision: %s (too short to be a git hash)", rev)
+			}
+			continue
+		}
+
 		validRevisions = append(validRevisions, rev)
 	}
 
@@ -1414,6 +1512,8 @@ func main() {
 			}
 		} else if *nixExpr {
 			// Process as Nix expression rather than as a Git revision
+			// Set IsNixExpr before processing to ensure reevaluation works correctly
+			config.IsNixExpr = true
 			if err := processNixExpression(rev, revisionID, db); err != nil {
 				log.Printf("Error processing Nix expression: %v", err)
 			}
@@ -1421,6 +1521,13 @@ func main() {
 			// Normal mode - process as a Git revision
 			if err := findFODsForRevision(rev, revisionID, db); err != nil {
 				log.Printf("Error finding FODs for revision %s: %v", rev, err)
+			}
+		}
+
+		// Handle reevaluation if requested
+		if config.Reevaluate {
+			if err := reevaluateFODs(db, revisionID, rev); err != nil {
+				log.Printf("Error reevaluating FODs for revision %s: %v", rev, err)
 			}
 		}
 	}
@@ -1501,4 +1608,110 @@ func processTestDerivation(drvPath string, revisionID int64, db *sql.DB) error {
 	}
 
 	return nil
+}
+
+// reevaluateFODs handles the reevaluation of FODs for a given revision or expression
+func reevaluateFODs(db *sql.DB, revisionID int64, rev string) error {
+	identifier := rev
+	if config.IsNixExpr {
+		identifier = "expr"
+	}
+
+	log.Printf("[%s] Starting FOD reevaluation...", identifier)
+
+	// Create the rebuild queue with the configured parallel workers and build delay
+	queue := NewRebuildQueue(db, config.ParallelWorkers, config.BuildDelay)
+
+	// Queue FODs for this revision
+	count, err := queue.QueueFODsForRevision(revisionID)
+	if err != nil {
+		return fmt.Errorf("failed to queue FODs: %w", err)
+	}
+
+	if count == 0 {
+		log.Printf("[%s] No FODs to reevaluate", identifier)
+		return nil
+	}
+
+	// Always show the configured settings
+	delayMessage := fmt.Sprintf("build delay: %d seconds", config.BuildDelay)
+	if config.BuildDelay <= 0 {
+		delayMessage = "build delay: DISABLED (0 seconds)"
+	}
+
+	if config.ParallelWorkers > 1 {
+		log.Printf("[%s] Queued %d FODs for reevaluation (parallel workers: %d, %s)",
+			identifier, count, config.ParallelWorkers, delayMessage)
+	} else {
+		log.Printf("[%s] Queued %d FODs for reevaluation (%s)",
+			identifier, count, delayMessage)
+	}
+
+	// Start the queue runner with the configured concurrency
+	queue.Start(config.ParallelWorkers)
+
+	// Setup for progress reporting
+	var maxWaitTime time.Duration = 10 * time.Minute
+	startTime := time.Now()
+
+	// Instead of using a separate goroutine, use a ticker with more frequent
+	// updates so we can check both for completion and provide status updates
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	// Setup a timeout to prevent hanging
+	timeout := time.NewTimer(maxWaitTime)
+	defer timeout.Stop()
+
+	// Wait for completion or provide status updates
+	for {
+		select {
+		case <-timeout.C:
+			// Safety timeout to prevent hanging
+			log.Printf("[%s] Reevaluation timed out after %v", identifier, maxWaitTime)
+			queue.Stop() // Force the queue to stop
+
+			// Try to get final stats
+			stats, err := queue.GetQueueStats(revisionID)
+			if err == nil && stats["total"] > 0 {
+				completed := stats["success"] + stats["hash_mismatch"] + stats["failure"] + stats["timeout"]
+				log.Printf("[%s] Partial results: %d/%d complete (%d%%)",
+					identifier, completed, stats["total"],
+					int(float64(completed)/float64(stats["total"])*100))
+			}
+			return fmt.Errorf("rebuild queue timed out after %v", maxWaitTime)
+
+		case <-ticker.C:
+			// Check if the queue is done
+			if !queue.IsRunning() {
+				// Get final stats
+				stats, err := queue.GetQueueStats(revisionID)
+				if err != nil {
+					log.Printf("[%s] Error getting final queue stats: %v", identifier, err)
+				} else {
+					log.Printf("[%s] Reevaluation complete. Total: %d, Success: %d, Hash Mismatch: %d, Failure: %d, Timeout: %d",
+						identifier, stats["total"], stats["success"], stats["hash_mismatch"], stats["failure"], stats["timeout"])
+				}
+				return nil
+			}
+
+			// Provide status update
+			stats, err := queue.GetQueueStats(revisionID)
+			if err != nil {
+				log.Printf("[%s] Error getting queue stats: %v", identifier, err)
+				continue
+			}
+
+			completed := stats["success"] + stats["hash_mismatch"] + stats["failure"] + stats["timeout"]
+			total := stats["total"]
+
+			if total > 0 {
+				percentComplete := float64(completed) / float64(total) * 100
+				elapsedTime := time.Since(startTime)
+				log.Printf("[%s] Reevaluation progress: %.1f%% (%d/%d complete, elapsed: %v). Success: %d, Hash Mismatch: %d, Failure: %d, Timeout: %d",
+					identifier, percentComplete, completed, total, elapsedTime.Round(time.Second),
+					stats["success"], stats["hash_mismatch"], stats["failure"], stats["timeout"])
+			}
+		}
+	}
 }

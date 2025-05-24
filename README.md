@@ -34,32 +34,27 @@ FOD Oracle is a tool for tracking and analyzing fixed-output derivations (FODs) 
 
 ### CLI
 
-To scan a nixpkgs revision:
-
 ```bash
-# Build the tool
-./build.sh
-
-# Process a simple package name
-./fod-oracle -expr hello
-
-# Process a complex Nix expression
-./fod-oracle -expr "let pkgs = import <nixpkgs> {}; in pkgs.hello"
+# Process a simple Nix expression
+./fod-oracle -expr "(import <nixpkgs> {}).hello"
 
 # Process a specific nixpkgs revision
 ./fod-oracle 1d250f4
 
+# Reevaluate FODs by rebuilding them (with parallel workers)
+./fod-oracle -reevaluate -parallel=4 -build-delay=5 1d250f4
+
 # Output to JSON format
-./fod-oracle -format=json -output=./output.json -expr hello
+./fod-oracle -format=json -output=./output.json -expr "hello"
 
 # Output to CSV format
-./fod-oracle -format=csv -output=./output.csv -expr hello
+./fod-oracle -format=csv -output=./output.csv -expr "hello"
 
 # Output to Parquet format
-./fod-oracle -format=parquet -output=./output.parquet -expr hello
+./fod-oracle -format=parquet -output=./output.parquet -expr "hello"
 ```
 
-Scanning a complete nixpkgs revision takes around 7 minutes on a 7950 AMD Ryzen 9 16-core processor.
+Scanning a complete nixpkgs revision takes around 10+ minutes on a 7950 AMD Ryzen 9 16-core CPU with 62GB RAM.
 
 ### Command-line Arguments
 
@@ -77,6 +72,12 @@ Options:
     	Show help
   -output string
     	Output path for non-SQLite formats
+  -parallel int
+    	Number of parallel rebuild workers (default: 1, use higher values for testing)
+  -reevaluate
+    	Reevaluate FODs by rebuilding them
+  -build-delay int
+    	Delay between builds in seconds (default 10)
   -test
     	Test mode - process a single derivation
   -workers int
@@ -91,6 +92,26 @@ Options:
 - `FOD_ORACLE_OUTPUT_PATH` - Output path for non-SQLite formats
 - `FOD_ORACLE_TEST_DRV_PATH` - Path to derivation for test mode
 - `FOD_ORACLE_EVAL_OPTS` - Additional options for nix-eval-jobs
+- `FOD_ORACLE_BUILD_DELAY` - Delay between builds in seconds (default: 0)
+
+## Rebuild-FOD Tool
+
+The project includes a standalone `rebuild-fod` tool that can be used to rebuild and verify fixed-output derivations. This tool is built in Go and can be used both as a command-line utility and as a library in the main application.
+
+### Building and Using the Tool with Nix
+
+```bash
+nix build .#rebuild-fod -- /nix/store/0m4y3j4pnivlhhpr5yqdvlly86p93fwc-busybox.drv
+```
+
+The rebuild-fod tool uses multiple methods to determine the correct hash of a fixed-output derivation:
+
+1. Extracting from derivation JSON (Method 1)
+2. Querying the Nix store (Method 2)
+3. Computing from the output (Method 3)
+4. Building the derivation if needed (Method 4)
+
+It then compares the results to find any hash mismatches, which could indicate reproducibility issues.
 
 ## API Endpoints
 

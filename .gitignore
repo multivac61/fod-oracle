@@ -81,3 +81,4 @@ bin/
 *.csv
 *.db
 *.json
+rebuild-fod
