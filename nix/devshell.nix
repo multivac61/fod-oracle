@@ -4,6 +4,8 @@ pkgs.mkShell {
   packages = with pkgs; [
     nix-eval-jobs
     jq
+    nodejs_20
+    pnpm
   ];
 
   # Add environment variables

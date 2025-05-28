@@ -77,8 +77,6 @@ nixpkgs-*
 bin/
 
 # output file extensions
-*.parquet
-*.csv
 *.db
-*.json
 rebuild-fod
+pb_data

@@ -23,6 +23,7 @@ FOD Oracle is a tool for tracking and analyzing fixed-output derivations (FODs) 
 - **FOD Tracking**: Scans nixpkgs revisions and tracks all fixed-output derivations
 - **JSON Lines Streaming**: Outputs FODs as streaming JSON Lines for real-time processing
 - **FOD Rebuilding**: Verifies FOD integrity by rebuilding and comparing hashes
+- **Real-time Web Interface**: Live dashboard showing FODs being processed during evaluation
 - **API**: RESTful API for programmatic access to FOD data
 
 ## Components
@@ -54,6 +55,12 @@ FOD Oracle outputs all results as streaming JSON Lines to stdout, making it easy
 
 # Save JSON Lines to file
 ./fod-oracle 1d250f4 > fods.jsonl
+
+# Start real-time web interface during evaluation
+./fod-oracle -expr "(import <nixpkgs> {}).hello" --web --port 8080
+
+# Start standalone web interface
+./fod-oracle --web --port 8080 --host 0.0.0.0
 ```
 
 #### Output Formats
@@ -94,6 +101,12 @@ Options:
     	Delay between builds in seconds (default 10)
   -test
     	Test mode - process a single derivation
+  -web
+    	Start web interface with real-time FOD streaming
+  -port int
+    	Port for web interface (default 8080)
+  -host string
+    	Host address for web interface (e.g., 0.0.0.0 for all interfaces) (default "127.0.0.1")
   -workers int
     	Number of worker threads (default 1)
 ```
@@ -104,6 +117,38 @@ Options:
 - `FOD_ORACLE_TEST_DRV_PATH` - Path to derivation for test mode
 - `FOD_ORACLE_EVAL_OPTS` - Additional options for nix-eval-jobs
 - `FOD_ORACLE_BUILD_DELAY` - Delay between builds in seconds (default: 0)
+
+## Real-time Web Interface
+
+FOD Oracle includes a real-time web interface for monitoring FOD discovery during evaluation. When you use the `--web` flag, FODs are streamed live to a dashboard as they are found.
+
+### Features
+
+- **Live FOD Streaming**: See FODs appear in real-time as they are discovered
+- **Evaluation Progress**: Track progress of ongoing evaluations
+- **Modern Dashboard**: Clean, responsive interface with dark theme
+- **PocketBase Backend**: Full-featured database and admin interface
+- **Network Access**: Use `--host 0.0.0.0` to access from other machines
+
+### Usage
+
+```bash
+# Real-time streaming during evaluation
+./fod-oracle -expr "(import <nixpkgs> {}).hello" --web --port 8080
+
+# Access from any network interface
+./fod-oracle -expr "(import <nixpkgs> {}).hello" --web --port 8080 --host 0.0.0.0
+
+# Standalone web interface (browse existing data)
+./fod-oracle --web --port 8080
+```
+
+### Endpoints
+
+- **Main Dashboard**: `http://localhost:8080/` - Overview and navigation
+- **Real-time Dashboard**: `http://localhost:8080/realtime` - Live FOD streaming
+- **Admin Interface**: `http://localhost:8080/_/` - PocketBase admin (create collections, manage data)
+- **API Status**: `http://localhost:8080/api/fod-status` - Health check and status
 
 ## Rebuild-FOD Tool
 

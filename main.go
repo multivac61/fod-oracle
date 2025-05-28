@@ -345,6 +345,54 @@ func initInMemoryDB() *sql.DB {
 	return db
 }
 
+// initPersistentDB initializes a persistent SQLite database file
+func initPersistentDB(dbFile string) *sql.DB {
+	debugLog("Initializing persistent SQLite database: %s", dbFile)
+
+	// Connection string for file-based database with optimizations
+	connString := dbFile +
+		"?_journal_mode=WAL" +
+		"&_synchronous=NORMAL" +
+		"&_cache_size=100000" +
+		"&_temp_store=MEMORY" +
+		"&_busy_timeout=10000" +
+		"&_locking_mode=NORMAL"
+
+	db, err := sql.Open("sqlite3", connString)
+	if err != nil {
+		log.Fatalf("Failed to open persistent database: %v", err)
+	}
+
+	// Set connection pool limits
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(time.Minute * 10)
+
+	// Apply optimizations for persistent database
+	pragmas := []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=NORMAL",
+		"PRAGMA cache_size=100000",
+		"PRAGMA temp_store=MEMORY",
+		"PRAGMA busy_timeout=10000",
+		"PRAGMA foreign_keys=ON",
+	}
+
+	for _, pragma := range pragmas {
+		if _, err := db.Exec(pragma); err != nil {
+			debugLog("Warning: Failed to set pragma %s: %v", pragma, err)
+		}
+	}
+
+	// Create tables
+	if _, err := db.Exec(createTables); err != nil {
+		log.Fatalf("Failed to create tables: %v", err)
+	}
+
+	debugLog("Persistent database initialized successfully")
+	return db
+}
+
 // initDB initializes the SQLite database
 func initDB() *sql.DB {
 	// For SQLite output format, use the normal file-based database
@@ -600,6 +648,12 @@ func (b *DBBatcher) AddFOD(fod FOD) {
 	}
 	b.relationBatch = append(b.relationBatch, relation)
 	b.stats.fods++
+	
+	// Stream FOD to web interface in real-time (non-blocking)
+	go func() {
+		evaluationID := fmt.Sprintf("eval-%d", b.revisionID)
+		streamFODRealtime(fod, evaluationID)
+	}()
 
 	if len(b.fodBatch) >= b.batchSize {
 		// Copy batches to local variables
@@ -1454,6 +1508,9 @@ func main() {
 		parallelFlag   = flag.Int("parallel", 1, "Number of parallel rebuild workers (default: 1, use higher values for testing)")
 		debugFlag      = flag.Bool("debug", false, "Enable debug logging")
 		helpFlag       = flag.Bool("help", false, "Show help")
+		webFlag        = flag.Bool("web", false, "Start web interface with real-time FOD streaming")
+		portFlag       = flag.Int("port", 8080, "Port for web interface")
+		hostFlag       = flag.String("host", "127.0.0.1", "Host address for web interface (e.g., 0.0.0.0 for all interfaces)")
 	)
 
 	// Use custom flag parsing to separate flags from positional arguments
@@ -1500,6 +1557,18 @@ func main() {
 		fmt.Printf("  FOD_ORACLE_TEST_DRV_PATH Path to derivation for test mode\n")
 		fmt.Printf("  FOD_ORACLE_EVAL_OPTS     Additional options for nix-eval-jobs\n")
 		fmt.Printf("  FOD_ORACLE_BUILD_DELAY   Delay between builds in seconds (default: 0)\n")
+		fmt.Printf("\nWeb Interface:\n")
+		fmt.Printf("  --web         Enable real-time web interface during evaluation\n")
+		fmt.Printf("  --port        Port for web interface (default: 8080)\n")
+		fmt.Printf("  --host        Host address for web interface (default: 127.0.0.1, use 0.0.0.0 for all interfaces)\n")
+		return
+	}
+
+	// Handle web-only mode (no evaluation)
+	if *webFlag && len(flag.Args()) == 0 && !*nixExpr {
+		if err := startWebInterface(*portFlag, *hostFlag); err != nil {
+			log.Fatalf("Failed to start web interface: %v", err)
+		}
 		return
 	}
 
@@ -1541,8 +1610,23 @@ func main() {
 	// Clean up any leftover worktrees
 	cleanupWorktrees()
 
-	// Always use in-memory database for JSON Lines streaming
-	db := initInMemoryDB()
+	// Use persistent database if web flag is set (for real-time streaming), otherwise in-memory
+	var db *sql.DB
+	if *webFlag {
+		db = initPersistentDB("./fod-oracle.db")
+		log.Printf("Using persistent database for real-time web streaming")
+		
+		// Start web interface in background
+		go func() {
+			time.Sleep(1 * time.Second) // Give time for database to initialize
+			if err := startWebInterfaceWithRealtime(*portFlag, *hostFlag, db); err != nil {
+				log.Printf("Web interface error: %v", err)
+			}
+		}()
+		log.Printf("Web interface will be available at http://%s:%d/realtime", *hostFlag, *portFlag)
+	} else {
+		db = initInMemoryDB()
+	}
 	defer db.Close()
 
 	// Get revisions from command line
