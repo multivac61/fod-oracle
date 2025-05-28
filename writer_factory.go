@@ -11,16 +11,13 @@ import (
 
 // FODWithRebuild extends FOD with rebuild information
 type FODWithRebuild struct {
-	DrvPath         string `json:"DrvPath"`
-	OutputPath      string `json:"OutputPath"`
-	HashAlgorithm   string `json:"HashAlgorithm"`
-	Hash            string `json:"Hash"`
-	SRIHash         string `json:"SRIHash"`
-	RebuildStatus   string `json:"rebuild_status,omitempty"`
-	ActualHash      string `json:"actual_hash,omitempty"`
-	ActualSRIHash   string `json:"actual_sri_hash,omitempty"`
-	HashMismatch    bool   `json:"hash_mismatch"`
-	ErrorMessage    string `json:"error_message,omitempty"`
+	DrvPath       string `json:"DrvPath"`
+	OutputPath    string `json:"OutputPath"`
+	ExpectedHash  string `json:"ExpectedHash"`
+	ActualHash    string `json:"ActualHash,omitempty"`
+	RebuildStatus string `json:"RebuildStatus,omitempty"`
+	HashMismatch  bool   `json:"HashMismatch"`
+	ErrorMessage  string `json:"ErrorMessage,omitempty"`
 }
 
 // toSRIHash converts a hash algorithm and hex hash to SRI format using nix hash convert
@@ -174,16 +171,13 @@ func (w *JSONLinesWriter) outputFODAsJSONLine(drvPath string) {
 		return // Skip if no rebuild info
 	}
 	
-	// Create FODWithRebuild struct with exact field names matching the example
+	// Create FODWithRebuild struct with simplified hash fields
 	fodWithRebuild := FODWithRebuild{
 		DrvPath:       fod.DrvPath,
 		OutputPath:    fod.OutputPath,
-		HashAlgorithm: fod.HashAlgorithm,
-		Hash:          fod.Hash,
-		SRIHash:       toSRIHash(fod.HashAlgorithm, fod.Hash),
+		ExpectedHash:  toSRIHash(fod.HashAlgorithm, fod.Hash),
+		ActualHash:    toSRIHash(fod.HashAlgorithm, rebuildInfo.ActualHash),
 		RebuildStatus: rebuildInfo.Status,
-		ActualHash:    rebuildInfo.ActualHash,
-		ActualSRIHash: toSRIHash(fod.HashAlgorithm, rebuildInfo.ActualHash),
 		ErrorMessage:  rebuildInfo.ErrorMessage,
 	}
 	
@@ -205,17 +199,13 @@ func (w *JSONLinesWriter) outputFODAsJSONLine(drvPath string) {
 func (w *JSONLinesWriter) outputBasicFODAsJSONLine(fod FOD) {
 	// Create basic FOD struct without rebuild info
 	basicFOD := struct {
-		DrvPath       string `json:"DrvPath"`
-		OutputPath    string `json:"OutputPath"`
-		HashAlgorithm string `json:"HashAlgorithm"`
-		Hash          string `json:"Hash"`
-		SRIHash       string `json:"SRIHash"`
+		DrvPath      string `json:"DrvPath"`
+		OutputPath   string `json:"OutputPath"`
+		ExpectedHash string `json:"ExpectedHash"`
 	}{
-		DrvPath:       fod.DrvPath,
-		OutputPath:    fod.OutputPath,
-		HashAlgorithm: fod.HashAlgorithm,
-		Hash:          fod.Hash,
-		SRIHash:       toSRIHash(fod.HashAlgorithm, fod.Hash),
+		DrvPath:      fod.DrvPath,
+		OutputPath:   fod.OutputPath,
+		ExpectedHash: toSRIHash(fod.HashAlgorithm, fod.Hash),
 	}
 	
 	// Output as JSON line to stdout
