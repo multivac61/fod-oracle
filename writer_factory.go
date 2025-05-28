@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -87,8 +88,9 @@ func (w *JSONLinesWriter) AddFOD(fod FOD) {
 	// Always cache the FOD for potential later use
 	w.fodMap[fod.DrvPath] = &fod
 	
-	// In reevaluate mode, we need to store FODs in the database for the rebuild queue
+	// Always output FODs immediately for streaming
 	if config.Reevaluate {
+		// In reevaluate mode, store in database for rebuild queue but don't output yet
 		w.insertFODToDatabase(fod)
 	} else {
 		// In normal mode, output FODs immediately without rebuild info
@@ -193,6 +195,13 @@ func (w *JSONLinesWriter) outputFODAsJSONLine(drvPath string) {
 	}
 	
 	fmt.Println(string(jsonBytes))
+	// Force flush to ensure immediate output
+	os.Stdout.Sync()
+	
+	// Debug: Log when FOD is output (only when debug is enabled)
+	if config.Debug {
+		debugLog("OUTPUT: FOD %s", fod.DrvPath)
+	}
 }
 
 // outputBasicFODAsJSONLine outputs a FOD without rebuild info (for normal mode)
@@ -215,6 +224,8 @@ func (w *JSONLinesWriter) outputBasicFODAsJSONLine(fod FOD) {
 	}
 	
 	fmt.Println(string(jsonBytes))
+	// Force flush to ensure immediate output
+	os.Stdout.Sync()
 }
 
 // Flush is a no-op for JSON Lines writer

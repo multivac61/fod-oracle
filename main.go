@@ -696,9 +696,16 @@ type ProcessingContext struct {
 
 func processDerivation(inputFile string, ctx *ProcessingContext) {
 	ctx.batcher.IncrementDrvCount()
+	
+	if config.Debug {
+		debugLog("PROCESS: Starting derivation %s", inputFile)
+	}
 
 	// Check if we've already processed this derivation
 	if _, alreadyProcessed := ctx.processedPaths.Load(inputFile); alreadyProcessed {
+		if config.Debug {
+			debugLog("PROCESS: Skipping already processed derivation %s", inputFile)
+		}
 		return
 	}
 
@@ -1008,6 +1015,9 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 				if !globalVisited[result.DrvPath] {
 					globalVisited[result.DrvPath] = true
 					totalJobCount++
+					if config.Debug {
+						debugLog("QUEUE: Sending derivation %s to processing", result.DrvPath)
+					}
 					drvPathChan <- result.DrvPath
 				}
 
