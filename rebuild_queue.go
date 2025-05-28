@@ -56,7 +56,7 @@ type RebuildQueue struct {
 	stopped                bool
 	running                bool
 	mutex                  sync.Mutex
-	hasShownRebuildMessage bool // Track if we've shown the rebuild message
+	hasShownRebuildMessage bool          // Track if we've shown the rebuild message
 	doneChan               chan struct{} // Signal when queue is completely done
 }
 
@@ -225,13 +225,13 @@ func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 			}
 		}(i)
 	}
-	
+
 	// Start the job fetcher goroutine
 	q.startJobFetcher()
-	
+
 	// Start a goroutine to wait for all workers to finish and signal completion
 	go func() {
-		q.wg.Wait() // Wait for all workers to finish
+		q.wg.Wait()       // Wait for all workers to finish
 		close(q.doneChan) // Signal that the queue is completely done
 	}()
 }
@@ -460,7 +460,7 @@ func (q *RebuildQueue) fetchNextJob() (*RebuildJob, error) {
 		}
 
 		job, err = q.attemptFetchNextJob()
-		
+
 		if err == nil || err == sql.ErrNoRows {
 			return job, nil
 		}

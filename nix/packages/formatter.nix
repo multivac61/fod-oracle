@@ -54,6 +54,7 @@ let
       "hosts/t1/ssh_host_ed25519_key.pub"
       "modules/home/config/ghostty/config"
       "modules/home/config/tmux/tmux.conf"
+      "vendor/*"
     ];
   };
   formatter = treefmtEval.config.build.wrapper;
