@@ -23,10 +23,10 @@ func debugLogNix(format string, v ...interface{}) {
 // isFlakeReference checks if the expression looks like a flake reference
 func isFlakeReference(expr string) bool {
 	// Look for common flake URI patterns
-	return strings.HasPrefix(expr, "github:") || 
-		strings.HasPrefix(expr, "gitlab:") || 
-		strings.HasPrefix(expr, "git+") || 
-		strings.HasPrefix(expr, "flake:") || 
+	return strings.HasPrefix(expr, "github:") ||
+		strings.HasPrefix(expr, "gitlab:") ||
+		strings.HasPrefix(expr, "git+") ||
+		strings.HasPrefix(expr, "flake:") ||
 		strings.Contains(expr, "#") && !strings.Contains(expr, "{") && !strings.Contains(expr, "(")
 }
 
@@ -48,13 +48,13 @@ func evalFlakeReference(flakeRef string) (string, error) {
 	if attrPath != "" {
 		// Handle different formats of attribute paths with proper escaping
 		debugLogNix("Using nix build with flake reference: %s#%s", flakeURI, attrPath)
-		
+
 		// Use nix build with --dry-run and --derivation to get the .drv path
 		cmd = exec.Command("nix", "build", "--dry-run", "--derivation", "--print-out-paths", flakeRef)
 	} else {
 		// Just a flake URI without an attribute path - use the default package
 		debugLogNix("Using nix build with default package for flake: %s", flakeURI)
-		cmd = exec.Command("nix", "build", "--dry-run", "--derivation", "--print-out-paths", 
+		cmd = exec.Command("nix", "build", "--dry-run", "--derivation", "--print-out-paths",
 			fmt.Sprintf("%s#defaultPackage.x86_64-linux", flakeURI))
 	}
 
@@ -70,25 +70,25 @@ func evalFlakeReference(flakeRef string) (string, error) {
 
 	// If nix build failed or returned invalid output, try nix eval
 	debugLogNix("nix build approach failed, trying nix eval: %v", err)
-	
+
 	if attrPath != "" {
 		// For complex attribute paths, we need to carefully construct the expression
 		debugLogNix("Using nix eval with flake URI %s and attribute path %s", flakeURI, attrPath)
-		
+
 		// First try using direct drvPath access if the attribute is a derivation
-		cmd = exec.Command("nix", "eval", "--raw", "--impure", "--expr", 
+		cmd = exec.Command("nix", "eval", "--raw", "--impure", "--expr",
 			fmt.Sprintf("let pkg = %s; in builtins.tryEval (pkg.drvPath or pkg.outPath or \"\")", flakeRef))
 	} else {
 		// Just a flake URI without an attribute path - use the default package
 		debugLogNix("Using nix eval with default package for flake: %s", flakeURI)
-		cmd = exec.Command("nix", "eval", "--raw", "--impure", "--expr", 
+		cmd = exec.Command("nix", "eval", "--raw", "--impure", "--expr",
 			fmt.Sprintf("let pkg = %s.defaultPackage.x86_64-linux; in pkg.drvPath or pkg.outPath or \"\"", flakeURI))
 	}
 
 	// Run the nix eval command
 	output, err = cmd.CombinedOutput()
 	outStr := strings.TrimSpace(string(output))
-	
+
 	// Check if we got a valid derivation path
 	if err == nil && strings.HasPrefix(outStr, "/nix/store/") && strings.HasSuffix(outStr, ".drv") {
 		return outStr, nil
@@ -96,7 +96,7 @@ func evalFlakeReference(flakeRef string) (string, error) {
 
 	// Try another approach using nix-instantiate as a fallback
 	debugLogNix("nix eval approach failed (%v), trying nix-instantiate", err)
-	
+
 	// First check if the flake exists
 	fallbackCmd := exec.Command("nix", "flake", "show", "--json", flakeURI)
 	_, fallbackErr := fallbackCmd.CombinedOutput()
@@ -106,7 +106,7 @@ func evalFlakeReference(flakeRef string) (string, error) {
 
 	// Flake exists, now try to get the derivation path using nix-instantiate
 	debugLogNix("Flake reference resolved. Now evaluating to get derivation path...")
-	
+
 	// Determine how to construct the nix-instantiate expression
 	var nixInstantiateExpr string
 	if attrPath != "" {
@@ -126,29 +126,29 @@ func evalFlakeReference(flakeRef string) (string, error) {
 			in 
 				getAttr flake "%s"
 		`, flakeURI, attrPath)
-		
+
 		// For specific common patterns, use direct access
-		if strings.HasPrefix(attrPath, "legacyPackages.") || 
-		   strings.HasPrefix(attrPath, "packages.") || 
-		   strings.HasPrefix(attrPath, "nixosConfigurations.") {
+		if strings.HasPrefix(attrPath, "legacyPackages.") ||
+			strings.HasPrefix(attrPath, "packages.") ||
+			strings.HasPrefix(attrPath, "nixosConfigurations.") {
 			nixInstantiateExpr = fmt.Sprintf("(%s).%s", flakeURI, attrPath)
 		}
 	} else {
 		nixInstantiateExpr = fmt.Sprintf("(%s).defaultPackage.x86_64-linux", flakeURI)
 	}
-	
+
 	// Create a temporary file for the expression
 	tempDir, err := os.MkdirTemp("", "fod-oracle-flake")
 	if err != nil {
 		return "", fmt.Errorf("failed to create temporary directory: %w", err)
 	}
 	defer os.RemoveAll(tempDir)
-	
+
 	exprFile := filepath.Join(tempDir, "expr.nix")
-	if err := os.WriteFile(exprFile, []byte(nixInstantiateExpr), 0644); err != nil {
+	if err := os.WriteFile(exprFile, []byte(nixInstantiateExpr), 0o644); err != nil {
 		return "", fmt.Errorf("failed to write expression file: %w", err)
 	}
-	
+
 	cmd = exec.Command("nix-instantiate", exprFile)
 	output, err = cmd.CombinedOutput()
 	if err != nil {

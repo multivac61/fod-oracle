@@ -750,7 +750,7 @@ type ProcessingContext struct {
 
 func processDerivation(inputFile string, ctx *ProcessingContext) {
 	ctx.batcher.IncrementDrvCount()
-	
+
 	if config.Debug {
 		debugLog("PROCESS: Starting derivation %s", inputFile)
 	}

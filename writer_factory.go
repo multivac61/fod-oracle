@@ -26,12 +26,12 @@ func toSRIHash(algorithm, hexHash string) string {
 	if hexHash == "" {
 		return ""
 	}
-	
+
 	// Handle recursive hash algorithms like "r:sha256"
 	if strings.HasPrefix(algorithm, "r:") {
 		algorithm = strings.TrimPrefix(algorithm, "r:")
 	}
-	
+
 	// Use nix hash convert to get the canonical SRI format
 	cmd := exec.Command("nix", "hash", "convert", "--hash-algo", algorithm, "--from", "base16", hexHash)
 	output, err := cmd.Output()
@@ -39,7 +39,7 @@ func toSRIHash(algorithm, hexHash string) string {
 		// Fallback to empty string if nix command fails
 		return ""
 	}
-	
+
 	// Trim whitespace and return
 	return strings.TrimSpace(string(output))
 }
@@ -84,10 +84,10 @@ func NewJSONLinesWriter(db *sql.DB, revisionID int64) *JSONLinesWriter {
 func (w *JSONLinesWriter) AddFOD(fod FOD) {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
-	
+
 	// Always cache the FOD for potential later use
 	w.fodMap[fod.DrvPath] = &fod
-	
+
 	// Always output FODs immediately for streaming
 	if config.Reevaluate {
 		// In reevaluate mode, store in database for rebuild queue but don't output yet
@@ -107,18 +107,18 @@ func (w *JSONLinesWriter) IncrementDrvCount() {
 func (w *JSONLinesWriter) AddRebuildInfo(drvPath string, status, actualHash, errorMessage string) {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
-	
+
 	w.rebuildMap[drvPath] = &RebuildInfo{
 		Status:       status,
 		ActualHash:   actualHash,
 		ErrorMessage: errorMessage,
 	}
-	
+
 	// If FOD is not in cache, try to load it from database
 	if _, exists := w.fodMap[drvPath]; !exists {
 		w.loadFODFromDatabase(drvPath)
 	}
-	
+
 	// Immediately output this FOD as JSON Lines
 	w.outputFODAsJSONLine(drvPath)
 }
@@ -133,7 +133,7 @@ func (w *JSONLinesWriter) insertFODToDatabase(fod FOD) {
 		// Silently ignore database errors to not break JSON output
 		return
 	}
-	
+
 	// Also insert into drv_revisions table for rebuild queue
 	_, err = w.db.Exec(
 		"INSERT OR REPLACE INTO drv_revisions (drv_path, revision_id) VALUES (?, ?)",
@@ -152,7 +152,7 @@ func (w *JSONLinesWriter) loadFODFromDatabase(drvPath string) {
 		"SELECT drv_path, output_path, hash_algorithm, hash FROM fods WHERE drv_path = ?",
 		drvPath,
 	).Scan(&fod.DrvPath, &fod.OutputPath, &fod.HashAlgorithm, &fod.Hash)
-	
+
 	if err == nil {
 		w.fodMap[drvPath] = &fod
 	}
@@ -166,13 +166,13 @@ func (w *JSONLinesWriter) outputFODAsJSONLine(drvPath string) {
 		return // Skip if FOD not found in cache
 	}
 	fod := *fodPtr
-	
+
 	// Get rebuild info from cache
 	rebuildInfo, exists := w.rebuildMap[drvPath]
 	if !exists {
 		return // Skip if no rebuild info
 	}
-	
+
 	// Create FODWithRebuild struct with simplified hash fields
 	fodWithRebuild := FODWithRebuild{
 		DrvPath:       fod.DrvPath,
@@ -182,22 +182,22 @@ func (w *JSONLinesWriter) outputFODAsJSONLine(drvPath string) {
 		RebuildStatus: rebuildInfo.Status,
 		ErrorMessage:  rebuildInfo.ErrorMessage,
 	}
-	
+
 	// Determine if there's a hash mismatch
-	hashMismatch := rebuildInfo.Status == "hash_mismatch" || 
+	hashMismatch := rebuildInfo.Status == "hash_mismatch" ||
 		(rebuildInfo.ActualHash != "" && rebuildInfo.ActualHash != fod.Hash)
 	fodWithRebuild.HashMismatch = hashMismatch
-	
+
 	// Output as JSON line to stdout
 	jsonBytes, err := json.Marshal(fodWithRebuild)
 	if err != nil {
 		return // Skip if JSON marshaling fails
 	}
-	
+
 	fmt.Println(string(jsonBytes))
 	// Force flush to ensure immediate output
 	os.Stdout.Sync()
-	
+
 	// Debug: Log when FOD is output (only when debug is enabled)
 	if config.Debug {
 		debugLog("OUTPUT: FOD %s", fod.DrvPath)
@@ -216,13 +216,13 @@ func (w *JSONLinesWriter) outputBasicFODAsJSONLine(fod FOD) {
 		OutputPath:   fod.OutputPath,
 		ExpectedHash: toSRIHash(fod.HashAlgorithm, fod.Hash),
 	}
-	
+
 	// Output as JSON line to stdout
 	jsonBytes, err := json.Marshal(basicFOD)
 	if err != nil {
 		return // Skip if JSON marshaling fails
 	}
-	
+
 	fmt.Println(string(jsonBytes))
 	// Force flush to ensure immediate output
 	os.Stdout.Sync()
