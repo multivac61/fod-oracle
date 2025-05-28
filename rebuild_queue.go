@@ -57,6 +57,7 @@ type RebuildQueue struct {
 	running                bool
 	mutex                  sync.Mutex
 	hasShownRebuildMessage bool // Track if we've shown the rebuild message
+	doneChan               chan struct{} // Signal when queue is completely done
 }
 
 // NewRebuildQueue creates a new rebuild queue
@@ -66,6 +67,7 @@ func NewRebuildQueue(db *sql.DB, concurrency int, delaySeconds int) *RebuildQueu
 		buildChan: make(chan RebuildJob, concurrency*2),
 		delay:     time.Duration(delaySeconds) * time.Second,
 		wg:        &sync.WaitGroup{},
+		doneChan:  make(chan struct{}),
 		running:   false,
 		stopped:   false,
 	}
@@ -226,6 +228,12 @@ func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 	
 	// Start the job fetcher goroutine
 	q.startJobFetcher()
+	
+	// Start a goroutine to wait for all workers to finish and signal completion
+	go func() {
+		q.wg.Wait() // Wait for all workers to finish
+		close(q.doneChan) // Signal that the queue is completely done
+	}()
 }
 
 // ensureRebuildQueueTableExists creates the rebuild_queue table if it doesn't exist
@@ -393,6 +401,11 @@ func (q *RebuildQueue) IsRunning() bool {
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 	return q.running
+}
+
+// Done returns a channel that will be closed when the queue is completely finished
+func (q *RebuildQueue) Done() <-chan struct{} {
+	return q.doneChan
 }
 
 // Stop stops the rebuild queue runner

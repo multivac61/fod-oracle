@@ -1773,10 +1773,9 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string, writer Writer) err
 	var maxWaitTime time.Duration = 10 * time.Minute
 	startTime := time.Now()
 
-	// Instead of using a separate goroutine, use a ticker with more frequent
-	// updates so we can check both for completion and provide status updates
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	// Use a status ticker for progress updates only
+	statusTicker := time.NewTicker(5 * time.Second) // Status updates every 5 seconds
+	defer statusTicker.Stop()
 
 	// Setup a timeout to prevent hanging
 	timeout := time.NewTimer(maxWaitTime)
@@ -1800,21 +1799,20 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string, writer Writer) err
 			}
 			return fmt.Errorf("rebuild queue timed out after %v", maxWaitTime)
 
-		case <-ticker.C:
-			// Check if the queue is done
-			if !queue.IsRunning() {
-				// Get final stats
-				stats, err := queue.GetQueueStats(revisionID)
-				if err != nil {
-					debugLog("[%s] Error getting final queue stats: %v", identifier, err)
-				} else {
-					debugLog("[%s] Reevaluation complete. Total: %d, Success: %d, Hash Mismatch: %d, Failure: %d, Timeout: %d",
-						identifier, stats["total"], stats["success"], stats["hash_mismatch"], stats["failure"], stats["timeout"])
-				}
-				return nil
+		case <-queue.Done():
+			// Queue is completely finished - immediate exit!
+			debugLog("[%s] Queue completion signal received - exiting immediately", identifier)
+			stats, err := queue.GetQueueStats(revisionID)
+			if err != nil {
+				debugLog("[%s] Error getting final queue stats: %v", identifier, err)
+			} else {
+				debugLog("[%s] Reevaluation complete. Total: %d, Success: %d, Hash Mismatch: %d, Failure: %d, Timeout: %d",
+					identifier, stats["total"], stats["success"], stats["hash_mismatch"], stats["failure"], stats["timeout"])
 			}
+			return nil
 
-			// Provide status update
+		case <-statusTicker.C:
+			// Provide status update (every 5 seconds)
 			stats, err := queue.GetQueueStats(revisionID)
 			if err != nil {
 				debugLog("[%s] Error getting queue stats: %v", identifier, err)

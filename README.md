@@ -60,13 +60,15 @@ FOD Oracle outputs all results as streaming JSON Lines to stdout, making it easy
 
 **Normal Mode**: Outputs basic FOD information as JSON Lines
 ```json
-{"DrvPath":"/nix/store/...","OutputPath":"/nix/store/...","HashAlgorithm":"sha256","Hash":"..."}
+{"DrvPath":"/nix/store/...","OutputPath":"/nix/store/...","HashAlgorithm":"sha256","Hash":"...","SRIHash":"sha256-..."}
 ```
 
 **Reevaluate Mode**: Includes rebuild verification results
 ```json
-{"DrvPath":"/nix/store/...","OutputPath":"/nix/store/...","HashAlgorithm":"sha256","Hash":"...","rebuild_status":"success","actual_hash":"...","hash_mismatch":false}
+{"DrvPath":"/nix/store/...","OutputPath":"/nix/store/...","HashAlgorithm":"sha256","Hash":"...","SRIHash":"sha256-...","rebuild_status":"success","actual_hash":"...","actual_sri_hash":"sha256-...","hash_mismatch":false}
 ```
+
+The SRI hashes (`SRIHash` and `actual_sri_hash`) are generated using `nix hash convert` and are in the exact format used by Nix expressions, making them directly greppable in the nixpkgs codebase.
 
 Scanning a complete nixpkgs revision takes around 10+ minutes on a 7950 AMD Ryzen 9 16-core CPU with 62GB RAM.
 

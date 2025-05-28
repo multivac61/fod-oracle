@@ -4,19 +4,46 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os/exec"
+	"strings"
 	"sync"
 )
 
 // FODWithRebuild extends FOD with rebuild information
 type FODWithRebuild struct {
-	DrvPath       string `json:"DrvPath"`
-	OutputPath    string `json:"OutputPath"`
-	HashAlgorithm string `json:"HashAlgorithm"`
-	Hash          string `json:"Hash"`
-	RebuildStatus string `json:"rebuild_status,omitempty"`
-	ActualHash    string `json:"actual_hash,omitempty"`
-	HashMismatch  bool   `json:"hash_mismatch"`
-	ErrorMessage  string `json:"error_message,omitempty"`
+	DrvPath         string `json:"DrvPath"`
+	OutputPath      string `json:"OutputPath"`
+	HashAlgorithm   string `json:"HashAlgorithm"`
+	Hash            string `json:"Hash"`
+	SRIHash         string `json:"SRIHash"`
+	RebuildStatus   string `json:"rebuild_status,omitempty"`
+	ActualHash      string `json:"actual_hash,omitempty"`
+	ActualSRIHash   string `json:"actual_sri_hash,omitempty"`
+	HashMismatch    bool   `json:"hash_mismatch"`
+	ErrorMessage    string `json:"error_message,omitempty"`
+}
+
+// toSRIHash converts a hash algorithm and hex hash to SRI format using nix hash convert
+func toSRIHash(algorithm, hexHash string) string {
+	if hexHash == "" {
+		return ""
+	}
+	
+	// Handle recursive hash algorithms like "r:sha256"
+	if strings.HasPrefix(algorithm, "r:") {
+		algorithm = strings.TrimPrefix(algorithm, "r:")
+	}
+	
+	// Use nix hash convert to get the canonical SRI format
+	cmd := exec.Command("nix", "hash", "convert", "--hash-algo", algorithm, "--from", "base16", hexHash)
+	output, err := cmd.Output()
+	if err != nil {
+		// Fallback to empty string if nix command fails
+		return ""
+	}
+	
+	// Trim whitespace and return
+	return strings.TrimSpace(string(output))
 }
 
 // Writer is an interface for writing FOD data
@@ -63,11 +90,13 @@ func (w *JSONLinesWriter) AddFOD(fod FOD) {
 	// Always cache the FOD for potential later use
 	w.fodMap[fod.DrvPath] = &fod
 	
-	// In normal mode (non-reevaluate), output FODs immediately without rebuild info
-	if !config.Reevaluate {
+	// In reevaluate mode, we need to store FODs in the database for the rebuild queue
+	if config.Reevaluate {
+		w.insertFODToDatabase(fod)
+	} else {
+		// In normal mode, output FODs immediately without rebuild info
 		w.outputBasicFODAsJSONLine(fod)
 	}
-	// In reevaluate mode, FODs are output when rebuild info is added
 }
 
 // IncrementDrvCount is a no-op for JSON Lines writer
@@ -86,8 +115,48 @@ func (w *JSONLinesWriter) AddRebuildInfo(drvPath string, status, actualHash, err
 		ErrorMessage: errorMessage,
 	}
 	
+	// If FOD is not in cache, try to load it from database
+	if _, exists := w.fodMap[drvPath]; !exists {
+		w.loadFODFromDatabase(drvPath)
+	}
+	
 	// Immediately output this FOD as JSON Lines
 	w.outputFODAsJSONLine(drvPath)
+}
+
+// insertFODToDatabase inserts a FOD into the database
+func (w *JSONLinesWriter) insertFODToDatabase(fod FOD) {
+	_, err := w.db.Exec(
+		"INSERT OR REPLACE INTO fods (drv_path, output_path, hash_algorithm, hash) VALUES (?, ?, ?, ?)",
+		fod.DrvPath, fod.OutputPath, fod.HashAlgorithm, fod.Hash,
+	)
+	if err != nil {
+		// Silently ignore database errors to not break JSON output
+		return
+	}
+	
+	// Also insert into drv_revisions table for rebuild queue
+	_, err = w.db.Exec(
+		"INSERT OR REPLACE INTO drv_revisions (drv_path, revision_id) VALUES (?, ?)",
+		fod.DrvPath, w.revisionID,
+	)
+	if err != nil {
+		// Silently ignore database errors to not break JSON output
+		return
+	}
+}
+
+// loadFODFromDatabase loads FOD information from the database into the cache
+func (w *JSONLinesWriter) loadFODFromDatabase(drvPath string) {
+	var fod FOD
+	err := w.db.QueryRow(
+		"SELECT drv_path, output_path, hash_algorithm, hash FROM fods WHERE drv_path = ?",
+		drvPath,
+	).Scan(&fod.DrvPath, &fod.OutputPath, &fod.HashAlgorithm, &fod.Hash)
+	
+	if err == nil {
+		w.fodMap[drvPath] = &fod
+	}
 }
 
 // outputFODAsJSONLine outputs a single FOD with rebuild info as a JSON line
@@ -111,8 +180,10 @@ func (w *JSONLinesWriter) outputFODAsJSONLine(drvPath string) {
 		OutputPath:    fod.OutputPath,
 		HashAlgorithm: fod.HashAlgorithm,
 		Hash:          fod.Hash,
+		SRIHash:       toSRIHash(fod.HashAlgorithm, fod.Hash),
 		RebuildStatus: rebuildInfo.Status,
 		ActualHash:    rebuildInfo.ActualHash,
+		ActualSRIHash: toSRIHash(fod.HashAlgorithm, rebuildInfo.ActualHash),
 		ErrorMessage:  rebuildInfo.ErrorMessage,
 	}
 	
@@ -138,11 +209,13 @@ func (w *JSONLinesWriter) outputBasicFODAsJSONLine(fod FOD) {
 		OutputPath    string `json:"OutputPath"`
 		HashAlgorithm string `json:"HashAlgorithm"`
 		Hash          string `json:"Hash"`
+		SRIHash       string `json:"SRIHash"`
 	}{
 		DrvPath:       fod.DrvPath,
 		OutputPath:    fod.OutputPath,
 		HashAlgorithm: fod.HashAlgorithm,
 		Hash:          fod.Hash,
+		SRIHash:       toSRIHash(fod.HashAlgorithm, fod.Hash),
 	}
 	
 	// Output as JSON line to stdout
