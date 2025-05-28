@@ -16,6 +16,7 @@ import (
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/hook"
+	"github.com/pocketbase/pocketbase/tools/types"
 )
 
 // startWebInterface starts the PocketBase web interface
@@ -344,30 +345,228 @@ func setupFODCollections(app core.App) error {
 	fodCollection, _ := app.FindCollectionByNameOrId("fods")
 	evaluationCollection, _ := app.FindCollectionByNameOrId("evaluations")
 
+	// Create FODs collection if it doesn't exist
 	if fodCollection == nil {
-		debugLog("FODs collection not found - please create via admin interface")
-		debugLog("Recommended FODs collection schema:")
-		debugLog("  - drv_path (text, required): Derivation path")
-		debugLog("  - output_path (text, required): Output path")
-		debugLog("  - expected_hash (text): Expected hash")
-		debugLog("  - actual_hash (text): Actual hash from rebuild")
-		debugLog("  - rebuild_status (select): pending|success|failed")
-		debugLog("  - hash_mismatch (bool): Whether hashes match")
-		debugLog("  - evaluation_id (relation to evaluations): Link to evaluation run")
+		debugLog("Creating FODs collection...")
+		collection := core.NewBaseCollection("fods")
+
+		// Set public read access
+		collection.ListRule = types.Pointer("")  // Allow public list access
+		collection.ViewRule = types.Pointer("")  // Allow public view access
+
+		// Add fields
+		collection.Fields.Add(&core.TextField{
+			Name:     "drv_path",
+			Required: true,
+		})
+		collection.Fields.Add(&core.TextField{
+			Name:     "output_path",
+			Required: true,
+		})
+		collection.Fields.Add(&core.TextField{
+			Name: "hash_algorithm",
+		})
+		collection.Fields.Add(&core.TextField{
+			Name: "expected_hash",
+		})
+		collection.Fields.Add(&core.TextField{
+			Name: "actual_hash",
+		})
+		collection.Fields.Add(&core.SelectField{
+			Name:   "rebuild_status",
+			Values: []string{"discovered", "pending", "success", "failed", "timeout", "hash_mismatch"},
+		})
+		collection.Fields.Add(&core.BoolField{
+			Name: "hash_mismatch",
+		})
+		collection.Fields.Add(&core.TextField{
+			Name: "error_message",
+		})
+		collection.Fields.Add(&core.TextField{
+			Name: "evaluation_id",
+		})
+		collection.Fields.Add(&core.DateField{
+			Name: "discovered_at",
+		})
+
+		// Add standard PocketBase system fields
+		collection.Fields.Add(&core.AutodateField{
+			Name:     "created",
+			OnCreate: true,
+		})
+		collection.Fields.Add(&core.AutodateField{
+			Name:     "updated", 
+			OnCreate: true,
+			OnUpdate: true,
+		})
+
+		if err := app.Save(collection); err != nil {
+			debugLog("Failed to create FODs collection: %v", err)
+			return err
+		} else {
+			debugLog("✅ FODs collection created successfully")
+		}
+	} else {
+		debugLog("✅ FODs collection exists")
+		// Update permissions if they're not set correctly
+		needsUpdate := false
+		if fodCollection.ListRule == nil || *fodCollection.ListRule != "" {
+			fodCollection.ListRule = types.Pointer("")
+			fodCollection.ViewRule = types.Pointer("")
+			needsUpdate = true
+		}
+		
+		// Check if standard PocketBase fields exist, add them if missing
+		hasCreated := false
+		hasUpdated := false
+		for _, field := range fodCollection.Fields {
+			if field.GetName() == "created" {
+				hasCreated = true
+			}
+			if field.GetName() == "updated" {
+				hasUpdated = true
+			}
+		}
+		
+		if !hasCreated {
+			fodCollection.Fields.Add(&core.AutodateField{
+				Name:     "created",
+				OnCreate: true,
+			})
+			needsUpdate = true
+		}
+		
+		if !hasUpdated {
+			fodCollection.Fields.Add(&core.AutodateField{
+				Name:     "updated",
+				OnCreate: true,
+				OnUpdate: true,
+			})
+			needsUpdate = true
+		}
+		
+		if needsUpdate {
+			if err := app.Save(fodCollection); err != nil {
+				debugLog("Failed to update FODs collection: %v", err)
+			} else {
+				debugLog("✅ Updated FODs collection")
+			}
+		}
 	}
 
+	// Create evaluations collection if it doesn't exist
 	if evaluationCollection == nil {
-		debugLog("Evaluations collection not found - please create via admin interface")
-		debugLog("Recommended Evaluations collection schema:")
-		debugLog("  - input (text, required): Nix expression input")
-		debugLog("  - status (select): running|completed|failed")
-		debugLog("  - start_time (datetime): When evaluation started")
-		debugLog("  - end_time (datetime): When evaluation finished")
-		debugLog("  - total_fods (number): Total FODs found")
-		debugLog("  - failed_fods (number): Number of failed FODs")
+		debugLog("Creating evaluations collection...")
+		collection := core.NewBaseCollection("evaluations")
+
+		// Set public read access
+		collection.ListRule = types.Pointer("")  // Allow public list access
+		collection.ViewRule = types.Pointer("")  // Allow public view access
+
+		// Add fields
+		collection.Fields.Add(&core.TextField{
+			Name:     "evaluation_id",
+			Required: true,
+		})
+		collection.Fields.Add(&core.TextField{
+			Name:     "input",
+			Required: true,
+		})
+		collection.Fields.Add(&core.SelectField{
+			Name:   "status",
+			Values: []string{"running", "completed", "failed"},
+		})
+		collection.Fields.Add(&core.DateField{
+			Name: "start_time",
+		})
+		collection.Fields.Add(&core.DateField{
+			Name: "end_time",
+		})
+		collection.Fields.Add(&core.NumberField{
+			Name: "total_fods",
+		})
+		collection.Fields.Add(&core.NumberField{
+			Name: "processed_fods",
+		})
+		collection.Fields.Add(&core.NumberField{
+			Name: "failed_fods",
+		})
+		collection.Fields.Add(&core.TextField{
+			Name: "current_package",
+		})
+		collection.Fields.Add(&core.NumberField{
+			Name: "progress_percent",
+		})
+		collection.Fields.Add(&core.DateField{
+			Name: "last_update",
+		})
+
+		// Add standard PocketBase system fields
+		collection.Fields.Add(&core.AutodateField{
+			Name:     "created",
+			OnCreate: true,
+		})
+		collection.Fields.Add(&core.AutodateField{
+			Name:     "updated",
+			OnCreate: true,
+			OnUpdate: true,
+		})
+
+		if err := app.Save(collection); err != nil {
+			debugLog("Failed to create evaluations collection: %v", err)
+			return err
+		} else {
+			debugLog("✅ Evaluations collection created successfully")
+		}
+	} else {
+		debugLog("✅ Evaluations collection exists")
+		// Update permissions if they're not set correctly
+		needsUpdate := false
+		if evaluationCollection.ListRule == nil || *evaluationCollection.ListRule != "" {
+			evaluationCollection.ListRule = types.Pointer("")
+			evaluationCollection.ViewRule = types.Pointer("")
+			needsUpdate = true
+		}
+		
+		// Check if standard PocketBase fields exist, add them if missing
+		hasCreated := false
+		hasUpdated := false
+		for _, field := range evaluationCollection.Fields {
+			if field.GetName() == "created" {
+				hasCreated = true
+			}
+			if field.GetName() == "updated" {
+				hasUpdated = true
+			}
+		}
+		
+		if !hasCreated {
+			evaluationCollection.Fields.Add(&core.AutodateField{
+				Name:     "created",
+				OnCreate: true,
+			})
+			needsUpdate = true
+		}
+		
+		if !hasUpdated {
+			evaluationCollection.Fields.Add(&core.AutodateField{
+				Name:     "updated",
+				OnCreate: true,
+				OnUpdate: true,
+			})
+			needsUpdate = true
+		}
+		
+		if needsUpdate {
+			if err := app.Save(evaluationCollection); err != nil {
+				debugLog("Failed to update evaluations collection: %v", err)
+			} else {
+				debugLog("✅ Updated evaluations collection")
+			}
+		}
 	}
 
-	debugLog("Collections setup complete - use admin interface at /_/ to create missing collections")
+	debugLog("Collections setup complete")
 	return nil
 }
 

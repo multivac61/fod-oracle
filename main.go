@@ -1746,6 +1746,17 @@ func main() {
 	cleanupWorktrees()
 
 	debugLog("All revisions processed in %v", time.Since(startTime))
+
+	// If web interface is enabled, keep the application running
+	if *webFlag {
+		debugLog("Keeping application running for web interface...")
+		log.Printf("🎯 Web interface running at http://%s:%d", *hostFlag, *portFlag)
+		log.Printf("📊 Dashboard: http://%s:%d/realtime", *hostFlag, *portFlag) 
+		log.Printf("🛠️ Admin: http://%s:%d/_/", *hostFlag, *portFlag)
+		
+		// Block forever to keep the web server running
+		select {}
+	}
 }
 
 // processTestDerivation processes a single derivation for testing purposes
