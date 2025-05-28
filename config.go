@@ -5,12 +5,6 @@ type Config struct {
 	// IsNixExpr indicates if we're processing a Nix expression rather than a revision
 	IsNixExpr bool
 
-	// OutputFormat specifies the output format (sqlite, json, csv, parquet)
-	OutputFormat string
-
-	// OutputPath specifies the path where output files should be written
-	OutputPath string
-
 	// WorkerCount specifies how many worker threads to use
 	WorkerCount int
 
@@ -22,6 +16,9 @@ type Config struct {
 
 	// ParallelWorkers is the number of parallel rebuild workers
 	ParallelWorkers int
+
+	// Debug enables debug logging
+	Debug bool
 }
 
 // Global configuration instance

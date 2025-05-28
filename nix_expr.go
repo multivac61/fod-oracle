@@ -13,8 +13,185 @@ import (
 	"github.com/nix-community/go-nix/pkg/derivation"
 )
 
+// debugLogNix logs a message only if debug mode is enabled
+func debugLogNix(format string, v ...interface{}) {
+	if config.Debug {
+		log.Printf(format, v...)
+	}
+}
+
+// isFlakeReference checks if the expression looks like a flake reference
+func isFlakeReference(expr string) bool {
+	// Look for common flake URI patterns
+	return strings.HasPrefix(expr, "github:") || 
+		strings.HasPrefix(expr, "gitlab:") || 
+		strings.HasPrefix(expr, "git+") || 
+		strings.HasPrefix(expr, "flake:") || 
+		strings.Contains(expr, "#") && !strings.Contains(expr, "{") && !strings.Contains(expr, "(")
+}
+
+// evalFlakeReference evaluates a flake reference and returns the derivation path
+func evalFlakeReference(flakeRef string) (string, error) {
+	debugLogNix("Evaluating flake reference: %s", flakeRef)
+
+	// Check if we have a flake reference with attribute path
+	parts := strings.SplitN(flakeRef, "#", 2)
+	flakeURI := parts[0]
+	attrPath := ""
+	if len(parts) > 1 {
+		attrPath = parts[1]
+	}
+
+	var cmd *exec.Cmd
+
+	// Try using nix build with --derivation flag first, which is more reliable for complex flake references
+	if attrPath != "" {
+		// Handle different formats of attribute paths with proper escaping
+		debugLogNix("Using nix build with flake reference: %s#%s", flakeURI, attrPath)
+		
+		// Use nix build with --dry-run and --derivation to get the .drv path
+		cmd = exec.Command("nix", "build", "--dry-run", "--derivation", "--print-out-paths", flakeRef)
+	} else {
+		// Just a flake URI without an attribute path - use the default package
+		debugLogNix("Using nix build with default package for flake: %s", flakeURI)
+		cmd = exec.Command("nix", "build", "--dry-run", "--derivation", "--print-out-paths", 
+			fmt.Sprintf("%s#defaultPackage.x86_64-linux", flakeURI))
+	}
+
+	// Run the command
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		// Successfully got the derivation path with nix build
+		outStr := strings.TrimSpace(string(output))
+		if strings.HasPrefix(outStr, "/nix/store/") && strings.HasSuffix(outStr, ".drv") {
+			return outStr, nil
+		}
+	}
+
+	// If nix build failed or returned invalid output, try nix eval
+	debugLogNix("nix build approach failed, trying nix eval: %v", err)
+	
+	if attrPath != "" {
+		// For complex attribute paths, we need to carefully construct the expression
+		debugLogNix("Using nix eval with flake URI %s and attribute path %s", flakeURI, attrPath)
+		
+		// First try using direct drvPath access if the attribute is a derivation
+		cmd = exec.Command("nix", "eval", "--raw", "--impure", "--expr", 
+			fmt.Sprintf("let pkg = %s; in builtins.tryEval (pkg.drvPath or pkg.outPath or \"\")", flakeRef))
+	} else {
+		// Just a flake URI without an attribute path - use the default package
+		debugLogNix("Using nix eval with default package for flake: %s", flakeURI)
+		cmd = exec.Command("nix", "eval", "--raw", "--impure", "--expr", 
+			fmt.Sprintf("let pkg = %s.defaultPackage.x86_64-linux; in pkg.drvPath or pkg.outPath or \"\"", flakeURI))
+	}
+
+	// Run the nix eval command
+	output, err = cmd.CombinedOutput()
+	outStr := strings.TrimSpace(string(output))
+	
+	// Check if we got a valid derivation path
+	if err == nil && strings.HasPrefix(outStr, "/nix/store/") && strings.HasSuffix(outStr, ".drv") {
+		return outStr, nil
+	}
+
+	// Try another approach using nix-instantiate as a fallback
+	debugLogNix("nix eval approach failed (%v), trying nix-instantiate", err)
+	
+	// First check if the flake exists
+	fallbackCmd := exec.Command("nix", "flake", "show", "--json", flakeURI)
+	_, fallbackErr := fallbackCmd.CombinedOutput()
+	if fallbackErr != nil {
+		return "", fmt.Errorf("failed to evaluate flake reference, flake does not exist: %s: %w", string(output), err)
+	}
+
+	// Flake exists, now try to get the derivation path using nix-instantiate
+	debugLogNix("Flake reference resolved. Now evaluating to get derivation path...")
+	
+	// Determine how to construct the nix-instantiate expression
+	var nixInstantiateExpr string
+	if attrPath != "" {
+		// Construct a more robust expression that handles various attribute path formats
+		nixInstantiateExpr = fmt.Sprintf(`
+			let 
+				flake = %s;
+				getAttr = attrs: path:
+					let
+						parts = builtins.split "\\." path;
+						first = builtins.head parts;
+						rest = builtins.concatStringsSep "." (builtins.tail parts);
+					in
+						if parts == [] then attrs
+						else if builtins.length parts == 1 then attrs.${first}
+						else getAttr attrs.${first} rest;
+			in 
+				getAttr flake "%s"
+		`, flakeURI, attrPath)
+		
+		// For specific common patterns, use direct access
+		if strings.HasPrefix(attrPath, "legacyPackages.") || 
+		   strings.HasPrefix(attrPath, "packages.") || 
+		   strings.HasPrefix(attrPath, "nixosConfigurations.") {
+			nixInstantiateExpr = fmt.Sprintf("(%s).%s", flakeURI, attrPath)
+		}
+	} else {
+		nixInstantiateExpr = fmt.Sprintf("(%s).defaultPackage.x86_64-linux", flakeURI)
+	}
+	
+	// Create a temporary file for the expression
+	tempDir, err := os.MkdirTemp("", "fod-oracle-flake")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+	
+	exprFile := filepath.Join(tempDir, "expr.nix")
+	if err := os.WriteFile(exprFile, []byte(nixInstantiateExpr), 0644); err != nil {
+		return "", fmt.Errorf("failed to write expression file: %w", err)
+	}
+	
+	cmd = exec.Command("nix-instantiate", exprFile)
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		// Try a direct instantiation as last resort
+		if attrPath != "" {
+			cmd = exec.Command("nix-instantiate", "--expr", fmt.Sprintf("builtins.getFlake \"%s\".%s", flakeURI, attrPath))
+		} else {
+			cmd = exec.Command("nix-instantiate", "--expr", fmt.Sprintf("builtins.getFlake \"%s\".defaultPackage.x86_64-linux", flakeURI))
+		}
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("all approaches failed to evaluate flake reference: %s: %w", string(output), err)
+		}
+	}
+
+	// Get the derivation path, stripping warning messages
+	outStr = strings.TrimSpace(string(output))
+	lines := strings.Split(outStr, "\n")
+
+	// Get the last line which should be the actual derivation path
+	drvPath := ""
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(line, "/nix/store/") && strings.HasSuffix(line, ".drv") {
+			drvPath = line
+			break
+		}
+	}
+
+	if drvPath == "" {
+		return "", fmt.Errorf("no valid derivation path found in output: %s", outStr)
+	}
+
+	return drvPath, nil
+}
+
 // evalNixExpression evaluates a Nix expression and returns the derivation path
 func evalNixExpression(expr string) (string, error) {
+	// First check if this is a flake reference
+	if isFlakeReference(expr) {
+		return evalFlakeReference(expr)
+	}
+
 	// Create a temporary directory
 	tempDir, err := os.MkdirTemp("", "fod-oracle-expr")
 	if err != nil {
@@ -27,12 +204,12 @@ func evalNixExpression(expr string) (string, error) {
 	// Try to handle different types of inputs
 	if !strings.Contains(expr, "let") && !strings.Contains(expr, "import") && !strings.Contains(expr, "=") {
 		// Simple package name like "hello"
-		log.Printf("Evaluating as simple package: %s", expr)
+		debugLogNix("Evaluating as simple package: %s", expr)
 		cmd = exec.Command("nix-instantiate", "<nixpkgs>", "-A", expr)
 	} else {
 		// Create a temporary Nix file with the expression
 		exprFile := filepath.Join(tempDir, "expr.nix")
-		log.Printf("Using Nix expression file with: %s", expr)
+		debugLogNix("Using Nix expression file with: %s", expr)
 		if err := os.WriteFile(exprFile, []byte(expr), 0o644); err != nil {
 			return "", fmt.Errorf("failed to write expression file: %w", err)
 		}
@@ -69,7 +246,7 @@ func evalNixExpression(expr string) (string, error) {
 
 // processNixExpression processes a Nix expression directly
 func processNixExpression(expr string, revisionID int64, db *sql.DB, writer Writer) error {
-	log.Printf("Processing Nix expression: %s", expr)
+	debugLogNix("Processing Nix expression: %s", expr)
 
 	// Mark this as a Nix expression
 	config.IsNixExpr = true
@@ -80,7 +257,7 @@ func processNixExpression(expr string, revisionID int64, db *sql.DB, writer Writ
 		return fmt.Errorf("failed to evaluate expression: %w", err)
 	}
 
-	log.Printf("Expression evaluated to derivation: %s", drvPath)
+	debugLogNix("Expression evaluated to derivation: %s", drvPath)
 
 	// Use the writer passed from main
 
@@ -107,14 +284,14 @@ func processNixExpression(expr string, revisionID int64, db *sql.DB, writer Writ
 		// Process the derivation
 		file, err := os.Open(path)
 		if err != nil {
-			log.Printf("Error opening file %s: %v", path, err)
+			debugLogNix("Error opening file %s: %v", path, err)
 			continue
 		}
 
 		drv, err := derivation.ReadDerivation(file)
 		file.Close()
 		if err != nil {
-			log.Printf("Error reading derivation %s: %v", path, err)
+			debugLogNix("Error reading derivation %s: %v", path, err)
 			continue
 		}
 
@@ -130,10 +307,10 @@ func processNixExpression(expr string, revisionID int64, db *sql.DB, writer Writ
 				writer.AddFOD(fod)
 				fodCount++
 				if fodCount%10 == 0 {
-					log.Printf("Found %d FODs so far", fodCount)
+					debugLogNix("Found %d FODs so far", fodCount)
 				}
 				if os.Getenv("VERBOSE") == "1" {
-					log.Printf("Found FOD: %s (output: %s, hash: %s)",
+					debugLogNix("Found FOD: %s (output: %s, hash: %s)",
 						filepath.Base(path), name, out.Hash)
 				}
 				break
@@ -150,15 +327,7 @@ func processNixExpression(expr string, revisionID int64, db *sql.DB, writer Writ
 	writer.Flush()
 
 	// Print results
-	if config.OutputFormat == "sqlite" {
-		var dbFodCount int
-		if err := db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&dbFodCount); err != nil {
-			log.Printf("Error counting FODs: %v", err)
-		}
-		log.Printf("Found %d FODs for expression (stored %d in database)", fodCount, dbFodCount)
-	} else {
-		log.Printf("Found %d FODs for expression", fodCount)
-	}
+	debugLogNix("Found %d FODs for expression", fodCount)
 
 	return nil
 }

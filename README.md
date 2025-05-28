@@ -21,9 +21,9 @@ FOD Oracle is a tool for tracking and analyzing fixed-output derivations (FODs) 
 ## Features
 
 - **FOD Tracking**: Scans nixpkgs revisions and tracks all fixed-output derivations
-- **Comparison Tools**: Compare FODs between different nixpkgs revisions
+- **JSON Lines Streaming**: Outputs FODs as streaming JSON Lines for real-time processing
+- **FOD Rebuilding**: Verifies FOD integrity by rebuilding and comparing hashes
 - **API**: RESTful API for programmatic access to FOD data
-- **Web UI**: User-friendly interface for exploring and comparing FOD data
 
 ## Components
 
@@ -34,24 +34,38 @@ FOD Oracle is a tool for tracking and analyzing fixed-output derivations (FODs) 
 
 ### CLI
 
+FOD Oracle outputs all results as streaming JSON Lines to stdout, making it easy to process with tools like `jq` or pipe to other programs.
+
 ```bash
-# Process a simple Nix expression
+# Process a simple Nix expression (outputs JSON Lines)
 ./fod-oracle -expr "(import <nixpkgs> {}).hello"
 
-# Process a specific nixpkgs revision
+# Process a specific nixpkgs revision  
 ./fod-oracle 1d250f4
 
-# Reevaluate FODs by rebuilding them (with parallel workers)
+# Reevaluate FODs by rebuilding them (includes rebuild status in JSON)
 ./fod-oracle -reevaluate -parallel=4 -build-delay=5 1d250f4
 
-# Output to JSON format
-./fod-oracle -format=json -output=./output.json -expr "hello"
+# Enable debug logging
+./fod-oracle -debug -expr "(import <nixpkgs> {}).hello"
 
-# Output to CSV format
-./fod-oracle -format=csv -output=./output.csv -expr "hello"
+# Process and filter with jq
+./fod-oracle -expr "(import <nixpkgs> {}).hello" | jq '.Hash'
 
-# Output to Parquet format
-./fod-oracle -format=parquet -output=./output.parquet -expr "hello"
+# Save JSON Lines to file
+./fod-oracle 1d250f4 > fods.jsonl
+```
+
+#### Output Formats
+
+**Normal Mode**: Outputs basic FOD information as JSON Lines
+```json
+{"DrvPath":"/nix/store/...","OutputPath":"/nix/store/...","HashAlgorithm":"sha256","Hash":"..."}
+```
+
+**Reevaluate Mode**: Includes rebuild verification results
+```json
+{"DrvPath":"/nix/store/...","OutputPath":"/nix/store/...","HashAlgorithm":"sha256","Hash":"...","rebuild_status":"success","actual_hash":"...","hash_mismatch":false}
 ```
 
 Scanning a complete nixpkgs revision takes around 10+ minutes on a 7950 AMD Ryzen 9 16-core CPU with 62GB RAM.
@@ -62,20 +76,18 @@ Scanning a complete nixpkgs revision takes around 10+ minutes on a 7950 AMD Ryze
 Usage: ./fod-oracle [options] <nixpkgs-revision> [<nixpkgs-revision2> ...]
 
 Options:
+  -debug
+    	Enable debug logging to stderr
   -drv string
     	Derivation path for test mode
-  -expr
+  -expr string
     	Process a Nix expression instead of a revision
-  -format string
-    	Output format (sqlite, json, csv, parquet) (default "sqlite")
   -help
     	Show help
-  -output string
-    	Output path for non-SQLite formats
   -parallel int
     	Number of parallel rebuild workers (default: 1, use higher values for testing)
   -reevaluate
-    	Reevaluate FODs by rebuilding them
+    	Reevaluate FODs by rebuilding them and include rebuild status in output
   -build-delay int
     	Delay between builds in seconds (default 10)
   -test
@@ -87,9 +99,6 @@ Options:
 ### Environment Variables
 
 - `FOD_ORACLE_NUM_WORKERS` - Number of worker threads (default: 1)
-- `FOD_ORACLE_DB_PATH` - Path to SQLite database (default: ./db/fods.db)
-- `FOD_ORACLE_OUTPUT_FORMAT` - Output format (default: sqlite)
-- `FOD_ORACLE_OUTPUT_PATH` - Output path for non-SQLite formats
 - `FOD_ORACLE_TEST_DRV_PATH` - Path to derivation for test mode
 - `FOD_ORACLE_EVAL_OPTS` - Additional options for nix-eval-jobs
 - `FOD_ORACLE_BUILD_DELAY` - Delay between builds in seconds (default: 0)

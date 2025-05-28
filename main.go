@@ -21,6 +21,13 @@ import (
 	"github.com/nix-community/go-nix/pkg/derivation"
 )
 
+// debugLog logs a message only if debug mode is enabled
+func debugLog(format string, v ...interface{}) {
+	if config.Debug {
+		log.Printf(format, v...)
+	}
+}
+
 // FOD represents a fixed-output derivation
 type FOD struct {
 	DrvPath       string
@@ -142,12 +149,10 @@ func init() {
 
 	// Initialize config with defaults
 	config = Config{
-		IsNixExpr:    false,
-		OutputFormat: "sqlite",
-		OutputPath:   "",
-		WorkerCount:  1,
-		Reevaluate:   false,
-		BuildDelay:   0, // Default build delay set to 0 for testing (no delay)
+		IsNixExpr:   false,
+		WorkerCount: 1,
+		Reevaluate:  false,
+		BuildDelay:  0, // Default build delay set to 0 for testing (no delay)
 	}
 
 	// Check for custom worker count in environment
@@ -158,21 +163,7 @@ func init() {
 		}
 	}
 
-	// Check for output format in environment
-	if outputFormat := os.Getenv("FOD_ORACLE_OUTPUT_FORMAT"); outputFormat != "" {
-		// Validate output format
-		switch outputFormat {
-		case "sqlite", "json", "csv", "parquet":
-			config.OutputFormat = outputFormat
-		default:
-			log.Printf("Warning: Invalid output format '%s', using 'sqlite'", outputFormat)
-		}
-	}
-
-	// Check for output path in environment
-	if outputPath := os.Getenv("FOD_ORACLE_OUTPUT_PATH"); outputPath != "" {
-		config.OutputPath = outputPath
-	}
+	// Format removed - always JSON Lines to stdout
 
 	// Check for build delay in environment
 	if buildDelayStr := os.Getenv("FOD_ORACLE_BUILD_DELAY"); buildDelayStr != "" {
@@ -280,7 +271,7 @@ var createTables = `
 
 // initInMemoryDB initializes an in-memory SQLite database with temp file storage
 func initInMemoryDB() *sql.DB {
-	log.Printf("Initializing in-memory SQLite database with temp file storage")
+	debugLog("Initializing in-memory SQLite database with temp file storage")
 
 	// Connection string for in-memory database with shared cache
 	// But using FILE for temp_store to prevent OOM with large datasets
@@ -373,7 +364,7 @@ func initDB() *sql.DB {
 		log.Fatalf("Failed to create database directory %s: %v", dbDir, err)
 	}
 
-	log.Printf("Using database at: %s with file-based temp storage", dbPath)
+	debugLog("Using database at: %s with file-based temp storage", dbPath)
 
 	// Add busy_timeout and other optimizations
 	// Use FILE for temp_store to prevent OOM with large datasets
@@ -863,7 +854,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB, writer Writer
 	fileStats := make(map[string]*exprFileStats)
 
 	// Run nix-eval-jobs
-	log.Printf("[%s] Running nix-eval-jobs with %d workers", rev, workers)
+	debugLog("[%s] Running nix-eval-jobs with %d workers", rev, workers)
 	if err := streamNixEvalJobs(rev, worktreeDir, workers, drvPathChan, fileStats, &usedFallback); err != nil {
 		close(drvPathChan)
 
@@ -890,14 +881,8 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB, writer Writer
 	writer.Flush()
 	revElapsed := time.Since(revStartTime)
 
-	// Only get count from database if using SQLite
-	if config.OutputFormat == "sqlite" {
-		var fodCount int
-		db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount)
-		log.Printf("[%s] Found %d FODs in %v", rev, fodCount, revElapsed)
-	} else {
-		log.Printf("[%s] Processing completed in %v", rev, revElapsed)
-	}
+	// Log completion
+	debugLog("[%s] Processing completed in %v", rev, revElapsed)
 
 	// Always store metadata in SQLite for reporting purposes
 	memoryMutex.Lock()
@@ -914,7 +899,7 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB, writer Writer
 func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan chan<- string,
 	fileStats map[string]*exprFileStats, usedFallback *bool,
 ) error {
-	log.Printf("[%s] Running nix-eval-jobs with nixpkgs at %s (%d workers)", rev, nixpkgsDir, workers)
+	debugLog("[%s] Running nix-eval-jobs with nixpkgs at %s (%d workers)", rev, nixpkgsDir, workers)
 
 	// Define possible Nix expression files to evaluate
 	possiblePaths := []string{
@@ -1446,12 +1431,10 @@ func cleanupWorktrees() error {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Println("Starting FOD finder...")
+	// Note: debugLog can't be used here since config isn't set yet
 
 	// Parse command-line flags
 	var (
-		formatFlag     = flag.String("format", config.OutputFormat, "Output format (sqlite, json, csv, parquet)")
-		outputFlag     = flag.String("output", config.OutputPath, "Output path for non-SQLite formats")
 		workersFlag    = flag.Int("workers", workers, "Number of worker threads")
 		testMode       = flag.Bool("test", false, "Test mode - process a single derivation")
 		testDrv        = flag.String("drv", "", "Derivation path for test mode")
@@ -1459,6 +1442,7 @@ func main() {
 		reevaluateFlag = flag.Bool("reevaluate", false, "Reevaluate FODs by rebuilding them")
 		buildDelayFlag = flag.Int("build-delay", config.BuildDelay, "Delay between builds in seconds")
 		parallelFlag   = flag.Int("parallel", 1, "Number of parallel rebuild workers (default: 1, use higher values for testing)")
+		debugFlag      = flag.Bool("debug", false, "Enable debug logging")
 		helpFlag       = flag.Bool("help", false, "Show help")
 	)
 
@@ -1466,103 +1450,50 @@ func main() {
 	// This ensures flags like -format and their values don't get treated as revisions
 	flag.Parse()
 
-	// Debug: Print all flag values
-	log.Printf("DEBUG: Flag values - format: %s, output: %s, reevaluate: %v",
-		*formatFlag, *outputFlag, *reevaluateFlag)
+	// Set debug flag early so we can use it for subsequent logging
+	config.Debug = *debugFlag
+
+	// Set reevaluate flag early too
+	config.Reevaluate = *reevaluateFlag
+	// Always check the raw args because flag parsing doesn't handle --flag style well
+	for _, arg := range os.Args {
+		if arg == "-reevaluate" || arg == "--reevaluate" {
+			config.Reevaluate = true
+			break
+		}
+	}
+
+	// Now we can use debugLog since config is set
+	debugLog("Starting FOD finder...")
+
+	// Debug: Print all flag values only in debug mode
+	debugLog("DEBUG: Flag values - reevaluate: %v", *reevaluateFlag)
 
 	if *helpFlag {
 		fmt.Printf("FOD Oracle - A tool for finding Fixed-Output Derivations in Nix packages\n\n")
 		fmt.Printf("Usage: %s [options] <nixpkgs-revision> [<nixpkgs-revision2> ...]\n", os.Args[0])
-		fmt.Printf("       %s --expr \"let pkgs = import <nixpkgs> {}; in pkgs.hello\" [--reevaluate]\n\n", os.Args[0])
+		fmt.Printf("       %s --expr \"let pkgs = import <nixpkgs> {}; in pkgs.hello\" [--reevaluate]\n", os.Args[0])
+		fmt.Printf("       %s --expr \"github:NixOS/nixpkgs/nixos-unstable#legacyPackages.x86_64-linux.hello\" [--reevaluate]\n\n", os.Args[0])
+		fmt.Printf("Flake URI Examples:\n")
+		fmt.Printf("  github:NixOS/nixpkgs/nixos-unstable#legacyPackages.x86_64-linux.obs-studio-plugins\n")
+		fmt.Printf("  github:NixOS/nixpkgs#nixosConfigurations.myConfig\n")
+		fmt.Printf("  gitlab:user/repo#myPackage\n\n")
 		fmt.Printf("Options:\n")
 		flag.PrintDefaults()
+		fmt.Printf("\nJSON Lines Output:\n")
+		fmt.Printf("  All output is streamed as JSON Lines to stdout for easy parsing.\n")
+		fmt.Printf("  Without --reevaluate: Basic FOD information (DrvPath, OutputPath, HashAlgorithm, Hash)\n")
+		fmt.Printf("  With --reevaluate: FOD information plus rebuild results (rebuild_status, actual_hash, hash_mismatch, error_message)\n")
+		fmt.Printf("  Use --debug to show debug logs, otherwise only JSON output is shown.\n")
 		fmt.Printf("\nEnvironment Variables:\n")
 		fmt.Printf("  FOD_ORACLE_NUM_WORKERS   Number of worker threads (default: 1)\n")
-		fmt.Printf("  FOD_ORACLE_DB_PATH       Path to SQLite database (default: ./db/fods.db)\n")
-		fmt.Printf("  FOD_ORACLE_OUTPUT_FORMAT Output format (default: sqlite)\n")
-		fmt.Printf("  FOD_ORACLE_OUTPUT_PATH   Output path for non-SQLite formats\n")
 		fmt.Printf("  FOD_ORACLE_TEST_DRV_PATH Path to derivation for test mode\n")
 		fmt.Printf("  FOD_ORACLE_EVAL_OPTS     Additional options for nix-eval-jobs\n")
 		fmt.Printf("  FOD_ORACLE_BUILD_DELAY   Delay between builds in seconds (default: 0)\n")
 		return
 	}
 
-	// Apply command-line options to config
-	// Check if -format was explicitly passed, either with = or as a separate argument
-	formatExplicitlySet := false
-	for i, arg := range os.Args {
-		if arg == "-format" && i+1 < len(os.Args) {
-			formatExplicitlySet = true
-			// The format value is in the next argument
-			format := os.Args[i+1]
-			switch format {
-			case "sqlite", "json", "csv", "parquet":
-				config.OutputFormat = format
-				log.Printf("DEBUG: Set output format to %s from explicit -format arg", format)
-			default:
-				log.Fatalf("Invalid output format: %s. Valid formats are: sqlite, json, csv, parquet", format)
-			}
-			break
-		} else if strings.HasPrefix(arg, "-format=") || strings.HasPrefix(arg, "--format=") {
-			formatExplicitlySet = true
-			// Extract the format value after the equals sign
-			parts := strings.SplitN(arg, "=", 2)
-			if len(parts) == 2 {
-				format := parts[1]
-				switch format {
-				case "sqlite", "json", "csv", "parquet":
-					config.OutputFormat = format
-					log.Printf("DEBUG: Set output format to %s from -format= arg", format)
-				default:
-					log.Fatalf("Invalid output format: %s. Valid formats are: sqlite, json, csv, parquet", format)
-				}
-			}
-			break
-		}
-	}
-
-	// Only use the flag.Parse() value if we didn't find an explicit format in the args
-	if !formatExplicitlySet && *formatFlag != "" {
-		// Validate output format
-		switch *formatFlag {
-		case "sqlite", "json", "csv", "parquet":
-			config.OutputFormat = *formatFlag
-			log.Printf("DEBUG: Set output format to %s from flag.Parse()", config.OutputFormat)
-		default:
-			log.Fatalf("Invalid output format: %s. Valid formats are: sqlite, json, csv, parquet", *formatFlag)
-		}
-	}
-
-	// Check if -output was explicitly passed, similar to format
-	outputExplicitlySet := false
-	for i, arg := range os.Args {
-		if arg == "-output" && i+1 < len(os.Args) {
-			outputExplicitlySet = true
-			config.OutputPath = os.Args[i+1]
-			log.Printf("DEBUG: Set output path to %s from explicit -output arg", config.OutputPath)
-			break
-		} else if strings.HasPrefix(arg, "-output=") || strings.HasPrefix(arg, "--output=") {
-			outputExplicitlySet = true
-			// Extract the output value after the equals sign
-			parts := strings.SplitN(arg, "=", 2)
-			if len(parts) == 2 {
-				config.OutputPath = parts[1]
-				log.Printf("DEBUG: Set output path to %s from -output= arg", config.OutputPath)
-			}
-			break
-		}
-	}
-
-	// Only use the flag.Parse() value if we didn't find an explicit output in the args
-	if !outputExplicitlySet && *outputFlag != "" {
-		config.OutputPath = *outputFlag
-		log.Printf("DEBUG: Set output path to %s from flag.Parse()", config.OutputPath)
-	}
-
-	// For non-SQLite formats, output path is required
-	if config.OutputFormat != "sqlite" && config.OutputPath == "" {
-		log.Fatalf("Output path (-output) is required when using format: %s", config.OutputFormat)
-	}
+	// No format processing needed - always JSON Lines to stdout
 
 	if *workersFlag > 0 {
 		workers = *workersFlag
@@ -1573,53 +1504,35 @@ func main() {
 		config.IsNixExpr = true
 	}
 
-	// Check if reevaluate is explicitly set or if it appears in the command line args
-	config.Reevaluate = *reevaluateFlag
-
-	// Always check the raw args because flag parsing doesn't handle --flag style well
-	for _, arg := range os.Args {
-		if arg == "-reevaluate" || arg == "--reevaluate" {
-			config.Reevaluate = true
-			log.Printf("DEBUG: Set reevaluate=true from explicit command line arg")
-			break
-		}
-	}
-
-	log.Printf("DEBUG: Reevaluate flag state: %v", config.Reevaluate)
+	// Reevaluate flag already set earlier
 
 	// Apply the build delay from the flag, overriding environment and default values
 	if *buildDelayFlag != config.BuildDelay {
-		log.Printf("Setting build delay to %d seconds (from command-line flag)", *buildDelayFlag)
+		debugLog("Setting build delay to %d seconds (from command-line flag)", *buildDelayFlag)
 		config.BuildDelay = *buildDelayFlag
 	}
 	// Set parallel workers
 	if *parallelFlag > 0 {
 		config.ParallelWorkers = *parallelFlag
 		if config.ParallelWorkers > 1 {
-			log.Printf("Using %d parallel rebuild workers (faster testing mode)", config.ParallelWorkers)
+			debugLog("Using %d parallel rebuild workers (faster testing mode)", config.ParallelWorkers)
 		}
 	} else {
 		config.ParallelWorkers = 1
 	}
 
-	log.Printf("Using %d worker threads on %s (%s), %s",
+	// Debug flag already set earlier
+
+	// Debug info only shown when debug mode is enabled
+	debugLog("Using %d worker threads on %s (%s), %s",
 		workers, systemInfo.CPU, systemInfo.Cores, systemInfo.OS)
-	log.Printf("Output format: %s", config.OutputFormat)
-	if config.OutputPath != "" {
-		log.Printf("Output path: %s", config.OutputPath)
-	}
+	debugLog("Output format: JSON Lines to stdout")
 
 	// Clean up any leftover worktrees
 	cleanupWorktrees()
 
-	// For non-SQLite output formats, always use an in-memory database
-	var db *sql.DB
-	if config.OutputFormat != "sqlite" {
-		log.Printf("Using %s output format: Using in-memory database", config.OutputFormat)
-		db = initInMemoryDB()
-	} else {
-		db = initDB()
-	}
+	// Always use in-memory database for JSON Lines streaming
+	db := initInMemoryDB()
 	defer db.Close()
 
 	// Get revisions from command line
@@ -1650,12 +1563,6 @@ func main() {
 			continue
 		}
 
-		// If we are in Nix expression mode, do not validate the revision length
-		if *nixExpr {
-			validRevisions = append(validRevisions, rev)
-			continue
-		}
-
 		// Skip arguments that are too short to be git hashes (only in Git revision mode)
 		if len(rev) < 7 {
 			// Only warn if it's not a number (which would be a flag value)
@@ -1673,7 +1580,7 @@ func main() {
 		log.Fatalf("Usage: %s [options] <nixpkgs-revision> [<nixpkgs-revision2> ...]\nUse --help for more information", os.Args[0])
 	}
 
-	log.Printf("Processing %d nixpkgs revisions", len(validRevisions))
+	debugLog("Processing %d nixpkgs revisions", len(validRevisions))
 
 	// Replace revisions with validRevisions
 	revisions = validRevisions
@@ -1734,19 +1641,6 @@ func main() {
 
 		// Close the writer
 		writer.Close()
-
-		// If using a non-SQLite output format, convert the database to the desired format
-		if config.OutputFormat != "sqlite" {
-			outputPath := config.OutputPath
-			if outputPath == "" {
-				// Use default output path if not specified
-				outputPath = fmt.Sprintf("output/%s/fods.%s", rev, config.OutputFormat)
-			}
-
-			if err := ConvertToFormat(db, config.OutputFormat, outputPath, revisionID); err != nil {
-				log.Printf("Error converting to %s format: %v", config.OutputFormat, err)
-			}
-		}
 	}
 
 	// Optimize database
@@ -1757,7 +1651,7 @@ func main() {
 	// Final cleanup
 	cleanupWorktrees()
 
-	log.Printf("All revisions processed in %v", time.Since(startTime))
+	debugLog("All revisions processed in %v", time.Since(startTime))
 }
 
 // processTestDerivation processes a single derivation for testing purposes
@@ -1808,16 +1702,8 @@ func processTestDerivation(drvPath string, revisionID int64, db *sql.DB, writer 
 	// Flush the writer
 	writer.Flush()
 
-	// Count the FODs if using SQLite
-	if config.OutputFormat == "sqlite" {
-		var fodCount int
-		if err := db.QueryRow("SELECT COUNT(*) FROM drv_revisions WHERE revision_id = ?", revisionID).Scan(&fodCount); err != nil {
-			log.Printf("Error counting FODs: %v", err)
-		}
-		log.Printf("Found %d FODs for test derivation", fodCount)
-	} else {
-		log.Printf("Processed test derivation successfully")
-	}
+	// Log completion
+	debugLog("Processed test derivation successfully")
 
 	return nil
 }
@@ -1829,7 +1715,7 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string, writer Writer) err
 		identifier = "expr"
 	}
 
-	log.Printf("[%s] Starting FOD reevaluation...", identifier)
+	debugLog("[%s] Starting FOD reevaluation...", identifier)
 
 	// Create the rebuild queue with the configured parallel workers and build delay
 	queue := NewRebuildQueue(db, config.ParallelWorkers, config.BuildDelay)
@@ -1850,10 +1736,10 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string, writer Writer) err
 		}
 
 		if queueErr != nil {
-			log.Printf("Error counting FODs: %v", queueErr)
+			debugLog("Error counting FODs: %v", queueErr)
 		} else if fodCount > 0 {
 			// Force queue FODs if there are some in the database
-			log.Printf("[%s] Found %d FODs in database but none in queue. Force queuing them...", identifier, fodCount)
+			debugLog("[%s] Found %d FODs in database but none in queue. Force queuing them...", identifier, fodCount)
 			count, queueErr = queue.ForceQueueAllFODs(revisionID)
 			if queueErr != nil {
 				return fmt.Errorf("failed to force queue FODs: %w", queueErr)
@@ -1862,7 +1748,7 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string, writer Writer) err
 	}
 
 	if count == 0 {
-		log.Printf("[%s] No FODs to reevaluate", identifier)
+		debugLog("[%s] No FODs to reevaluate", identifier)
 		return nil
 	}
 
@@ -1873,10 +1759,10 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string, writer Writer) err
 	}
 
 	if config.ParallelWorkers > 1 {
-		log.Printf("[%s] Queued %d FODs for reevaluation (parallel workers: %d, %s)",
+		debugLog("[%s] Queued %d FODs for reevaluation (parallel workers: %d, %s)",
 			identifier, count, config.ParallelWorkers, delayMessage)
 	} else {
-		log.Printf("[%s] Queued %d FODs for reevaluation (%s)",
+		debugLog("[%s] Queued %d FODs for reevaluation (%s)",
 			identifier, count, delayMessage)
 	}
 
@@ -1901,14 +1787,14 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string, writer Writer) err
 		select {
 		case <-timeout.C:
 			// Safety timeout to prevent hanging
-			log.Printf("[%s] Reevaluation timed out after %v", identifier, maxWaitTime)
+			debugLog("[%s] Reevaluation timed out after %v", identifier, maxWaitTime)
 			queue.Stop() // Force the queue to stop
 
 			// Try to get final stats
 			stats, err := queue.GetQueueStats(revisionID)
 			if err == nil && stats["total"] > 0 {
 				completed := stats["success"] + stats["hash_mismatch"] + stats["failure"] + stats["timeout"]
-				log.Printf("[%s] Partial results: %d/%d complete (%d%%)",
+				debugLog("[%s] Partial results: %d/%d complete (%d%%)",
 					identifier, completed, stats["total"],
 					int(float64(completed)/float64(stats["total"])*100))
 			}
@@ -1920,9 +1806,9 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string, writer Writer) err
 				// Get final stats
 				stats, err := queue.GetQueueStats(revisionID)
 				if err != nil {
-					log.Printf("[%s] Error getting final queue stats: %v", identifier, err)
+					debugLog("[%s] Error getting final queue stats: %v", identifier, err)
 				} else {
-					log.Printf("[%s] Reevaluation complete. Total: %d, Success: %d, Hash Mismatch: %d, Failure: %d, Timeout: %d",
+					debugLog("[%s] Reevaluation complete. Total: %d, Success: %d, Hash Mismatch: %d, Failure: %d, Timeout: %d",
 						identifier, stats["total"], stats["success"], stats["hash_mismatch"], stats["failure"], stats["timeout"])
 				}
 				return nil
@@ -1931,7 +1817,7 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string, writer Writer) err
 			// Provide status update
 			stats, err := queue.GetQueueStats(revisionID)
 			if err != nil {
-				log.Printf("[%s] Error getting queue stats: %v", identifier, err)
+				debugLog("[%s] Error getting queue stats: %v", identifier, err)
 				continue
 			}
 
@@ -1941,7 +1827,7 @@ func reevaluateFODs(db *sql.DB, revisionID int64, rev string, writer Writer) err
 			if total > 0 {
 				percentComplete := float64(completed) / float64(total) * 100
 				elapsedTime := time.Since(startTime)
-				log.Printf("[%s] Reevaluation progress: %.1f%% (%d/%d complete, elapsed: %v). Success: %d, Hash Mismatch: %d, Failure: %d, Timeout: %d",
+				debugLog("[%s] Reevaluation progress: %.1f%% (%d/%d complete, elapsed: %v). Success: %d, Hash Mismatch: %d, Failure: %d, Timeout: %d",
 					identifier, percentComplete, completed, total, elapsedTime.Round(time.Second),
 					stats["success"], stats["hash_mismatch"], stats["failure"], stats["timeout"])
 			}

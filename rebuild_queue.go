@@ -13,6 +13,13 @@ import (
 	"github.com/multivac61/fod-oracle/pkg/fod"
 )
 
+// debugLogQueue logs a message only if debug mode is enabled
+func debugLogQueue(format string, v ...interface{}) {
+	if config.Debug {
+		log.Printf(format, v...)
+	}
+}
+
 // RebuildJob represents a job to rebuild a FOD
 type RebuildJob struct {
 	ID           int64
@@ -72,7 +79,7 @@ func (q *RebuildQueue) QueueFODsForRevision(revisionID int64) (int, error) {
 	if config.IsNixExpr {
 		// For Nix expressions, just count all FODs
 		err = q.db.QueryRow(`SELECT COUNT(*) FROM fods`).Scan(&totalCount)
-		log.Printf("DEBUG: Using IsNixExpr path, found %d FODs", totalCount)
+		debugLogQueue("DEBUG: Using IsNixExpr path, found %d FODs", totalCount)
 	} else {
 		// For regular revisions, count FODs associated with this revision
 		err = q.db.QueryRow(`
@@ -86,9 +93,9 @@ func (q *RebuildQueue) QueueFODsForRevision(revisionID int64) (int, error) {
 
 	if totalCount == 0 {
 		if config.IsNixExpr {
-			log.Printf("No FODs found for expression")
+			debugLogQueue("No FODs found for expression")
 		} else {
-			log.Printf("No FODs found for revision ID %d", revisionID)
+			debugLogQueue("No FODs found for revision ID %d", revisionID)
 		}
 		return 0, nil
 	}
@@ -142,7 +149,7 @@ func (q *RebuildQueue) QueueFODsForRevision(revisionID int64) (int, error) {
 		}
 
 		if resetCount > 0 {
-			log.Printf("Reset %d failed FODs to pending for revision ID %d", resetCount, revisionID)
+			debugLogQueue("Reset %d failed FODs to pending for revision ID %d", resetCount, revisionID)
 			return resetCount, nil
 		}
 
@@ -153,7 +160,7 @@ func (q *RebuildQueue) QueueFODsForRevision(revisionID int64) (int, error) {
 	var result sql.Result
 	if config.IsNixExpr {
 		// For Nix expressions, queue all FODs
-		log.Printf("Queuing all FODs for expression (total: %d)", totalCount)
+		debugLogQueue("Queuing all FODs for expression (total: %d)", totalCount)
 		result, err = q.db.Exec(`
 			INSERT INTO rebuild_queue (drv_path, revision_id, expected_hash, status)
 			SELECT f.drv_path, ?, f.hash, ?
@@ -181,7 +188,7 @@ func (q *RebuildQueue) QueueFODsForRevision(revisionID int64) (int, error) {
 		return 0, fmt.Errorf("failed to get rows affected: %w", err)
 	}
 
-	log.Printf("Queued %d FODs for rebuild for revision ID %d", rowsAffected, revisionID)
+	debugLogQueue("Queued %d FODs for rebuild for revision ID %d", rowsAffected, revisionID)
 	return int(rowsAffected), nil
 }
 
@@ -198,7 +205,7 @@ func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 	// This prevents errors when workers start fetching jobs
 	err := q.ensureRebuildQueueTableExists()
 	if err != nil {
-		log.Printf("Error ensuring rebuild_queue table exists: %v", err)
+		debugLogQueue("Error ensuring rebuild_queue table exists: %v", err)
 	}
 
 	// Start worker goroutines
@@ -206,12 +213,12 @@ func (q *RebuildQueue) Start(concurrency int, writer Writer) {
 		q.wg.Add(1)
 		go func(workerID int) {
 			defer q.wg.Done()
-			log.Printf("Starting rebuild worker %d", workerID)
+			debugLogQueue("Starting rebuild worker %d", workerID)
 			for job := range q.buildChan {
 				status, actualHash, errorMsg := q.processJob(job)
 
 				// Pass rebuild data to the writer
-				log.Printf("DEBUG: Adding rebuild info to writer: %s, status: %s, hash: %s", job.DrvPath, status, actualHash)
+				debugLogQueue("DEBUG: Adding rebuild info to writer: %s, status: %s, hash: %s", job.DrvPath, status, actualHash)
 				writer.AddRebuildInfo(job.DrvPath, status, actualHash, errorMsg)
 			}
 		}(i)
@@ -229,7 +236,7 @@ func (q *RebuildQueue) ensureRebuildQueueTableExists() error {
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// Table doesn't exist, create it
-			log.Printf("Creating rebuild_queue table...")
+			debugLogQueue("Creating rebuild_queue table...")
 			_, err = q.db.Exec(`
 				CREATE TABLE IF NOT EXISTS rebuild_queue (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -285,7 +292,7 @@ func (q *RebuildQueue) startJobFetcher() {
 			stopped := q.stopped
 			q.mutex.Unlock()
 			if stopped {
-				log.Printf("Job fetcher: stopping due to stop signal")
+				debugLogQueue("Job fetcher: stopping due to stop signal")
 				break
 			}
 
@@ -293,7 +300,7 @@ func (q *RebuildQueue) startJobFetcher() {
 			job, err := q.fetchNextJob()
 			if err != nil {
 				if err != sql.ErrNoRows {
-					log.Printf("Error fetching next job: %v", err)
+					debugLogQueue("Error fetching next job: %v", err)
 				}
 
 				// Use a shorter wait time if delay is set to 0 (testing mode)
@@ -310,9 +317,9 @@ func (q *RebuildQueue) startJobFetcher() {
 				if emptyAttempts >= 5 {
 					pending, err := q.countPendingJobs()
 					if err != nil {
-						log.Printf("Error counting pending jobs: %v", err)
+						debugLogQueue("Error counting pending jobs: %v", err)
 					} else if pending == 0 {
-						log.Printf("Job fetcher: no more pending jobs, exiting")
+						debugLogQueue("Job fetcher: no more pending jobs, exiting")
 						break
 					}
 				}
@@ -336,9 +343,9 @@ func (q *RebuildQueue) startJobFetcher() {
 				if emptyAttempts >= 5 {
 					pending, err := q.countPendingJobs()
 					if err != nil {
-						log.Printf("Error counting pending jobs: %v", err)
+						debugLogQueue("Error counting pending jobs: %v", err)
 					} else if pending == 0 {
-						log.Printf("Job fetcher: no more pending jobs, exiting")
+						debugLogQueue("Job fetcher: no more pending jobs, exiting")
 						break
 					}
 				}
@@ -407,7 +414,7 @@ func (q *RebuildQueue) Stop() {
 		// Workers completed normally
 	case <-time.After(10 * time.Second):
 		// Timed out waiting for workers
-		log.Printf("Warning: Timed out waiting for rebuild workers to complete")
+		debugLogQueue("Warning: Timed out waiting for rebuild workers to complete")
 	}
 }
 
@@ -456,7 +463,7 @@ func (q *RebuildQueue) fetchNextJob() (*RebuildJob, error) {
 			return nil, err
 		}
 
-		log.Printf("Database locked, retrying fetch (attempt %d/5)", attempt+1)
+		debugLogQueue("Database locked, retrying fetch (attempt %d/5)", attempt+1)
 	}
 
 	return nil, fmt.Errorf("failed to fetch job after retries: %w", err)
@@ -545,7 +552,7 @@ func (q *RebuildQueue) markBuildComplete() {
 // processJob handles a single rebuild job
 // Returns status, actualHash, and errorMessage for use by writers
 func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
-	log.Printf("Processing job #%d: %s", job.ID, job.DrvPath)
+	debugLogQueue("Processing job #%d: %s", job.ID, job.DrvPath)
 
 	// Run the rebuild-fod command
 	outputLog, err := q.rebuildFOD(job.DrvPath)
@@ -630,7 +637,7 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 			// Just log it once and continue with the rest of the process
 			if attempt == 0 {
 				// Only log on the first attempt to reduce noise
-				log.Printf("Cannot update job #%d: rebuild_queue table no longer exists, continuing with job results", job.ID)
+				debugLogQueue("Cannot update job #%d: rebuild_queue table no longer exists, continuing with job results", job.ID)
 			}
 			dbErr = nil
 			break
@@ -639,7 +646,7 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 		// Table exists, proceed with update
 		tx, err := q.db.Begin()
 		if err != nil {
-			log.Printf("Error beginning transaction for job #%d: %v", job.ID, err)
+			debugLogQueue("Error beginning transaction for job #%d: %v", job.ID, err)
 			continue
 		}
 
@@ -647,7 +654,7 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 		_, err = tx.Exec("PRAGMA busy_timeout = 5000")
 		if err != nil {
 			tx.Rollback()
-			log.Printf("Error setting busy timeout for job #%d: %v", job.ID, err)
+			debugLogQueue("Error setting busy timeout for job #%d: %v", job.ID, err)
 			continue
 		}
 
@@ -664,12 +671,12 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 				if strings.Contains(err.Error(), "no such table") {
 					// Table has been dropped (may happen during database conversion)
 					if attempt == 0 {
-						log.Printf("rebuild_queue table no longer exists for job #%d, continuing with job results", job.ID)
+						debugLogQueue("rebuild_queue table no longer exists for job #%d, continuing with job results", job.ID)
 					}
 					dbErr = nil
 					break
 				}
-				log.Printf("Database locked, retrying update for job #%d (attempt %d/5)", job.ID, attempt+1)
+				debugLogQueue("Database locked, retrying update for job #%d (attempt %d/5)", job.ID, attempt+1)
 				dbErr = err
 				continue
 			}
@@ -688,10 +695,10 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 	}
 
 	if dbErr != nil {
-		log.Printf("Error updating job #%d after retries: %v", job.ID, dbErr)
+		debugLogQueue("Error updating job #%d after retries: %v", job.ID, dbErr)
 	}
 
-	log.Printf("Job #%d completed with status: %s", job.ID, status)
+	debugLogQueue("Job #%d completed with status: %s", job.ID, status)
 
 	return status, actualHash, errorMessage
 }
@@ -699,7 +706,7 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 // rebuildFOD runs the rebuild-fod implementation for a derivation
 func (q *RebuildQueue) rebuildFOD(drvPath string) (string, error) {
 	startTime := time.Now()
-	log.Printf("Rebuilding FOD: %s", drvPath)
+	debugLogQueue("Rebuilding FOD: %s", drvPath)
 
 	// Set a timeout to prevent hanging - shorter timeout for testing
 	timeoutSeconds := 300 // 5 minutes
@@ -709,10 +716,10 @@ func (q *RebuildQueue) rebuildFOD(drvPath string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
 
-	// Check if we're in a non-SQLite format with first FOD - print helpful message
-	if config.OutputFormat != "sqlite" && !q.hasShownRebuildMessage {
+	// Show rebuild message on first FOD
+	if !q.hasShownRebuildMessage {
 		q.hasShownRebuildMessage = true
-		log.Printf("INFO: Rebuilding FODs for %s output format", config.OutputFormat)
+		debugLogQueue("INFO: Rebuilding FODs for JSON Lines output")
 	}
 
 	// Use the fod package's RebuildFOD function directly
@@ -749,7 +756,7 @@ func (q *RebuildQueue) rebuildFOD(drvPath string) (string, error) {
 
 	totalDuration := time.Since(startTime)
 	if totalDuration > 1*time.Second {
-		log.Printf("Rebuild took %v to complete", totalDuration)
+		debugLogQueue("Rebuild took %v to complete", totalDuration)
 	}
 
 	outputStr := outputBuf.String()
@@ -880,7 +887,7 @@ func (q *RebuildQueue) ForceQueueAllFODs(revisionID int64) (int, error) {
 	var result sql.Result
 	if config.IsNixExpr {
 		// For Nix expressions, force queue all FODs
-		log.Printf("Force queuing all FODs for expression")
+		debugLogQueue("Force queuing all FODs for expression")
 		result, err = q.db.Exec(`
 			INSERT INTO rebuild_queue (drv_path, revision_id, expected_hash, status)
 			SELECT f.drv_path, ?, f.hash, ?
@@ -906,7 +913,7 @@ func (q *RebuildQueue) ForceQueueAllFODs(revisionID int64) (int, error) {
 		return 0, fmt.Errorf("failed to get rows affected: %w", err)
 	}
 
-	log.Printf("Force queued %d FODs for rebuild for revision ID %d", rowsAffected, revisionID)
+	debugLogQueue("Force queued %d FODs for rebuild for revision ID %d", rowsAffected, revisionID)
 	return int(rowsAffected), nil
 }
 
