@@ -745,15 +745,16 @@ func (q *RebuildQueue) rebuildFOD(drvPath string) (string, error) {
 	if result != nil {
 		fmt.Fprintf(&outputBuf, "%s\n", result.Log)
 
-		if result.Status == "success" {
+		switch result.Status {
+		case "success":
 			fmt.Fprintf(&outputBuf, "STATUS=success\n")
 			fmt.Fprintf(&outputBuf, "ACTUAL_HASH=%s\n", result.ActualHash)
 			fmt.Fprintf(&outputBuf, "ERROR_MESSAGE=\n")
-		} else if result.Status == "timeout" {
+		case "timeout":
 			fmt.Fprintf(&outputBuf, "STATUS=timeout\n")
 			fmt.Fprintf(&outputBuf, "ACTUAL_HASH=\n")
 			fmt.Fprintf(&outputBuf, "ERROR_MESSAGE=%s\n", result.ErrorMessage)
-		} else {
+		default:
 			fmt.Fprintf(&outputBuf, "STATUS=%s\n", result.Status)
 			fmt.Fprintf(&outputBuf, "ACTUAL_HASH=%s\n", result.ActualHash)
 			fmt.Fprintf(&outputBuf, "ERROR_MESSAGE=%s\n", result.ErrorMessage)
