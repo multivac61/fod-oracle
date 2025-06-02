@@ -42,7 +42,7 @@ type hashResult struct {
 }
 
 // RebuildFOD rebuilds a fixed-output derivation and extracts the hash
-func RebuildFOD(ctx context.Context, drvPath string) (*RebuildFODResult, error) {
+func RebuildFOD(ctx context.Context, drvPath string, debug bool) (*RebuildFODResult, error) {
 	if drvPath == "" {
 		return nil, errors.New("derivation path cannot be empty")
 	}
@@ -191,8 +191,8 @@ func RebuildFOD(ctx context.Context, drvPath string) (*RebuildFODResult, error) 
 	result.FinishedAt = time.Now()
 
 	// Log performance information
-	totalDuration := time.Since(startTime)
-	if totalDuration > 1*time.Second {
+	if debug {
+		totalDuration := time.Since(startTime)
 		fmt.Fprintf(os.Stderr, "rebuild-fod took %v to complete for %s\n", totalDuration, drvPath)
 	}
 
