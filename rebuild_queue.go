@@ -718,7 +718,6 @@ func (q *RebuildQueue) processJob(job RebuildJob) (string, string, string) {
 
 // rebuildFOD runs the rebuild-fod implementation for a derivation
 func (q *RebuildQueue) rebuildFOD(drvPath string) (string, error) {
-	startTime := time.Now()
 	debugLogQueue("Rebuilding FOD: %s", drvPath)
 
 	// Set a timeout to prevent hanging - shorter timeout for testing
@@ -737,7 +736,7 @@ func (q *RebuildQueue) rebuildFOD(drvPath string) (string, error) {
 
 	// Use the fod package's RebuildFOD function directly
 	// This ensures we're using the same code as the rebuild-fod command
-	result, err := fod.RebuildFOD(ctx, drvPath)
+	result, err := fod.RebuildFOD(ctx, drvPath, config.Debug)
 
 	// Create an output buffer for compatibility with the old approach
 	var outputBuf bytes.Buffer
@@ -765,11 +764,6 @@ func (q *RebuildQueue) rebuildFOD(drvPath string) (string, error) {
 		fmt.Fprintf(&outputBuf, "STATUS=failure\n")
 		fmt.Fprintf(&outputBuf, "ACTUAL_HASH=\n")
 		fmt.Fprintf(&outputBuf, "ERROR_MESSAGE=%v\n", err)
-	}
-
-	totalDuration := time.Since(startTime)
-	if totalDuration > 1*time.Second {
-		debugLogQueue("Rebuild took %v to complete", totalDuration)
 	}
 
 	outputStr := outputBuf.String()
