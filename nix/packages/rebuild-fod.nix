@@ -10,7 +10,7 @@ pkgs.buildGoModule {
   version = "0.1.0";
 
   # This is a simplified approach - in a real setup, we'd compute this correctly
-  vendorHash = "sha256-RsONSrgfiOUKgIoiQf9yXff1pYH2TFecr3zaotUuImw=";
+  vendorHash = "sha256-wAG+bp7lwd7VGxPZ1Ii0GmFdTGec01cfBzhBwiKiaIQ=";
 
   # Only build the rebuild-fod program
   subPackages = [ "cmd/rebuild-fod" ];
