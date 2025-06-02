@@ -1,13 +1,12 @@
 {
   pkgs,
-  flake,
   pname,
+  flake,
+  src ? flake, # Default to the root of the project
 }:
 pkgs.buildGoModule {
-  inherit pname;
+  inherit src pname;
   version = "0.1.0";
-
-  src = flake;
 
   vendorHash = "sha256-wAG+bp7lwd7VGxPZ1Ii0GmFdTGec01cfBzhBwiKiaIQ=";
 

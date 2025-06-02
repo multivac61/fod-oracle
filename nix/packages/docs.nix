@@ -2,13 +2,12 @@
   pkgs,
   flake,
   pname,
+  src ? flake,
 }:
 
 pkgs.stdenv.mkDerivation {
-  inherit pname;
+  inherit src pname;
   version = "0.1.0";
-
-  src = flake;
 
   buildInputs = [ pkgs.pandoc ];
 

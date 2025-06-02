@@ -1,8 +1,12 @@
-{ pkgs, flake, ... }:
+{
+  pkgs,
+  flake,
+  pname,
+  src ? flake,
+}:
 pkgs.buildGoModule {
-  pname = "fod-oracle";
+  inherit pname src;
   version = "0.0";
-  src = flake;
   vendorHash = "sha256-wAG+bp7lwd7VGxPZ1Ii0GmFdTGec01cfBzhBwiKiaIQ=";
 
   # Add proper Go test execution
