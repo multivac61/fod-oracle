@@ -1,11 +1,13 @@
 {
   pkgs,
   flake,
-  pname,
   src ? flake,
 }:
+let
+  pname = "fod-oracle";
+in
 pkgs.buildGoModule {
-  inherit pname src;
+  inherit src pname;
   version = "0.0";
   vendorHash = "sha256-wAG+bp7lwd7VGxPZ1Ii0GmFdTGec01cfBzhBwiKiaIQ=";
 
@@ -37,7 +39,7 @@ pkgs.buildGoModule {
 
   nativeBuildInputs = [ pkgs.makeWrapper ];
   postFixup = ''
-    wrapProgram $out/bin/fod-oracle \
+    wrapProgram $out/bin/${pname} \
       --prefix PATH : ${
         pkgs.lib.makeBinPath (
           with pkgs;
