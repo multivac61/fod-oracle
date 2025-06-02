@@ -33,6 +33,7 @@ func isFlakeReference(expr string) bool {
 // evalFlakeReference evaluates a flake reference and returns the derivation path
 func evalFlakeReference(flakeRef string) (string, error) {
 	debugLogNix("Evaluating flake reference: %s", flakeRef)
+	debugLogNix("DEBUG: Starting evalFlakeReference with: %s", flakeRef)
 
 	// Check if we have a flake reference with attribute path
 	parts := strings.SplitN(flakeRef, "#", 2)
@@ -44,28 +45,39 @@ func evalFlakeReference(flakeRef string) (string, error) {
 
 	var cmd *exec.Cmd
 
-	// Try using nix build with --derivation flag first, which is more reliable for complex flake references
+	// Try using nix-instantiate first, which is more direct for getting .drv paths
 	if attrPath != "" {
 		// Handle different formats of attribute paths with proper escaping
-		debugLogNix("Using nix build with flake reference: %s#%s", flakeURI, attrPath)
+		debugLogNix("Using nix-instantiate with flake reference: %s#%s", flakeURI, attrPath)
 
-		// Use nix build with --dry-run and --derivation to get the .drv path
-		cmd = exec.Command("nix", "build", "--dry-run", "--derivation", "--print-out-paths", flakeRef)
+		// Use nix-instantiate which directly gives us .drv paths
+		cmd = exec.Command("nix-instantiate", "--expr", fmt.Sprintf("(builtins.getFlake \"%s\").%s", flakeURI, attrPath))
+		cmd.Env = append(os.Environ(), "NIXPKGS_ALLOW_UNFREE=1", "NIXPKGS_ALLOW_BROKEN=1")
 	} else {
 		// Just a flake URI without an attribute path - use the default package
-		debugLogNix("Using nix build with default package for flake: %s", flakeURI)
-		cmd = exec.Command("nix", "build", "--dry-run", "--derivation", "--print-out-paths",
-			fmt.Sprintf("%s#defaultPackage.x86_64-linux", flakeURI))
+		debugLogNix("Using nix-instantiate with default package for flake: %s", flakeURI)
+		cmd = exec.Command("nix-instantiate", "--expr", fmt.Sprintf("(builtins.getFlake \"%s\").defaultPackage.x86_64-linux", flakeURI))
+		cmd.Env = append(os.Environ(), "NIXPKGS_ALLOW_UNFREE=1", "NIXPKGS_ALLOW_BROKEN=1")
 	}
 
 	// Run the command
 	output, err := cmd.CombinedOutput()
+	debugLogNix("nix-instantiate output: %s", string(output))
+	debugLogNix("nix-instantiate error: %v", err)
 	if err == nil {
-		// Successfully got the derivation path with nix build
+		// Successfully got the derivation path(s) with nix-instantiate
 		outStr := strings.TrimSpace(string(output))
-		if strings.HasPrefix(outStr, "/nix/store/") && strings.HasSuffix(outStr, ".drv") {
-			return outStr, nil
+		lines := strings.Split(outStr, "\n")
+
+		// Get the first valid derivation path (for multi-output cases)
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "/nix/store/") && strings.HasSuffix(line, ".drv") {
+				debugLogNix("Found valid derivation path: %s", line)
+				return line, nil
+			}
 		}
+		debugLogNix("No valid derivation paths found in output")
 	}
 
 	// If nix build failed or returned invalid output, try nix eval
@@ -154,9 +166,9 @@ func evalFlakeReference(flakeRef string) (string, error) {
 	if err != nil {
 		// Try a direct instantiation as last resort
 		if attrPath != "" {
-			cmd = exec.Command("nix-instantiate", "--expr", fmt.Sprintf("builtins.getFlake \"%s\".%s", flakeURI, attrPath))
+			cmd = exec.Command("nix-instantiate", "--expr", fmt.Sprintf("(builtins.getFlake \"%s\").%s", flakeURI, attrPath))
 		} else {
-			cmd = exec.Command("nix-instantiate", "--expr", fmt.Sprintf("builtins.getFlake \"%s\".defaultPackage.x86_64-linux", flakeURI))
+			cmd = exec.Command("nix-instantiate", "--expr", fmt.Sprintf("(builtins.getFlake \"%s\").defaultPackage.x86_64-linux", flakeURI))
 		}
 		output, err = cmd.CombinedOutput()
 		if err != nil {
@@ -187,8 +199,11 @@ func evalFlakeReference(flakeRef string) (string, error) {
 
 // evalNixExpression evaluates a Nix expression and returns the derivation path
 func evalNixExpression(expr string) (string, error) {
+	debugLogNix("DEBUG: evalNixExpression called with: %s", expr)
+	debugLogNix("DEBUG: isFlakeReference returned: %v", isFlakeReference(expr))
 	// First check if this is a flake reference
 	if isFlakeReference(expr) {
+		debugLogNix("DEBUG: Calling evalFlakeReference")
 		return evalFlakeReference(expr)
 	}
 
