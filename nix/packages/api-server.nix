@@ -9,7 +9,7 @@ pkgs.buildGoModule {
 
   src = flake;
 
-  vendorHash = "sha256-svQ1hG30MjNjiYE+NqCaWeD5eX+Li4N9G3sUJsr4PF0=";
+  vendorHash = "sha256-wAG+bp7lwd7VGxPZ1Ii0GmFdTGec01cfBzhBwiKiaIQ=";
 
   postBuild = ''
     go build -o api-server ./cmd/api
