@@ -112,7 +112,7 @@ func main() {
 	defer cancel()
 
 	// Run the rebuild
-	result, err := fod.RebuildFOD(ctx, drvPath)
+	result, err := fod.RebuildFOD(ctx, drvPath, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
