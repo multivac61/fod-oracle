@@ -786,7 +786,7 @@ func getOrCreateRevision(db *sql.DB, rev string) (int64, error) {
 
 func findFODsForRevision(rev string, revisionID int64, db *sql.DB, writer Writer) error {
 	revStartTime := time.Now()
-	log.Printf("[%s] Starting to find FODs...", rev)
+	debugLog("[%s] Starting to find FODs...", rev)
 
 	// Prepare worktree
 	worktreeDir, err := prepareNixpkgsWorktree(rev)
@@ -879,9 +879,9 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB, writer Writer
 	// Wait for completion or timeout
 	select {
 	case <-done:
-		log.Printf("[%s] All derivations processed", rev)
+		debugLog("[%s] All derivations processed", rev)
 	case <-time.After(1 * time.Hour):
-		log.Printf("[%s] Processing timed out after 1 hour", rev)
+		debugLog("[%s] Processing timed out after 1 hour", rev)
 	}
 
 	// Flush and get stats
@@ -930,12 +930,12 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 		if _, err := os.Stat(path); err == nil {
 			fileStats[path].exists = true
 			existingPaths = append(existingPaths, path)
-			log.Printf("[%s] Found: %s", rev, relPath)
+			debugLog("[%s] Found: %s", rev, relPath)
 		}
 	}
 
 	if len(existingPaths) == 0 {
-		log.Printf("[%s] No suitable Nix files found, will try fallback", rev)
+		debugLog("[%s] No suitable Nix files found, will try fallback", rev)
 	}
 
 	// Global deduplication map
@@ -1023,7 +1023,7 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 
 				jobCount++
 				if jobCount%1000 == 0 {
-					log.Printf("[%s] Processed %d jobs from %s (unique: %d, total: %d)",
+					debugLog("[%s] Processed %d jobs from %s (unique: %d, total: %d)",
 						rev, jobCount, relPath, len(fileVisited), totalJobCount)
 				}
 			}
@@ -1055,12 +1055,12 @@ func streamNixEvalJobs(rev string, nixpkgsDir string, workers int, drvPathChan c
 
 	// If we found some jobs, consider it a success
 	if totalJobCount > 0 {
-		log.Printf("[%s] Found %d unique derivations across all files", rev, totalJobCount)
+		debugLog("[%s] Found %d unique derivations across all files", rev, totalJobCount)
 		return nil
 	}
 
 	// Try fallback mechanism if no jobs found
-	log.Printf("[%s] No jobs found, trying fallback...", rev)
+	debugLog("[%s] No jobs found, trying fallback...", rev)
 	*usedFallback = true
 
 	// Create fallback Nix file
@@ -1110,14 +1110,14 @@ in drvPaths
 	fallbackStats.exists = true
 
 	// Try to evaluate with nix-instantiate
-	log.Printf("[%s] Running fallback with nix-instantiate", rev)
+	debugLog("[%s] Running fallback with nix-instantiate", rev)
 	fallbackCmd := exec.Command("nix-instantiate", "--eval", "--json", fallbackPath)
 	fallbackCmd.Dir = nixpkgsDir
 	fallbackOutput, err := fallbackCmd.Output()
 	// Handle fallback failure
 	if err != nil {
 		fallbackStats.errorMessage = fmt.Sprintf("Fallback failed: %v", err)
-		log.Printf("[%s] All evaluation methods failed, recording revision anyway", rev)
+		debugLog("[%s] All evaluation methods failed, recording revision anyway", rev)
 		printExpressionSummary(rev, nixpkgsDir, possiblePaths, fileStats, fallbackPath)
 		return nil
 	}
@@ -1147,11 +1147,11 @@ in drvPaths
 
 	if len(fallbackVisited) > 0 {
 		fallbackStats.succeeded = true
-		log.Printf("[%s] Fallback found %d derivations", rev, len(fallbackVisited))
+		debugLog("[%s] Fallback found %d derivations", rev, len(fallbackVisited))
 		return nil
 	}
 
-	log.Printf("[%s] Fallback found no derivations", rev)
+	debugLog("[%s] Fallback found no derivations", rev)
 	return fmt.Errorf("all evaluation methods failed for %s", rev)
 }
 
@@ -1269,8 +1269,8 @@ func storeEvaluationMetadata(db *sql.DB, revisionID int64, stats map[string]*exp
 }
 
 func printExpressionSummary(rev, nixpkgsDir string, basePaths []string, stats map[string]*exprFileStats, extraPaths ...string) {
-	log.Printf("[%s] Expression file evaluation summary:", rev)
-	log.Printf("[%s] %-50s %-10s %-10s %-10s %-10s %s",
+	debugLog("[%s] Expression file evaluation summary:", rev)
+	debugLog("[%s] %-50s %-10s %-10s %-10s %-10s %s",
 		rev, "FILE", "EXISTS", "ATTEMPTED", "SUCCEEDED", "DERIVATIONS", "ERROR")
 
 	// First print the base paths
@@ -1286,7 +1286,7 @@ func printExpressionSummary(rev, nixpkgsDir string, basePaths []string, stats ma
 					errorSummary = s.errorMessage
 				}
 			}
-			log.Printf("[%s] %-50s %-10t %-10t %-10t %-10d %s",
+			debugLog("[%s] %-50s %-10t %-10t %-10t %-10d %s",
 				rev, relPath, s.exists, s.attempted, s.succeeded,
 				s.derivationsFound, errorSummary)
 		}
@@ -1305,7 +1305,7 @@ func printExpressionSummary(rev, nixpkgsDir string, basePaths []string, stats ma
 					errorSummary = s.errorMessage
 				}
 			}
-			log.Printf("[%s] %-50s %-10t %-10t %-10t %-10d %s",
+			debugLog("[%s] %-50s %-10t %-10t %-10t %-10d %s",
 				rev, relPath, s.exists, s.attempted, s.succeeded,
 				s.derivationsFound, errorSummary)
 		}
@@ -1329,7 +1329,7 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 
 	// Clean up existing worktree if it exists
 	if _, err := os.Stat(worktreeDir); err == nil {
-		log.Printf("Removing existing worktree directory: %s", worktreeDir)
+		debugLog("Removing existing worktree directory: %s", worktreeDir)
 		if err := os.RemoveAll(worktreeDir); err != nil {
 			return "", fmt.Errorf("failed to remove existing worktree directory: %w", err)
 		}
@@ -1337,23 +1337,33 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 
 	// Initialize or update the main repository with minimal history
 	if _, err := os.Stat(mainRepoDir); os.IsNotExist(err) {
-		log.Printf("Initializing shallow clone of nixpkgs repository")
+		debugLog("Initializing shallow clone of nixpkgs repository")
 		if err := os.MkdirAll(filepath.Dir(mainRepoDir), 0o755); err != nil {
 			return "", fmt.Errorf("failed to create parent directory: %w", err)
 		}
 
 		// Initialize a bare repository
 		initCmd := exec.Command("git", "init", "--bare", mainRepoDir)
-		initCmd.Stdout = os.Stdout
-		initCmd.Stderr = os.Stderr
+		if !config.Debug {
+			initCmd.Stdout = nil
+			initCmd.Stderr = nil
+		} else {
+			initCmd.Stdout = os.Stdout
+			initCmd.Stderr = os.Stderr
+		}
 		if err := initCmd.Run(); err != nil {
 			return "", fmt.Errorf("failed to initialize bare repository: %w", err)
 		}
 
 		// Add the remote
 		remoteCmd := exec.Command("git", "-C", mainRepoDir, "remote", "add", "origin", repoURL)
-		remoteCmd.Stdout = os.Stdout
-		remoteCmd.Stderr = os.Stderr
+		if !config.Debug {
+			remoteCmd.Stdout = nil
+			remoteCmd.Stderr = nil
+		} else {
+			remoteCmd.Stdout = os.Stdout
+			remoteCmd.Stderr = os.Stderr
+		}
 		if err := remoteCmd.Run(); err != nil {
 			return "", fmt.Errorf("failed to add remote: %w", err)
 		}
@@ -1361,26 +1371,41 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 
 	// Prune any stale worktrees first
 	pruneCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "prune")
-	pruneCmd.Stdout = os.Stdout
-	pruneCmd.Stderr = os.Stderr
+	if !config.Debug {
+		pruneCmd.Stdout = nil
+		pruneCmd.Stderr = nil
+	} else {
+		pruneCmd.Stdout = os.Stdout
+		pruneCmd.Stderr = os.Stderr
+	}
 	if err := pruneCmd.Run(); err != nil {
 		log.Printf("Warning: Failed to prune worktrees: %v", err)
 	}
 
 	// Fetch only the specific revision
-	log.Printf("Fetching only commit %s from repository", rev)
+	debugLog("Fetching only commit %s from repository", rev)
 	fetchCmd := exec.Command("git", "-C", mainRepoDir, "fetch", "--depth=1", "origin", rev)
-	fetchCmd.Stdout = os.Stdout
-	fetchCmd.Stderr = os.Stderr
+	if !config.Debug {
+		fetchCmd.Stdout = nil
+		fetchCmd.Stderr = nil
+	} else {
+		fetchCmd.Stdout = os.Stdout
+		fetchCmd.Stderr = os.Stderr
+	}
 	if err := fetchCmd.Run(); err != nil {
 		return "", fmt.Errorf("failed to fetch revision: %w", err)
 	}
 
 	// Create the worktree with force flag
-	log.Printf("Creating worktree for revision %s", rev)
+	debugLog("Creating worktree for revision %s", rev)
 	addCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "add", "--force", "--detach", worktreeDir, rev)
-	addCmd.Stdout = os.Stdout
-	addCmd.Stderr = os.Stderr
+	if !config.Debug {
+		addCmd.Stdout = nil
+		addCmd.Stderr = nil
+	} else {
+		addCmd.Stdout = os.Stdout
+		addCmd.Stderr = os.Stderr
+	}
 	if err := addCmd.Run(); err != nil {
 		return "", fmt.Errorf("failed to create worktree: %w", err)
 	}
@@ -1391,7 +1416,7 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 		log.Printf("Warning: Could not find %s, structure may have changed", minverPath)
 	}
 
-	log.Printf("Prepared worktree for revision %s at %s", rev, worktreeDir)
+	debugLog("Prepared worktree for revision %s at %s", rev, worktreeDir)
 	return worktreeDir, nil
 }
 
@@ -1414,8 +1439,13 @@ func cleanupWorktrees() error {
 
 	// Prune worktrees
 	pruneCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "prune")
-	pruneCmd.Stdout = os.Stdout
-	pruneCmd.Stderr = os.Stderr
+	if !config.Debug {
+		pruneCmd.Stdout = nil
+		pruneCmd.Stderr = nil
+	} else {
+		pruneCmd.Stdout = os.Stdout
+		pruneCmd.Stderr = os.Stderr
+	}
 	if err := pruneCmd.Run(); err != nil {
 		return fmt.Errorf("failed to prune worktrees: %w", err)
 	}
@@ -1429,7 +1459,7 @@ func cleanupWorktrees() error {
 	for _, entry := range entries {
 		if entry.IsDir() && isWorktreeDir(entry.Name()) {
 			worktreePath := filepath.Join(scriptDir, entry.Name())
-			log.Printf("Removing leftover worktree directory: %s", worktreePath)
+			debugLog("Removing leftover worktree directory: %s", worktreePath)
 			if err := os.RemoveAll(worktreePath); err != nil {
 				log.Printf("Warning: Failed to remove directory %s: %v", worktreePath, err)
 			}
@@ -1611,41 +1641,41 @@ func main() {
 
 		revisionID, err := getOrCreateRevision(db, rev)
 		if err != nil {
-			log.Printf("Failed to get or create revision %s: %v", rev, err)
+			debugLog("Failed to get or create revision %s: %v", rev, err)
 			continue
 		}
 
 		// Create the writer (always a DBBatcher now)
 		writer, err := GetWriter(db, revisionID, rev)
 		if err != nil {
-			log.Printf("Error creating writer: %v", err)
+			debugLog("Error creating writer: %v", err)
 			continue
 		}
 
 		// Handle different processing modes
 		if isTestMode {
-			log.Printf("Running in test mode with derivation path: %s", testDrvPath)
+			debugLog("Running in test mode with derivation path: %s", testDrvPath)
 			if err := processTestDerivation(testDrvPath, revisionID, db, writer); err != nil {
-				log.Printf("Error processing test derivation: %v", err)
+				debugLog("Error processing test derivation: %v", err)
 			}
 		} else if *nixExpr {
 			// Process as Nix expression rather than as a Git revision
 			// Set IsNixExpr before processing to ensure reevaluation works correctly
 			config.IsNixExpr = true
 			if err := processNixExpression(rev, revisionID, db, writer); err != nil {
-				log.Printf("Error processing Nix expression: %v", err)
+				debugLog("Error processing Nix expression: %v", err)
 			}
 		} else {
 			// Normal mode - process as a Git revision
 			if err := findFODsForRevision(rev, revisionID, db, writer); err != nil {
-				log.Printf("Error finding FODs for revision %s: %v", rev, err)
+				debugLog("Error finding FODs for revision %s: %v", rev, err)
 			}
 		}
 
 		// Handle reevaluation if requested
 		if config.Reevaluate {
 			if err := reevaluateFODs(db, revisionID, rev, writer); err != nil {
-				log.Printf("Error reevaluating FODs for revision %s: %v", rev, err)
+				debugLog("Error reevaluating FODs for revision %s: %v", rev, err)
 			}
 		}
 
@@ -1666,7 +1696,7 @@ func main() {
 
 // processTestDerivation processes a single derivation for testing purposes
 func processTestDerivation(drvPath string, revisionID int64, db *sql.DB, writer Writer) error {
-	log.Printf("Processing test derivation: %s", drvPath)
+	debugLog("Processing test derivation: %s", drvPath)
 
 	// Mark this as a test/Nix expression
 	config.IsNixExpr = true
@@ -1700,9 +1730,9 @@ func processTestDerivation(drvPath string, revisionID int64, db *sql.DB, writer 
 	}
 
 	// Debug output - print the outputs and their properties
-	log.Printf("Derivation has %d outputs", len(drv.Outputs))
+	debugLog("Derivation has %d outputs", len(drv.Outputs))
 	for name, out := range drv.Outputs {
-		log.Printf("Output %s: Path=%s, HashAlgo=%s, Hash=%s",
+		debugLog("Output %s: Path=%s, HashAlgo=%s, Hash=%s",
 			name, out.Path, out.HashAlgorithm, out.Hash)
 	}
 
