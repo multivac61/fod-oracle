@@ -742,23 +742,11 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 		}
 	}
 
-	// Queue input derivations to process
+	// Queue input derivations to process sequentially to avoid goroutine explosion
 	for path := range drv.InputDerivations {
 		if _, loaded := ctx.visited.LoadOrStore(path, true); !loaded {
-			// Acquire semaphore to limit concurrency
-			select {
-			case ctx.semaphore <- struct{}{}:
-				// We got a slot, process in a new goroutine
-				ctx.wg.Add(1)
-				go func(drvPath string) {
-					defer ctx.wg.Done()
-					defer func() { <-ctx.semaphore }() // Release semaphore when done
-					processDerivation(drvPath, ctx)
-				}(path)
-			default:
-				// No slots available, process in current goroutine
-				processDerivation(path, ctx)
-			}
+			// Process sequentially to prevent goroutine explosion at massive scale
+			processDerivation(path, ctx)
 		}
 	}
 }
@@ -826,33 +814,21 @@ func findFODsForRevision(rev string, revisionID int64, db *sql.DB, writer Writer
 		visited:        visited,
 		processedPaths: &sync.Map{}, // Cache for processed derivations
 		wg:             &wg,
-		semaphore:      make(chan struct{}, 20000), // Increased concurrency limit
+		semaphore:      make(chan struct{}, 1000), // Reduced concurrency limit to prevent system overload
 	}
 
 	// Channel for derivation paths
-	drvPathChan := make(chan string, 200000) // Increased channel buffer
+	drvPathChan := make(chan string, 50000) // Reduced channel buffer
 	done := make(chan struct{})
 
-	// Start processor goroutine
+	// Start processor goroutine with limited concurrency
 	go func() {
 		for drvPath := range drvPathChan {
 			if _, loaded := visited.LoadOrStore(drvPath, true); !loaded {
-				// Try to process in new goroutine
-				select {
-				case ctx.semaphore <- struct{}{}:
-					wg.Add(1)
-					go func(path string) {
-						defer wg.Done()
-						defer func() { <-ctx.semaphore }()
-						processDerivation(path, ctx)
-					}(drvPath)
-				default:
-					// Process in current goroutine if semaphore full
-					processDerivation(drvPath, ctx)
-				}
+				// Always process in current goroutine to avoid goroutine explosion
+				processDerivation(drvPath, ctx)
 			}
 		}
-		wg.Wait()
 		close(done)
 	}()
 
@@ -1597,6 +1573,22 @@ func main() {
 		}
 	}
 
+	// Set debug flag from raw args too
+	for _, arg := range os.Args {
+		if arg == "-debug" || arg == "--debug" {
+			config.Debug = true
+			break
+		}
+	}
+
+	// Debug startup messages only in debug mode
+	debugLog("FOD Oracle starting...")
+	debugLog("Flags parsed successfully")
+	debugLog("Debug flag set: %v", *debugFlag)
+	debugLog("Reevaluate flag set: %v", *reevaluateFlag)
+	debugLog("Final reevaluate setting: %v", config.Reevaluate)
+	debugLog("Final debug setting: %v", config.Debug)
+
 	// Now we can use debugLog since config is set
 	debugLog("Starting FOD finder...")
 
@@ -1646,6 +1638,7 @@ func main() {
 		config.BuildDelay = *buildDelayFlag
 	}
 	// Set parallel workers
+	debugLog("parallelFlag value: %d", *parallelFlag)
 	if *parallelFlag > 0 {
 		config.ParallelWorkers = *parallelFlag
 		if config.ParallelWorkers > 1 {
@@ -1653,6 +1646,25 @@ func main() {
 		}
 	} else {
 		config.ParallelWorkers = 1
+	}
+	debugLog("Final ParallelWorkers setting: %d", config.ParallelWorkers)
+
+	// Set parallel workers from raw args too (workaround for flag parsing issues)
+	for i, arg := range os.Args {
+		if (arg == "-parallel" || arg == "--parallel") && i+1 < len(os.Args) {
+			if val, err := strconv.Atoi(os.Args[i+1]); err == nil && val > 0 {
+				config.ParallelWorkers = val
+				debugLog("Override ParallelWorkers from raw args: %d", val)
+			}
+			break
+		}
+		if strings.HasPrefix(arg, "--parallel=") {
+			if val, err := strconv.Atoi(strings.TrimPrefix(arg, "--parallel=")); err == nil && val > 0 {
+				config.ParallelWorkers = val
+				debugLog("Override ParallelWorkers from raw args (=syntax): %d", val)
+			}
+			break
+		}
 	}
 
 	// Debug flag already set earlier
@@ -1732,12 +1744,14 @@ func main() {
 
 	// Process revisions sequentially
 	for _, rev := range revisions {
+		debugLog("Starting processing for revision: %s", rev)
 
 		revisionID, err := getOrCreateRevision(db, rev)
 		if err != nil {
 			debugLog("Failed to get or create revision %s: %v", rev, err)
 			continue
 		}
+		debugLog("Created revision ID: %d", revisionID)
 
 		// Create the writer (always a DBBatcher now)
 		writer, err := GetWriter(db, revisionID, rev)
@@ -1745,6 +1759,7 @@ func main() {
 			debugLog("Error creating writer: %v", err)
 			continue
 		}
+		debugLog("Created writer successfully")
 
 		// Handle different processing modes
 		if isTestMode {
@@ -1766,11 +1781,9 @@ func main() {
 			}
 		}
 
-		// Handle reevaluation if requested
+		// Handle reevaluation if requested - now handled in writer.Close()
 		if config.Reevaluate {
-			if err := reevaluateFODs(db, revisionID, rev, writer); err != nil {
-				debugLog("Error reevaluating FODs for revision %s: %v", rev, err)
-			}
+			debugLog("Reevaluation will be handled during writer.Close()")
 		}
 
 		// Close the writer
