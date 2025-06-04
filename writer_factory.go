@@ -60,14 +60,14 @@ type Writer interface {
 
 // JSONLinesWriter writes FODs with rebuild info as JSON Lines to stdout
 type JSONLinesWriter struct {
-	db           *sql.DB
-	revisionID   int64
-	mutex        sync.Mutex
-	rebuildMap   map[string]*RebuildInfo // Cache for rebuild information
-	fodMap       map[string]*FOD         // Cache for FOD information
-	rebuildChan  chan FOD                // Channel for concurrent rebuilding
-	workersWG    sync.WaitGroup          // Wait group for workers
-	workersStarted bool                  // Track if workers are started
+	db             *sql.DB
+	revisionID     int64
+	mutex          sync.Mutex
+	rebuildMap     map[string]*RebuildInfo // Cache for rebuild information
+	fodMap         map[string]*FOD         // Cache for FOD information
+	rebuildChan    chan FOD                // Channel for concurrent rebuilding
+	workersWG      sync.WaitGroup          // Wait group for workers
+	workersStarted bool                    // Track if workers are started
 }
 
 // RebuildInfo holds rebuild status information
@@ -80,14 +80,14 @@ type RebuildInfo struct {
 // NewJSONLinesWriter creates a new JSON Lines writer
 func NewJSONLinesWriter(db *sql.DB, revisionID int64) *JSONLinesWriter {
 	w := &JSONLinesWriter{
-		db:         db,
-		revisionID: revisionID,
-		rebuildMap: make(map[string]*RebuildInfo),
-		fodMap:     make(map[string]*FOD),
-		rebuildChan: make(chan FOD, 10000), // Large buffer for discovered FODs
+		db:             db,
+		revisionID:     revisionID,
+		rebuildMap:     make(map[string]*RebuildInfo),
+		fodMap:         make(map[string]*FOD),
+		rebuildChan:    make(chan FOD, 10000), // Large buffer for discovered FODs
 		workersStarted: false,
 	}
-	
+
 	return w
 }
 
@@ -103,13 +103,13 @@ func (w *JSONLinesWriter) AddFOD(fod FOD) {
 	if config.Reevaluate {
 		// In reevaluate mode, store in database and send to rebuild workers
 		w.insertFODToDatabase(fod)
-		
+
 		// Start workers on first FOD
 		if !w.workersStarted {
 			w.startRebuildWorkers()
 			w.workersStarted = true
 		}
-		
+
 		// Send to rebuild workers immediately (non-blocking)
 		select {
 		case w.rebuildChan <- fod:
@@ -117,7 +117,7 @@ func (w *JSONLinesWriter) AddFOD(fod FOD) {
 		default:
 			debugLog("DISCOVERY: Channel full, skipping FOD: %s", fod.DrvPath)
 		}
-		
+
 		// Don't output basic FOD - only output rebuild results
 	} else {
 		// In normal mode, output FODs immediately without rebuild info
@@ -264,13 +264,13 @@ func (w *JSONLinesWriter) Flush() {
 func (w *JSONLinesWriter) Close() error {
 	if config.Reevaluate && w.workersStarted {
 		debugLog("Discovery complete, waiting for all rebuilds to finish...")
-		
+
 		// Close the channel to signal no more FODs
 		close(w.rebuildChan)
-		
+
 		// Wait for all workers to finish
 		w.workersWG.Wait()
-		
+
 		debugLog("All rebuild workers completed")
 	}
 	return nil
@@ -280,7 +280,7 @@ func (w *JSONLinesWriter) Close() error {
 func (w *JSONLinesWriter) startRebuildWorkers() {
 	numWorkers := config.ParallelWorkers
 	debugLog("Starting %d concurrent rebuild workers", numWorkers)
-	
+
 	for i := 0; i < numWorkers; i++ {
 		w.workersWG.Add(1)
 		go w.rebuildWorker(i)
@@ -291,7 +291,7 @@ func (w *JSONLinesWriter) startRebuildWorkers() {
 func (w *JSONLinesWriter) rebuildWorker(workerID int) {
 	defer w.workersWG.Done()
 	debugLog("Rebuild worker %d started", workerID)
-	
+
 	for fod := range w.rebuildChan {
 		// Apply build delay if configured
 		if config.BuildDelay > 0 {
@@ -304,7 +304,7 @@ func (w *JSONLinesWriter) rebuildWorker(workerID int) {
 		// Output rebuild result immediately
 		w.AddRebuildInfo(fod.DrvPath, status, actualHash, errorMsg)
 	}
-	
+
 	debugLog("Rebuild worker %d finished", workerID)
 }
 

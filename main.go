@@ -1581,7 +1581,6 @@ func main() {
 		}
 	}
 
-
 	// Debug startup messages only in debug mode
 	debugLog("FOD Oracle starting...")
 	debugLog("Flags parsed successfully")
