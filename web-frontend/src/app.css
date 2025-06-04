@@ -1,0 +1,58 @@
+@import "tailwindcss";
+
+@theme {
+  --color-fod-dark: #0a0a0a;
+  --color-fod-gray: #1a1a1a;
+  --color-fod-green: #00ff88;
+  --color-fod-blue: #3b82f6;
+  --color-fod-red: #ef4444;
+  --color-fod-yellow: #f59e0b;
+}
+
+@layer base {
+  body {
+    @apply bg-fod-dark text-white font-mono;
+  }
+}
+
+@layer components {
+  .fod-card {
+    @apply bg-fod-gray border border-gray-700 rounded-lg p-6 shadow-lg;
+  }
+  
+  .fod-stat {
+    @apply text-center p-4 bg-fod-gray rounded-lg border border-gray-700;
+  }
+  
+  .fod-stat-value {
+    @apply text-3xl font-bold text-fod-green;
+  }
+  
+  .fod-stat-label {
+    @apply text-sm text-gray-400 mt-1;
+  }
+  
+  .fod-item {
+    @apply bg-gray-800 border-l-4 border-fod-green p-3 mb-2 rounded-r-lg;
+  }
+  
+  .fod-item-failed {
+    @apply border-fod-red;
+  }
+  
+  .fod-item-success {
+    @apply border-fod-green;
+  }
+  
+  .fod-item-pending {
+    @apply border-fod-yellow;
+  }
+  
+  .fod-button {
+    @apply bg-fod-green text-black px-4 py-2 rounded-lg font-medium hover:bg-green-400 transition-colors;
+  }
+  
+  .fod-button-secondary {
+    @apply bg-gray-700 text-white px-4 py-2 rounded-lg font-medium hover:bg-gray-600 transition-colors;
+  }
+}

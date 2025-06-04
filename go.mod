@@ -1,6 +1,8 @@
 module github.com/multivac61/fod-oracle
 
-go 1.21
+go 1.23.0
+
+toolchain go1.24.3
 
 require (
 	github.com/go-chi/chi/v5 v5.0.11
