@@ -76,6 +76,9 @@ _testmain.go
 nixpkgs-*
 bin/
 
+# Nixpkgs worktree cache directory
+.nixpkgs/
+
 # output file extensions
 *.parquet
 *.csv

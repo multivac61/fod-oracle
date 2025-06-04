@@ -1322,83 +1322,44 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 		return "", fmt.Errorf("failed to get current directory: %w", err)
 	}
 
-	// Create a main repository directory if it doesn't exist
-	mainRepoDir := filepath.Join(scriptDir, "nixpkgs-repo")
-	worktreeDir := filepath.Join(scriptDir, fmt.Sprintf("nixpkgs-worktree-%s", rev))
+	// Use .nixpkgs directory to hide from user repo
+	nixpkgsDir := filepath.Join(scriptDir, ".nixpkgs")
+	mainRepoDir := filepath.Join(nixpkgsDir, "repo")
+	worktreeDir := filepath.Join(nixpkgsDir, "worktrees", rev)
 	repoURL := "https://github.com/NixOS/nixpkgs.git"
 
-	// Clean up existing worktree if it exists
+	// Create .nixpkgs directory structure
+	if err := os.MkdirAll(filepath.Join(nixpkgsDir, "worktrees"), 0o755); err != nil {
+		return "", fmt.Errorf("failed to create .nixpkgs directory structure: %w", err)
+	}
+
+	// Check if worktree already exists and is valid
+	if isValidWorktree(worktreeDir, rev) {
+		debugLog("Reusing existing worktree for revision %s", rev)
+		return worktreeDir, nil
+	}
+
+	// Initialize or update the main repository
+	if err := ensureMainRepository(mainRepoDir, repoURL); err != nil {
+		return "", fmt.Errorf("failed to ensure main repository: %w", err)
+	}
+
+	// Clean up existing worktree if it exists but is invalid
 	if _, err := os.Stat(worktreeDir); err == nil {
-		debugLog("Removing existing worktree directory: %s", worktreeDir)
-		if err := os.RemoveAll(worktreeDir); err != nil {
-			return "", fmt.Errorf("failed to remove existing worktree directory: %w", err)
+		debugLog("Cleaning up invalid worktree for revision %s", rev)
+		if err := removeWorktree(mainRepoDir, worktreeDir); err != nil {
+			debugLog("Warning: Failed to clean up invalid worktree: %v", err)
 		}
 	}
 
-	// Initialize or update the main repository with minimal history
-	if _, err := os.Stat(mainRepoDir); os.IsNotExist(err) {
-		debugLog("Initializing shallow clone of nixpkgs repository")
-		if err := os.MkdirAll(filepath.Dir(mainRepoDir), 0o755); err != nil {
-			return "", fmt.Errorf("failed to create parent directory: %w", err)
-		}
-
-		// Initialize a bare repository
-		initCmd := exec.Command("git", "init", "--bare", mainRepoDir)
-		if !config.Debug {
-			initCmd.Stdout = nil
-			initCmd.Stderr = nil
-		} else {
-			initCmd.Stdout = os.Stdout
-			initCmd.Stderr = os.Stderr
-		}
-		if err := initCmd.Run(); err != nil {
-			return "", fmt.Errorf("failed to initialize bare repository: %w", err)
-		}
-
-		// Add the remote
-		remoteCmd := exec.Command("git", "-C", mainRepoDir, "remote", "add", "origin", repoURL)
-		if !config.Debug {
-			remoteCmd.Stdout = nil
-			remoteCmd.Stderr = nil
-		} else {
-			remoteCmd.Stdout = os.Stdout
-			remoteCmd.Stderr = os.Stderr
-		}
-		if err := remoteCmd.Run(); err != nil {
-			return "", fmt.Errorf("failed to add remote: %w", err)
-		}
-	}
-
-	// Prune any stale worktrees first
-	pruneCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "prune")
-	if !config.Debug {
-		pruneCmd.Stdout = nil
-		pruneCmd.Stderr = nil
-	} else {
-		pruneCmd.Stdout = os.Stdout
-		pruneCmd.Stderr = os.Stderr
-	}
-	if err := pruneCmd.Run(); err != nil {
-		log.Printf("Warning: Failed to prune worktrees: %v", err)
-	}
-
-	// Fetch only the specific revision
-	debugLog("Fetching only commit %s from repository", rev)
-	fetchCmd := exec.Command("git", "-C", mainRepoDir, "fetch", "--depth=1", "origin", rev)
-	if !config.Debug {
-		fetchCmd.Stdout = nil
-		fetchCmd.Stderr = nil
-	} else {
-		fetchCmd.Stdout = os.Stdout
-		fetchCmd.Stderr = os.Stderr
-	}
-	if err := fetchCmd.Run(); err != nil {
+	// Fetch the specific revision if we don't have it
+	if err := fetchRevisionIfNeeded(mainRepoDir, rev); err != nil {
 		return "", fmt.Errorf("failed to fetch revision: %w", err)
 	}
 
-	// Create the worktree with force flag
+	// Create the worktree
 	debugLog("Creating worktree for revision %s", rev)
-	addCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "add", "--force", "--detach", worktreeDir, rev)
+	addCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "add", "--detach", worktreeDir, rev)
 	if !config.Debug {
 		addCmd.Stdout = nil
 		addCmd.Stderr = nil
@@ -1410,17 +1371,150 @@ func prepareNixpkgsWorktree(rev string) (string, error) {
 		return "", fmt.Errorf("failed to create worktree: %w", err)
 	}
 
-	// Verify worktree
-	minverPath := filepath.Join(worktreeDir, "lib", "minver.nix")
-	if _, err := os.Stat(minverPath); os.IsNotExist(err) {
-		log.Printf("Warning: Could not find %s, structure may have changed", minverPath)
+	// Verify worktree structure
+	if err := verifyWorktreeStructure(worktreeDir); err != nil {
+		debugLog("Warning: %v", err)
 	}
 
 	debugLog("Prepared worktree for revision %s at %s", rev, worktreeDir)
 	return worktreeDir, nil
 }
 
-// isWorktreeDir checks if a directory is a nixpkgs worktree directory
+// isValidWorktree checks if a worktree exists and points to the correct revision
+func isValidWorktree(worktreeDir, expectedRev string) bool {
+	// Check if directory exists
+	if _, err := os.Stat(worktreeDir); os.IsNotExist(err) {
+		return false
+	}
+
+	// Check if it's a valid git worktree by checking HEAD
+	headFile := filepath.Join(worktreeDir, ".git", "HEAD")
+	if _, err := os.Stat(headFile); os.IsNotExist(err) {
+		// Try alternative: .git might be a file pointing to the real git dir
+		gitFile := filepath.Join(worktreeDir, ".git")
+		if content, err := os.ReadFile(gitFile); err == nil {
+			if strings.HasPrefix(string(content), "gitdir:") {
+				return true // Assume it's valid if .git points to gitdir
+			}
+		}
+		return false
+	}
+
+	// Verify the worktree points to the expected revision
+	cmd := exec.Command("git", "-C", worktreeDir, "rev-parse", "HEAD")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+
+	currentRev := strings.TrimSpace(string(output))
+	return currentRev == expectedRev
+}
+
+// ensureMainRepository initializes or updates the main bare repository
+func ensureMainRepository(mainRepoDir, repoURL string) error {
+	// Check if repository already exists
+	if _, err := os.Stat(filepath.Join(mainRepoDir, "config")); err == nil {
+		debugLog("Main repository already exists at %s", mainRepoDir)
+		return nil
+	}
+
+	debugLog("Initializing bare repository at %s", mainRepoDir)
+	if err := os.MkdirAll(filepath.Dir(mainRepoDir), 0o755); err != nil {
+		return fmt.Errorf("failed to create parent directory: %w", err)
+	}
+
+	// Initialize a bare repository
+	initCmd := exec.Command("git", "init", "--bare", mainRepoDir)
+	if !config.Debug {
+		initCmd.Stdout = nil
+		initCmd.Stderr = nil
+	} else {
+		initCmd.Stdout = os.Stdout
+		initCmd.Stderr = os.Stderr
+	}
+	if err := initCmd.Run(); err != nil {
+		return fmt.Errorf("failed to initialize bare repository: %w", err)
+	}
+
+	// Add the remote
+	remoteCmd := exec.Command("git", "-C", mainRepoDir, "remote", "add", "origin", repoURL)
+	if !config.Debug {
+		remoteCmd.Stdout = nil
+		remoteCmd.Stderr = nil
+	} else {
+		remoteCmd.Stdout = os.Stdout
+		remoteCmd.Stderr = os.Stderr
+	}
+	if err := remoteCmd.Run(); err != nil {
+		return fmt.Errorf("failed to add remote: %w", err)
+	}
+
+	return nil
+}
+
+// fetchRevisionIfNeeded fetches a revision if it's not already available locally
+func fetchRevisionIfNeeded(mainRepoDir, rev string) error {
+	// Check if we already have this revision
+	checkCmd := exec.Command("git", "-C", mainRepoDir, "cat-file", "-e", rev)
+	checkCmd.Stdout = nil
+	checkCmd.Stderr = nil
+	if err := checkCmd.Run(); err == nil {
+		debugLog("Revision %s already available locally", rev)
+		return nil
+	}
+
+	// Fetch the specific revision with minimal history
+	debugLog("Fetching revision %s from remote", rev)
+	fetchCmd := exec.Command("git", "-C", mainRepoDir, "fetch", "--depth=1", "--no-tags", "origin", rev)
+	if !config.Debug {
+		fetchCmd.Stdout = nil
+		fetchCmd.Stderr = nil
+	} else {
+		fetchCmd.Stdout = os.Stdout
+		fetchCmd.Stderr = os.Stderr
+	}
+	if err := fetchCmd.Run(); err != nil {
+		return fmt.Errorf("failed to fetch revision %s: %w", rev, err)
+	}
+
+	return nil
+}
+
+// removeWorktree safely removes a worktree
+func removeWorktree(mainRepoDir, worktreeDir string) error {
+	// First try to remove it via git worktree remove
+	removeCmd := exec.Command("git", "-C", mainRepoDir, "worktree", "remove", "--force", worktreeDir)
+	removeCmd.Stdout = nil
+	removeCmd.Stderr = nil
+	if err := removeCmd.Run(); err != nil {
+		// If git worktree remove fails, manually remove the directory
+		debugLog("Git worktree remove failed, manually removing directory: %v", err)
+		return os.RemoveAll(worktreeDir)
+	}
+	return nil
+}
+
+// verifyWorktreeStructure checks if the worktree has expected nixpkgs structure
+func verifyWorktreeStructure(worktreeDir string) error {
+	// Check for some key nixpkgs files/directories
+	expectedPaths := []string{
+		filepath.Join(worktreeDir, "pkgs"),
+		filepath.Join(worktreeDir, "nixos"),
+		filepath.Join(worktreeDir, "lib"),
+		filepath.Join(worktreeDir, "default.nix"),
+	}
+
+	for _, path := range expectedPaths {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return fmt.Errorf("expected nixpkgs structure missing: %s", path)
+		}
+	}
+
+	return nil
+}
+
+// isWorktreeDir checks if a directory is a nixpkgs worktree directory (legacy function)
 func isWorktreeDir(name string) bool {
 	return strings.HasPrefix(name, "nixpkgs-worktree-")
 }
