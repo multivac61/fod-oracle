@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"sync"
@@ -74,11 +76,24 @@ func processDerivation(inputFile string, ctx *ProcessingContext) {
 }
 
 func main() {
-	if len(os.Args) != 2 {
-		log.Fatalf("Usage: %s <json-file>", os.Args[0])
+	var debug bool
+	flag.BoolVar(&debug, "debug", false, "Enable debug output to stderr")
+	flag.Parse()
+
+	// Set log output based on debug flag
+	if debug {
+		log.SetOutput(os.Stderr)
+	} else {
+		log.SetOutput(io.Discard) // Discard all log output
 	}
 
-	jsonFile := os.Args[1]
+	args := flag.Args()
+	if len(args) != 1 {
+		fmt.Fprintf(os.Stderr, "Usage: %s [--debug] <json-file>\n", os.Args[0])
+		os.Exit(1)
+	}
+
+	jsonFile := args[0]
 
 	// Read and parse JSON file
 	data, err := os.ReadFile(jsonFile)
