@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -40,6 +41,7 @@ type ProcessingContext struct {
 	rebuild            bool
 	failOnHashMismatch bool
 	hashMismatchFound  *sync.Map // Track if any hash mismatches were found
+	rebuildSemaphore   chan struct{} // Semaphore to limit concurrent rebuilds
 }
 
 func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
@@ -99,8 +101,12 @@ func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
 	}
 }
 
-// rebuildFOD attempts to rebuild a FOD and compare hashes
+// rebuildFOD attempts to rebuild a FOD to verify it works
 func rebuildFOD(fod *FOD, ctx *ProcessingContext) {
+	// Acquire semaphore to limit concurrent rebuilds
+	ctx.rebuildSemaphore <- struct{}{}
+	defer func() { <-ctx.rebuildSemaphore }()
+	
 	log.Printf("Rebuilding FOD: %s", fod.DrvPath)
 
 	// Use nix-build to rebuild the derivation
@@ -110,39 +116,28 @@ func rebuildFOD(fod *FOD, ctx *ProcessingContext) {
 	if err != nil {
 		fod.RebuildStatus = "failure"
 		fod.ErrorMessage = fmt.Sprintf("Build failed: %v\nOutput: %s", err, string(output))
+		
+		// Check if it's a hash mismatch and try to extract actual hash
+		if strings.Contains(string(output), "hash mismatch") {
+			fod.HashMismatch = true
+			ctx.hashMismatchFound.Store("found", true)
+			
+			// Simple regex to find "got: sha256-..." pattern
+			re := regexp.MustCompile(`got:\s*([a-zA-Z0-9-]+)`)
+			if matches := re.FindStringSubmatch(string(output)); len(matches) > 1 {
+				fod.ActualHash = matches[1]
+			}
+		}
 		return
 	}
 
-	// Parse the output to get the built store path
-	outputLines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(outputLines) == 0 {
-		fod.RebuildStatus = "failure"
-		fod.ErrorMessage = "No output path from nix-build"
-		return
-	}
-
-	builtPath := strings.TrimSpace(outputLines[len(outputLines)-1])
-
-	// Compute the actual SRI hash of the built output
-	actualHash, err := computeSRIHash(builtPath, fod.HashAlgorithm)
-	if err != nil {
-		fod.RebuildStatus = "failure"
-		fod.ErrorMessage = fmt.Sprintf("Failed to compute SRI hash of built output: %v", err)
-		return
-	}
-
-	fod.ActualHash = actualHash
+	// Build succeeded - hash was verified by Nix
 	fod.RebuildStatus = "success"
-
-	// Compare SRI hashes
-	expectedHash := normalizeToSRI(fod.Hash, fod.HashAlgorithm)
-
-	if expectedHash != actualHash {
-		fod.HashMismatch = true
-		// Track that we found a hash mismatch
-		ctx.hashMismatchFound.Store("found", true)
-	}
+	fod.HashMismatch = false
+	
+	log.Printf("FOD rebuild successful: %s", fod.DrvPath)
 }
+
 
 // computeSRIHash computes the SRI hash of a file or directory
 func computeSRIHash(path, hashAlgorithm string) (string, error) {
@@ -266,6 +261,7 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 	isExpr, _ := cmd.Flags().GetBool("expr")
 	rebuild, _ := cmd.Flags().GetBool("rebuild")
 	failOnHashMismatch, _ := cmd.Flags().GetBool("fail-on-hash-mismatch")
+	maxParallel, _ := cmd.Flags().GetInt("max-parallel")
 
 	// Validate flag combinations
 	if failOnHashMismatch && !rebuild {
@@ -313,6 +309,7 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 		rebuild:            rebuild,
 		failOnHashMismatch: failOnHashMismatch,
 		hashMismatchFound:  &sync.Map{},
+		rebuildSemaphore:   make(chan struct{}, maxParallel),
 	}
 
 	// Start output writer goroutine
@@ -386,6 +383,7 @@ patches, and other fixed content that needs to be downloaded from external sourc
 	rootCmd.Flags().Bool("expr", false, "Treat the argument as a Nix expression")
 	rootCmd.Flags().Bool("rebuild", false, "Rebuild FODs to verify their hashes")
 	rootCmd.Flags().Bool("fail-on-hash-mismatch", false, "Exit with error code if hash mismatches are found (requires --rebuild)")
+	rootCmd.Flags().Int("max-parallel", 1, "Maximum number of parallel rebuilds (default: 1)")
 
 	// Execute with fang for fancy output
 	if err := fang.Execute(context.Background(), rootCmd); err != nil {

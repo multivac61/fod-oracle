@@ -23,116 +23,84 @@ FOD Oracle is a tool for tracking and analyzing fixed-output derivations (FODs) 
 - **FOD Tracking**: Scans nixpkgs revisions and tracks all fixed-output derivations
 - **JSON Lines Streaming**: Outputs FODs as streaming JSON Lines for real-time processing
 - **FOD Rebuilding**: Verifies FOD integrity by rebuilding and comparing hashes
-- **API**: RESTful API for programmatic access to FOD data
-
-## Components
-
-- **CLI**: Command-line tool for scanning nixpkgs revisions and populating the database
-- **API Server**: Provides RESTful API access to the FOD data
 
 ## Usage
 
-### CLI
+```
+  fod-oracle finds all Fixed Output Derivations (FODs) in a Nix expression.
+  
+  FODs are derivations with predetermined output hashes, typically used for source code,
+  patches, and other fixed content that needs to be downloaded from external sources.
 
-FOD Oracle outputs all results as streaming JSON Lines to stdout, making it easy to process with tools like `jq` or pipe to other programs.
+  USAGE
 
-```bash
-# Process a simple Nix expression (outputs JSON Lines)
-./fod-oracle -expr "(import <nixpkgs> {}).hello"
 
-# Process a specific nixpkgs revision  
-./fod-oracle 1d250f4
+    fod-oracle <expression> [command] [--flags]  
 
-# Reevaluate FODs by rebuilding them (includes rebuild status in JSON)
-./fod-oracle -reevaluate -parallel=4 -build-delay=5 1d250f4
 
-# Enable debug logging
-./fod-oracle -debug -expr "(import <nixpkgs> {}).hello"
+  EXAMPLES
 
-# Process and filter with jq
-./fod-oracle -expr "(import <nixpkgs> {}).hello" | jq '.Hash'
 
-# Save JSON Lines to file
-./fod-oracle 1d250f4 > fods.jsonl
+    # Find FODs in a flake package  
+    fod-oracle 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'  
+      
+    # Find FODs and rebuild them to verify hashes  
+    fod-oracle --rebuild 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'  
+      
+    # Rebuild and fail if any hash mismatches are found  
+    fod-oracle --rebuild --fail-on-hash-mismatch 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'  
+      
+    # Use a regular Nix expression  
+    fod-oracle --expr 'import <nixpkgs> {}.hello'  
+      
+    # Enable debug output  
+    fod-oracle --debug 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'  
+
+
+  COMMANDS
+
+    completion [command]     Generate the autocompletion script for the specified shell
+    help [command]           Help about any command
+
+  FLAGS
+
+    --debug                  Enable debug output to stderr
+    --expr                   Treat the argument as a Nix expression
+    --fail-on-hash-mismatch  Exit with error code if hash mismatches are found (requires --rebuild)
+    --flake                  Evaluate a flake expression
+    -h --help                Help for fod-oracle
+    --rebuild                Rebuild FODs to verify their hashes
+    -v --version             Version for fod-oracle
 ```
 
-#### Output Formats
 
-**Normal Mode**: Outputs basic FOD information as JSON Lines
+
+## Examples
+
+```console
+❮ fod-oracle 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'
+{"drv_path":"/nix/store/z7rvbcngls4p928an3ajiawypmhd9rw1-bash52-028.drv","output_path":"/nix/store/m2vybc6frn326f6yxlhpkbvi7grjzna2-bash52-028","hash_algorithm":"sha256","hash":"sha256-YEJ4C6KJPayko/D5tlcoWSzXu21M6+BzhVpqrU1jqsE="}
+{"drv_path":"/nix/store/jxaa5p13rvgwbxm14yqmfxnj3rfj322f-bash52-037.drv","output_path":"/nix/store/yp6bfms6q369y93j622mqq6i6b02xwbq-bash52-037","hash_algorithm":"sha256","hash":"sha256-iiwcO1El2a5bR4gvfS3flkiAX4xnwTql6n7+rEdc2pQ="}
+{"drv_path":"/nix/store/bsf32582y9rl8wy0dmi6h1lfd0f3qklh-lzip-1.25.tar.gz.drv","output_path":"/nix/store/8jaj1xfcj1i3sl6m8zh2wn8k0rzxq9nh-lzip-1.25.tar.gz","hash_algorithm":"sha256","hash":"sha256-CUGKbY+4P1ET9b2FbglwPfXTe64DCMZo0PNG49PwpW8="}
+{"drv_path":"/nix/store/v6b5sjrlhljhrvk4dy9f786riml2nn8k-hello-2.12.2.tar.gz.drv","output_path":"/nix/store/dw402azxjrgrzrk6j0p66wkqrab5mwgw-hello-2.12.2.tar.gz","hash_algorithm":"sha256","hash":"sha256-WpqZbcKSzCTc9BHO6H6S9qrluNE72caBm0x6nc4IGKs="}
+...
+```
+
+
+```console
+{"drv_path":"/nix/store/2k5fih5nlvvwafb9qivnvxfiv1170ihb-source.drv","output_path":"/nix/store/vyxhyk3i20rzdq4clbzpl31kxs8yprmm-source","hash_algorithm":"r:sha256","hash":"sha256-7Niq+Xxq/r86qOeJl6/gNdH1XKm6m0fPhbPmgazZFkU=","rebuild_status":"success","actual_hash":"sha256-7Niq+Xxq/r86qOeJl6/gNdH1XKm6m0fPhbPmgazZFkU="}
+{"drv_path":"/nix/store/h46szk9s9lmwygw3bkif0dwr51xbycjx-source.drv","output_path":"/nix/store/j27ci7p95zf84mb5sqyjjmcpd1sfazkp-source","hash_algorithm":"r:sha256","hash":"sha256-bfFmDfRBSvoWMdQYVstsJRbcq+15lDjVFqk+0XYWpy8=","rebuild_status":"success","actual_hash":"sha256-bfFmDfRBSvoWMdQYVstsJRbcq+15lDjVFqk+0XYWpy8="}
+{"drv_path":"/nix/store/qrhjpcmqb46fzcfjfdbmjbibv787ysmh-xnu-src.drv","output_path":"/nix/store/ryh5cxpq72p3b8jjg16s10cw0nl5k8dv-xnu-src","hash_algorithm":"r:sha256","hash":"sha256-uHmAOm6k9ZXWfyqHiDSpm+tZqUbERlr6rXSJ4xNACkM=","rebuild_status":"success","actual_hash":"sha256-uHmAOm6k9ZXWfyqHiDSpm+tZqUbERlr6rXSJ4xNACkM="}
+{"drv_path":"/nix/store/36mp6b0ybqy6z3jhk36lnd8gpkdsw9vl-macOS-SDK-11.3.drv","output_path":"/nix/store/iak05hjjbnrzfdavj463scmf9cndidlf-macOS-SDK-11.3","hash_algorithm":"r:sha256","hash":"sha256-/go8utcx3jprf6c8V/DUbXwsmNYSFchOAai1OaJs3Bg=","rebuild_status":"success","actual_hash":"sha256-/go8utcx3jprf6c8V/DUbXwsmNYSFchOAai1OaJs3Bg="}
+{"drv_path":"/nix/store/2srmqir9grsxxcjfknxxxlf1y1ysmv9v-macOS-SDK-14.4.drv","output_path":"/nix/store/c3xfmn0gi4zss7yzgh2k969xcjjyv5p0-macOS-SDK-14.4","hash_algorithm":"r:sha256","hash":"sha256-QozDiwY0Czc0g45vPD7G4v4Ra+3DujCJbSads3fJjjM=","rebuild_status":"success","actual_hash":"sha256-QozDiwY0Czc0g45vPD7G4v4Ra+3DujCJbSads3fJjjM="}
+...
+```
+
+## Hash Verification
+
+When rebuilds succeed, it means Nix has verified the FOD hash matches. When rebuilds fail due to hash mismatches, the tool extracts both the expected and actual hashes from Nix's error output for easy comparison.
+
+**Hash mismatch example:**
 ```json
-{"DrvPath":"/nix/store/...","OutputPath":"/nix/store/...","ExpectedHash":"sha256-..."}
+{"drv_path":"/nix/store/...","rebuild_status":"failure","hash_mismatch":true,"actual_hash":"sha256-ActualHashHere","error_message":"Build failed: ..."}
 ```
-
-**Reevaluate Mode**: Includes rebuild verification results
-```json
-{"DrvPath":"/nix/store/...","OutputPath":"/nix/store/...","ExpectedHash":"sha256-...","ActualHash":"sha256-...","RebuildStatus":"success","HashMismatch":false}
-```
-
-All hashes are in SRI format (generated using `nix hash convert`) and are directly greppable in the nixpkgs codebase.
-
-Scanning a complete nixpkgs revision takes around 10+ minutes on a 7950 AMD Ryzen 9 16-core CPU with 62GB RAM.
-
-### Command-line Arguments
-
-```
-Usage: ./fod-oracle [options] <nixpkgs-revision> [<nixpkgs-revision2> ...]
-
-Options:
-  -debug
-    	Enable debug logging to stderr
-  -drv string
-    	Derivation path for test mode
-  -expr string
-    	Process a Nix expression instead of a revision
-  -help
-    	Show help
-  -parallel int
-    	Number of parallel rebuild workers (default: 1, use higher values for testing)
-  -reevaluate
-    	Reevaluate FODs by rebuilding them and include rebuild status in output
-  -build-delay int
-    	Delay between builds in seconds (default 10)
-  -test
-    	Test mode - process a single derivation
-  -workers int
-    	Number of worker threads (default 1)
-```
-
-### Environment Variables
-
-- `FOD_ORACLE_NUM_WORKERS` - Number of worker threads (default: 1)
-- `FOD_ORACLE_TEST_DRV_PATH` - Path to derivation for test mode
-- `FOD_ORACLE_EVAL_OPTS` - Additional options for nix-eval-jobs
-- `FOD_ORACLE_BUILD_DELAY` - Delay between builds in seconds (default: 0)
-
-## Rebuild-FOD Tool
-
-The project includes a standalone `rebuild-fod` tool that can be used to rebuild and verify fixed-output derivations. This tool is built in Go and can be used both as a command-line utility and as a library in the main application.
-
-### Building and Using the Tool with Nix
-
-```bash
-nix build .#rebuild-fod -- /nix/store/0m4y3j4pnivlhhpr5yqdvlly86p93fwc-busybox.drv
-```
-
-The rebuild-fod tool uses multiple methods to determine the correct hash of a fixed-output derivation:
-
-1. Extracting from derivation JSON (Method 1)
-2. Querying the Nix store (Method 2)
-3. Computing from the output (Method 3)
-4. Building the derivation if needed (Method 4)
-
-It then compares the results to find any hash mismatches, which could indicate reproducibility issues.
-
-## API Endpoints
-
-The following API endpoints are available:
-
-- https://api.fod-oracle.org/health - Health check
-- https://api.fod-oracle.org/revisions - List all nixpkgs revisions
-- https://api.fod-oracle.org/stats - Get database statistics
-- https://api.fod-oracle.org/fods - List FODs (with pagination)
-- `https://api.fod-oracle.org/revisions/{id}` - Get details for a specific revision
-- `https://api.fod-oracle.org/revision/{rev}` - Get details for a specific revision by git hash
-- `https://api.fod-oracle.org/fods/{hash}` - Find FODs by hash
-- `https://api.fod-oracle.org/commit/{commit}/fods` - List all FODs associated with a specific nixpkgs commit hash (with pagination)
