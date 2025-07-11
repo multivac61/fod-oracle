@@ -27,50 +27,47 @@ FOD Oracle is a tool for tracking and analyzing fixed-output derivations (FODs) 
 ## Usage
 
 ```
-  fod-oracle finds all Fixed Output Derivations (FODs) in a Nix expression.
-  
-  FODs are derivations with predetermined output hashes, typically used for source code,
-  patches, and other fixed content that needs to be downloaded from external sources.
-
-  USAGE
-
-
-    fod-oracle <expression> [command] [--flags]  
-
-
-  EXAMPLES
-
-
-    # Find FODs in a flake package  
-    fod-oracle 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'  
-      
-    # Find FODs and rebuild them to verify hashes  
-    fod-oracle --rebuild 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'  
-      
-    # Rebuild and fail if any hash mismatches are found  
-    fod-oracle --rebuild --fail-on-hash-mismatch 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'  
-      
-    # Use a regular Nix expression  
-    fod-oracle --expr 'import <nixpkgs> {}.hello'  
-      
-    # Enable debug output  
-    fod-oracle --debug 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'  
-
-
-  COMMANDS
-
-    completion [command]     Generate the autocompletion script for the specified shell
-    help [command]           Help about any command
-
-  FLAGS
-
-    --debug                  Enable debug output to stderr
-    --expr                   Treat the argument as a Nix expression
-    --fail-on-hash-mismatch  Exit with error code if hash mismatches are found (requires --rebuild)
-    --flake                  Evaluate a flake expression
-    -h --help                Help for fod-oracle
-    --rebuild                Rebuild FODs to verify their hashes
-    -v --version             Version for fod-oracle
+  fod-oracle finds all Fixed Output Derivations (FODs) in a Nix expression.                                             
+                                                                                                                        
+  FODs are derivations with predetermined output hashes, typically used for source code,                                
+  patches, and other fixed content that needs to be downloaded from external sources.                                   
+         
+  USAGE  
+         
+    fod-oracle <expression> [command] [--flags]                                                     
+            
+  EXAMPLES  
+            
+    # Find FODs in a flake package                                                                  
+    fod-oracle 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'                             
+                                                                                                    
+    # Find FODs and rebuild them to verify hashes                                                   
+    fod-oracle --rebuild 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'                   
+                                                                                                    
+    # Rebuild and fail if any rebuild fails for any reason                                          
+    fod-oracle --rebuild --strict-rebuild 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'  
+                                                                                                    
+    # Use a regular Nix expression                                                                  
+    fod-oracle --expr 'import <nixpkgs> {}.hello'                                                   
+                                                                                                    
+    # Enable debug output                                                                           
+    fod-oracle --debug 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'                     
+            
+  COMMANDS  
+            
+    completion [command]  Generate the autocompletion script for the specified shell
+    help [command]        Help about any command
+         
+  FLAGS  
+         
+    --debug               Enable debug output to stderr
+    --expr                Treat the argument as a Nix expression
+    --flake               Evaluate a flake expression
+    -h --help             Help for fod-oracle
+    --max-parallel        Maximum number of parallel rebuilds (default: CPU count)
+    --rebuild             Rebuild FODs to verify their hashes
+    --strict-rebuild      Exit with error code if any rebuild fails for any reason (requires --rebuild)
+    -v --version          Version for fod-oracle
 ```
 
 

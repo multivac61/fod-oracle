@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/charmbracelet/fang"
 	"github.com/nix-community/go-nix/pkg/derivation"
@@ -43,18 +44,28 @@ type FOD struct {
 
 // ProcessingContext holds the context for processing derivations
 type ProcessingContext struct {
-	ctx                context.Context // Context for cancellation
-	visited            *sync.Map
-	processedPaths     *sync.Map
-	output             chan FOD
-	rebuildQueue       chan FOD // Queue of FODs to rebuild
-	wg                 *sync.WaitGroup
-	rebuild            bool
-	failOnHashMismatch bool
-	hashMismatchFound  *sync.Map // Track if any hash mismatches were found
+	ctx                  context.Context    // Context for cancellation
+	cancelFunc           context.CancelFunc // Function to cancel context for fail-fast behavior
+	visited              *sync.Map
+	processedPaths       *sync.Map
+	output               chan FOD
+	rebuildQueue         chan FOD // Queue of FODs to rebuild
+	wg                   *sync.WaitGroup
+	rebuild              bool
+	failOnRebuildFailure bool         // Renamed from failOnHashMismatch
+	firstFailure         atomic.Value // Stores pointer to first failed FOD
 }
 
 func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
+	// Check for cancellation at the very start of the function
+	select {
+	case <-ctx.ctx.Done():
+		ctx.wg.Done()
+		return
+	default:
+		// Continue if not canceled
+	}
+
 	defer ctx.wg.Done()
 
 	// Check if we've already processed this derivation
@@ -68,12 +79,17 @@ func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
 	file, err := os.Open(drvPath)
 	if err != nil {
 		log.Printf("Error opening derivation file %s: %v", drvPath, err)
-		// Send error FOD to output for tracking
-		ctx.output <- FOD{
+		// Send error FOD to output for tracking, but check for cancellation
+		errorFOD := FOD{
 			DrvPath:       drvPath,
 			Attr:          attrName,
 			RebuildStatus: "error",
 			ErrorMessage:  fmt.Sprintf("Failed to open derivation: %v", err),
+		}
+		select {
+		case ctx.output <- errorFOD:
+		case <-ctx.ctx.Done():
+			return
 		}
 		return
 	}
@@ -82,12 +98,17 @@ func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
 	drv, err := derivation.ReadDerivation(file)
 	if err != nil {
 		log.Printf("Error reading derivation %s: %v", drvPath, err)
-		// Send error FOD to output for tracking
-		ctx.output <- FOD{
+		// Send error FOD to output for tracking, but check for cancellation
+		errorFOD := FOD{
 			DrvPath:       drvPath,
 			Attr:          attrName,
 			RebuildStatus: "error",
 			ErrorMessage:  fmt.Sprintf("Failed to parse derivation: %v", err),
+		}
+		select {
+		case ctx.output <- errorFOD:
+		case <-ctx.ctx.Done():
+			return
 		}
 		return
 	}
@@ -106,12 +127,20 @@ func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
 				Attr:          attrName,
 			}
 
-			// Send FOD to output channel first
-			ctx.output <- fod
+			// Send FOD to output channel first, but check for cancellation
+			select {
+			case ctx.output <- fod:
+			case <-ctx.ctx.Done():
+				return
+			}
 
 			// If rebuild flag is set, queue the FOD for rebuilding
 			if ctx.rebuild {
-				ctx.rebuildQueue <- fod // Blocking send ensures we never miss FODs
+				select {
+				case ctx.rebuildQueue <- fod: // Blocking send ensures we never miss FODs
+				case <-ctx.ctx.Done():
+					return
+				}
 			}
 			break // Only need to find one FOD output per derivation
 		}
@@ -132,58 +161,42 @@ func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
 func rebuildFOD(fod *FOD, ctx *ProcessingContext) {
 	log.Printf("Verifying FOD from source (no cache): %s", fod.DrvPath)
 
-	// --- Stage 1: Build dependencies from source ---
-	// We use `nix-build` instead of `nix-store --realise` because it provides
-	// better build output for debugging. We add `--no-out-link` to avoid polluting
-	// the current directory and `--no-substitute` to force a local build.
-	// We build the FOD derivation itself, which will force all of its dependencies
-	// to be built first. We are NOT using --check here yet.
-	log.Printf("Stage 1: Building dependencies from source for %s", fod.DrvPath)
-	buildDepsCmd := exec.CommandContext(ctx.ctx, "nix-build", fod.DrvPath, "--no-out-link", "--no-substitute")
-	if output, err := buildDepsCmd.CombinedOutput(); err != nil {
-		// If this stage fails, it could be a dependency build failure OR
-		// a hash mismatch in the target FOD if Nix got that far.
-		// We must check the output to distinguish them.
-		errStr := string(output)
-		if strings.Contains(errStr, "hash mismatch") {
-			fod.RebuildStatus = "verification_failure"
-			fod.ErrorMessage = fmt.Sprintf("Verification failed during build: %v\nOutput: %s", err, errStr)
-			fod.HashMismatch = true
-			ctx.hashMismatchFound.Store("found", true)
+	// Combine into a single, definitive check.
+	// We want to force a from-source build and check the result.
+	buildCmd := exec.CommandContext(ctx.ctx, "nix-build", fod.DrvPath, "--no-out-link", "--no-substitute", "--check")
+	output, err := buildCmd.CombinedOutput()
 
-			re := regexp.MustCompile(`got:\s*([a-zA-Z0-9-/+=]+)`) // Expanded regex for base64 SRI hashes
-			if matches := re.FindStringSubmatch(errStr); len(matches) > 1 {
-				fod.ActualHash = matches[1]
-			}
-		} else {
-			fod.RebuildStatus = "dependency_failure"
-			fod.ErrorMessage = fmt.Sprintf("Failed to build dependencies from source: %v\nOutput: %s", err, errStr)
-		}
+	if err == nil {
+		// Success case
+		fod.RebuildStatus = "success"
+		fod.HashMismatch = false
+		log.Printf("FOD verification successful: %s", fod.DrvPath)
 		return
 	}
 
-	// --- Stage 2: Re-run with --check to verify the FOD hash specifically ---
-	// At this point, all dependencies AND the FOD itself have been successfully built
-	// and are in the local store. The first build already verified the hash implicitly.
-	// Running with --check again is a redundant but definitive confirmation.
-	// It's extremely fast because everything is already built.
-	log.Printf("Stage 2: Running final verification check for %s", fod.DrvPath)
-	checkCmd := exec.CommandContext(ctx.ctx, "nix-build", fod.DrvPath, "--no-out-link", "--no-substitute", "--check")
-	if output, err := checkCmd.CombinedOutput(); err != nil {
-		// A failure here is rare but would definitively be a verification issue.
+	// --- Failure Case ---
+	errStr := string(output)
+	if strings.Contains(errStr, "hash mismatch") {
 		fod.RebuildStatus = "verification_failure"
-		fod.ErrorMessage = fmt.Sprintf("Post-build verification check failed: %v\nOutput: %s", err, string(output))
-		if strings.Contains(string(output), "hash mismatch") {
-			fod.HashMismatch = true
-			ctx.hashMismatchFound.Store("found", true)
+		fod.ErrorMessage = fmt.Sprintf("Verification failed: %v\nOutput: %s", err, errStr)
+		fod.HashMismatch = true
+
+		re := regexp.MustCompile(`got:\s*([a-zA-Z0-9-/+=]+)`) // Expanded regex for base64 SRI hashes
+		if matches := re.FindStringSubmatch(errStr); len(matches) > 1 {
+			fod.ActualHash = matches[1]
 		}
-		return
+	} else {
+		fod.RebuildStatus = "dependency_failure"
+		fod.ErrorMessage = fmt.Sprintf("Failed to build from source: %v\nOutput: %s", err, errStr)
 	}
 
-	// If we reach here, the entire process was successful.
-	fod.RebuildStatus = "success"
-	fod.HashMismatch = false
-	log.Printf("FOD and its dependencies successfully built from source and verified: %s", fod.DrvPath)
+	// If strict mode is enabled, store this as the first failure and cancel everything.
+	if ctx.failOnRebuildFailure {
+		// Atomically store a pointer to this FOD struct.
+		// This ensures only the very first failure is recorded.
+		ctx.firstFailure.CompareAndSwap(nil, fod)
+		ctx.cancelFunc() // Cancel immediately to stop all other work.
+	}
 }
 
 // normalizeToSRI converts a hash to SRI format if it isn't already
@@ -207,17 +220,18 @@ func normalizeToSRI(hash, hashAlgorithm string) string {
 }
 
 // initializeProcessing creates and returns a new ProcessingContext
-func initializeProcessing(ctx context.Context, rebuild, failOnHashMismatch bool) *ProcessingContext {
+func initializeProcessing(ctx context.Context, cancel context.CancelFunc, rebuild, strictRebuild bool) *ProcessingContext {
 	return &ProcessingContext{
-		ctx:                ctx,
-		visited:            &sync.Map{},
-		processedPaths:     &sync.Map{},
-		output:             make(chan FOD, OutputChannelBuffer),
-		rebuildQueue:       make(chan FOD, RebuildQueueBuffer),
-		wg:                 &sync.WaitGroup{},
-		rebuild:            rebuild,
-		failOnHashMismatch: failOnHashMismatch,
-		hashMismatchFound:  &sync.Map{},
+		ctx:                  ctx,
+		cancelFunc:           cancel,
+		visited:              &sync.Map{},
+		processedPaths:       &sync.Map{},
+		output:               make(chan FOD, OutputChannelBuffer),
+		rebuildQueue:         make(chan FOD, RebuildQueueBuffer),
+		wg:                   &sync.WaitGroup{},
+		rebuild:              rebuild,
+		failOnRebuildFailure: strictRebuild,
+		// firstFailure is ready to use with its zero value
 	}
 }
 
@@ -226,9 +240,17 @@ func startOutputWriter(ctx *ProcessingContext) chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for fod := range ctx.output {
-			output, _ := json.Marshal(fod)
-			fmt.Println(string(output))
+		for {
+			select {
+			case <-ctx.ctx.Done(): // Check for cancellation
+				return // Exit the output writer goroutine
+			case fod, ok := <-ctx.output:
+				if !ok {
+					return // Channel is closed and empty
+				}
+				output, _ := json.Marshal(fod)
+				fmt.Println(string(output))
+			}
 		}
 	}()
 	return done
@@ -251,10 +273,24 @@ func startRebuildWorkers(ctx *ProcessingContext, maxParallel int) chan struct{} 
 			workerWg.Add(1)
 			go func() {
 				defer workerWg.Done()
-				for fod := range ctx.rebuildQueue {
-					rebuildFOD(&fod, ctx)
-					// Send updated FOD to output
-					ctx.output <- fod
+				for {
+					select {
+					case <-ctx.ctx.Done(): // Check for cancellation
+						return // Exit the worker goroutine
+					case fod, ok := <-ctx.rebuildQueue:
+						if !ok {
+							return // Channel is closed and empty
+						}
+						rebuildFOD(&fod, ctx)
+						// Always try to send the result, even if it's a failure.
+						// If the output writer has already shut down due to cancellation,
+						// this will gracefully exit.
+						select {
+						case ctx.output <- fod:
+						case <-ctx.ctx.Done():
+							return
+						}
+					}
 				}
 			}()
 		}
@@ -319,14 +355,19 @@ func evaluateNixExpression(ctx context.Context, expr string, isFlake bool) (map[
 }
 
 func runFODOracle(cmd *cobra.Command, args []string) error {
-	// Set up context with signal handling for graceful shutdown
-	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
+	// Set up a PARENT context that handles OS signals (Ctrl+C)
+	signalCtx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 	defer stop()
+
+	// Create a CHILD context that we can cancel ourselves for fail-fast behavior
+	// This inherits cancellation from the parent
+	ctx, cancel := context.WithCancel(signalCtx)
+	defer cancel() // Ensure cancel is called on exit to clean up resources
 	debug, _ := cmd.Flags().GetBool("debug")
 	isFlake, _ := cmd.Flags().GetBool("flake")
 	isExpr, _ := cmd.Flags().GetBool("expr")
 	rebuild, _ := cmd.Flags().GetBool("rebuild")
-	failOnHashMismatch, _ := cmd.Flags().GetBool("fail-on-hash-mismatch")
+	strictRebuild, _ := cmd.Flags().GetBool("strict-rebuild")
 	maxParallel, _ := cmd.Flags().GetInt("max-parallel")
 
 	// Set default max-parallel to CPU count if not specified
@@ -335,8 +376,8 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 	}
 
 	// Validate flag combinations
-	if failOnHashMismatch && !rebuild {
-		return fmt.Errorf("--fail-on-hash-mismatch can only be used with --rebuild")
+	if strictRebuild && !rebuild {
+		return fmt.Errorf("--strict-rebuild can only be used with --rebuild")
 	}
 
 	// Set log output based on debug flag
@@ -372,7 +413,7 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 	log.Printf("Processing %d derivation paths", len(drvPaths))
 
 	// Initialize processing context
-	pCtx := initializeProcessing(ctx, rebuild, failOnHashMismatch)
+	pCtx := initializeProcessing(ctx, cancel, rebuild, strictRebuild)
 
 	// Start workers
 	done := startOutputWriter(pCtx)
@@ -405,10 +446,17 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 
 	log.Printf("Processing complete")
 
-	// Check if we should fail on hash mismatches
-	if failOnHashMismatch {
-		if _, found := pCtx.hashMismatchFound.Load("found"); found {
-			return fmt.Errorf("hash mismatch detected - exiting with error as requested")
+	// Check if a strict rebuild failed.
+	if strictRebuild {
+		if val := pCtx.firstFailure.Load(); val != nil {
+			// A failure was recorded. Extract the details.
+			failedFOD := val.(*FOD)
+
+			// Marshal the details to JSON for clear, machine-readable output.
+			failJSON, _ := json.MarshalIndent(failedFOD, "", "  ")
+
+			// Return a descriptive error message containing the JSON details.
+			return fmt.Errorf("rebuild failure detected, exiting due to --strict-rebuild. The first failing FOD was:\n%s", string(failJSON))
 		}
 	}
 
@@ -429,8 +477,8 @@ patches, and other fixed content that needs to be downloaded from external sourc
   # Find FODs and rebuild them to verify hashes
   fod-oracle --rebuild 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'
 
-  # Rebuild and fail if any hash mismatches are found
-  fod-oracle --rebuild --fail-on-hash-mismatch 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'
+  # Rebuild and fail if any rebuild fails for any reason
+  fod-oracle --rebuild --strict-rebuild 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'
 
   # Use a regular Nix expression
   fod-oracle --expr 'import <nixpkgs> {}.hello'
@@ -445,7 +493,7 @@ patches, and other fixed content that needs to be downloaded from external sourc
 	rootCmd.Flags().Bool("flake", false, "Evaluate a flake expression")
 	rootCmd.Flags().Bool("expr", false, "Treat the argument as a Nix expression")
 	rootCmd.Flags().Bool("rebuild", false, "Rebuild FODs to verify their hashes")
-	rootCmd.Flags().Bool("fail-on-hash-mismatch", false, "Exit with error code if hash mismatches are found (requires --rebuild)")
+	rootCmd.Flags().Bool("strict-rebuild", false, "Exit with error code if any rebuild fails for any reason (requires --rebuild)")
 	rootCmd.Flags().Int("max-parallel", DefaultMaxParallel, "Maximum number of parallel rebuilds (default: CPU count)")
 
 	// Execute with fang for fancy output
