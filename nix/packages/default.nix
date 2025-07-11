@@ -22,7 +22,7 @@ pkgs.buildGoModule {
           with pkgs;
           [
             nix-eval-jobs
-            nix  # For nix-hash and nix hash commands
+            nix # For nix-hash and nix hash commands
           ]
         )
       }
