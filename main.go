@@ -14,7 +14,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/charmbracelet/fang"
 	"github.com/nix-community/go-nix/pkg/derivation"
@@ -52,8 +51,8 @@ type ProcessingContext struct {
 	rebuildQueue         chan FOD // Queue of FODs to rebuild
 	wg                   *sync.WaitGroup
 	rebuild              bool
-	failOnRebuildFailure bool         // Renamed from failOnHashMismatch
-	firstFailure         atomic.Value // Stores pointer to first failed FOD
+	failOnRebuildFailure bool       // Renamed from failOnHashMismatch
+	firstFailureErr      chan error // Channel for first rebuild failure (buffered size 1)
 }
 
 func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
@@ -155,27 +154,40 @@ func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
 	}
 }
 
-// rebuildFOD attempts to rebuild a FOD to verify it works
-// rebuildFOD attempts to rebuild a FOD from source to verify it and its dependencies.
+// rebuildFOD attempts to rebuild a FOD from source to verify it works.
 // It explicitly disables binary caches to ensure a local, from-source build.
-func rebuildFOD(fod *FOD, ctx *ProcessingContext) {
+// This function is now pure: it has no side effects on ProcessingContext.
+func rebuildFOD(procCtx context.Context, fod *FOD) error {
 	log.Printf("Verifying FOD from source (no cache): %s", fod.DrvPath)
 
-	// Combine into a single, definitive check.
-	// We want to force a from-source build and check the result.
-	buildCmd := exec.CommandContext(ctx.ctx, "nix-build", fod.DrvPath, "--no-out-link", "--no-substitute", "--check")
-	output, err := buildCmd.CombinedOutput()
-
-	if err == nil {
-		// Success case
-		fod.RebuildStatus = "success"
-		fod.HashMismatch = false
-		log.Printf("FOD verification successful: %s", fod.DrvPath)
-		return
+	// Check if the output already exists in the store
+	if _, err := os.Stat(fod.OutputPath); os.IsNotExist(err) {
+		// Output doesn't exist, build without --check first
+		log.Printf("Building FOD from source: %s", fod.DrvPath)
+		buildCmd := exec.CommandContext(procCtx, "nix-build", fod.DrvPath, "--no-out-link", "--no-substitute")
+		if output, err := buildCmd.CombinedOutput(); err != nil {
+			return handleBuildFailure(fod, err, output)
+		}
 	}
 
-	// --- Failure Case ---
+	// Now verify with --check (output should exist by now)
+	log.Printf("Verifying FOD with --check: %s", fod.DrvPath)
+	checkCmd := exec.CommandContext(procCtx, "nix-build", fod.DrvPath, "--no-out-link", "--no-substitute", "--check")
+	if output, err := checkCmd.CombinedOutput(); err != nil {
+		return handleBuildFailure(fod, err, output)
+	}
+
+	// Success case
+	fod.RebuildStatus = "success"
+	fod.HashMismatch = false
+	log.Printf("FOD verification successful: %s", fod.DrvPath)
+	return nil
+}
+
+// handleBuildFailure processes build failures and annotates the FOD accordingly
+func handleBuildFailure(fod *FOD, err error, output []byte) error {
 	errStr := string(output)
+
 	if strings.Contains(errStr, "hash mismatch") {
 		fod.RebuildStatus = "verification_failure"
 		fod.ErrorMessage = fmt.Sprintf("Verification failed: %v\nOutput: %s", err, errStr)
@@ -190,13 +202,8 @@ func rebuildFOD(fod *FOD, ctx *ProcessingContext) {
 		fod.ErrorMessage = fmt.Sprintf("Failed to build from source: %v\nOutput: %s", err, errStr)
 	}
 
-	// If strict mode is enabled, store this as the first failure and cancel everything.
-	if ctx.failOnRebuildFailure {
-		// Atomically store a pointer to this FOD struct.
-		// This ensures only the very first failure is recorded.
-		ctx.firstFailure.CompareAndSwap(nil, fod)
-		ctx.cancelFunc() // Cancel immediately to stop all other work.
-	}
+	// Return a detailed error that includes the build output for debugging
+	return fmt.Errorf("rebuild of %s failed: %s\n\nBuild output:\n%s", fod.DrvPath, fod.RebuildStatus, errStr)
 }
 
 // normalizeToSRI converts a hash to SRI format if it isn't already
@@ -231,7 +238,7 @@ func initializeProcessing(ctx context.Context, cancel context.CancelFunc, rebuil
 		wg:                   &sync.WaitGroup{},
 		rebuild:              rebuild,
 		failOnRebuildFailure: strictRebuild,
-		// firstFailure is ready to use with its zero value
+		firstFailureErr:      make(chan error, 1), // Buffered channel for the first failure
 	}
 }
 
@@ -281,13 +288,30 @@ func startRebuildWorkers(ctx *ProcessingContext, maxParallel int) chan struct{} 
 						if !ok {
 							return // Channel is closed and empty
 						}
-						rebuildFOD(&fod, ctx)
-						// Always try to send the result, even if it's a failure.
-						// If the output writer has already shut down due to cancellation,
-						// this will gracefully exit.
+
+						// Call the pure rebuildFOD function
+						if err := rebuildFOD(ctx.ctx, &fod); err != nil {
+							// A failure occurred!
+							if ctx.failOnRebuildFailure {
+								// Try to send the error. This will only succeed for the first one.
+								select {
+								case ctx.firstFailureErr <- err:
+									ctx.cancelFunc() // Cancel everyone else *after* reporting our error.
+								default:
+									// Channel is already full, another goroutine reported the error first.
+								}
+							}
+						}
+
+						// Always send the (updated) FOD to the output channel.
 						select {
 						case ctx.output <- fod:
 						case <-ctx.ctx.Done():
+							return
+						}
+
+						// Check for cancellation before starting next loop
+						if ctx.ctx.Err() != nil {
 							return
 						}
 					}
@@ -435,8 +459,23 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 	// Wait for all processing to complete
 	pCtx.wg.Wait()
 
-	// Close rebuild queue and wait for workers to finish
-	if rebuild {
+	// Close rebuild queue and wait for workers to finish or fast failure
+	if rebuild && strictRebuild {
+		close(pCtx.rebuildQueue)
+
+		// Use select to handle either successful completion or fast failure
+		select {
+		case failureErr := <-pCtx.firstFailureErr:
+			// A fast failure was triggered. Wait for workers to finish, then close output.
+			<-rebuildDone
+			close(pCtx.output)
+			<-done
+			return failureErr
+		case <-rebuildDone:
+			// All rebuilds completed without a strict failure.
+			log.Printf("All rebuilds completed successfully.")
+		}
+	} else if rebuild {
 		close(pCtx.rebuildQueue)
 		<-rebuildDone
 	}
@@ -445,21 +484,6 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 	<-done
 
 	log.Printf("Processing complete")
-
-	// Check if a strict rebuild failed.
-	if strictRebuild {
-		if val := pCtx.firstFailure.Load(); val != nil {
-			// A failure was recorded. Extract the details.
-			failedFOD := val.(*FOD)
-
-			// Marshal the details to JSON for clear, machine-readable output.
-			failJSON, _ := json.MarshalIndent(failedFOD, "", "  ")
-
-			// Return a descriptive error message containing the JSON details.
-			return fmt.Errorf("rebuild failure detected, exiting due to --strict-rebuild. The first failing FOD was:\n%s", string(failJSON))
-		}
-	}
-
 	return nil
 }
 
