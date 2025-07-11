@@ -10,12 +10,20 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 
 	"github.com/charmbracelet/fang"
 	"github.com/nix-community/go-nix/pkg/derivation"
 	"github.com/spf13/cobra"
+)
+
+const (
+	// Buffer sizes for channels
+	OutputChannelBuffer = 1000
+	RebuildQueueBuffer  = 10000
+	DefaultMaxParallel  = 0 // 0 means use CPU count
 )
 
 // FOD represents a fixed-output derivation
@@ -37,11 +45,11 @@ type ProcessingContext struct {
 	visited            *sync.Map
 	processedPaths     *sync.Map
 	output             chan FOD
+	rebuildQueue       chan FOD // Queue of FODs to rebuild
 	wg                 *sync.WaitGroup
 	rebuild            bool
 	failOnHashMismatch bool
 	hashMismatchFound  *sync.Map // Track if any hash mismatches were found
-	rebuildSemaphore   chan struct{} // Semaphore to limit concurrent rebuilds
 }
 
 func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
@@ -57,7 +65,14 @@ func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
 
 	file, err := os.Open(drvPath)
 	if err != nil {
-		log.Printf("Error opening file %s: %v", drvPath, err)
+		log.Printf("Error opening derivation file %s: %v", drvPath, err)
+		// Send error FOD to output for tracking
+		ctx.output <- FOD{
+			DrvPath:       drvPath,
+			Attr:          attrName,
+			RebuildStatus: "error",
+			ErrorMessage:  fmt.Sprintf("Failed to open derivation: %v", err),
+		}
 		return
 	}
 	defer file.Close()
@@ -65,6 +80,13 @@ func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
 	drv, err := derivation.ReadDerivation(file)
 	if err != nil {
 		log.Printf("Error reading derivation %s: %v", drvPath, err)
+		// Send error FOD to output for tracking
+		ctx.output <- FOD{
+			DrvPath:       drvPath,
+			Attr:          attrName,
+			RebuildStatus: "error",
+			ErrorMessage:  fmt.Sprintf("Failed to parse derivation: %v", err),
+		}
 		return
 	}
 
@@ -82,12 +104,13 @@ func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
 				Attr:          attrName,
 			}
 
-			// If rebuild flag is set, attempt to rebuild the FOD
-			if ctx.rebuild {
-				rebuildFOD(&fod, ctx)
-			}
-
+			// Send FOD to output channel first
 			ctx.output <- fod
+
+			// If rebuild flag is set, queue the FOD for rebuilding
+			if ctx.rebuild {
+				ctx.rebuildQueue <- fod // Blocking send ensures we never miss FODs
+			}
 			break // Only need to find one FOD output per derivation
 		}
 	}
@@ -103,10 +126,6 @@ func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
 
 // rebuildFOD attempts to rebuild a FOD to verify it works
 func rebuildFOD(fod *FOD, ctx *ProcessingContext) {
-	// Acquire semaphore to limit concurrent rebuilds
-	ctx.rebuildSemaphore <- struct{}{}
-	defer func() { <-ctx.rebuildSemaphore }()
-	
 	log.Printf("Rebuilding FOD: %s", fod.DrvPath)
 
 	// Use nix-build to rebuild the derivation
@@ -116,12 +135,12 @@ func rebuildFOD(fod *FOD, ctx *ProcessingContext) {
 	if err != nil {
 		fod.RebuildStatus = "failure"
 		fod.ErrorMessage = fmt.Sprintf("Build failed: %v\nOutput: %s", err, string(output))
-		
+
 		// Check if it's a hash mismatch and try to extract actual hash
 		if strings.Contains(string(output), "hash mismatch") {
 			fod.HashMismatch = true
 			ctx.hashMismatchFound.Store("found", true)
-			
+
 			// Simple regex to find "got: sha256-..." pattern
 			re := regexp.MustCompile(`got:\s*([a-zA-Z0-9-]+)`)
 			if matches := re.FindStringSubmatch(string(output)); len(matches) > 1 {
@@ -134,10 +153,9 @@ func rebuildFOD(fod *FOD, ctx *ProcessingContext) {
 	// Build succeeded - hash was verified by Nix
 	fod.RebuildStatus = "success"
 	fod.HashMismatch = false
-	
+
 	log.Printf("FOD rebuild successful: %s", fod.DrvPath)
 }
-
 
 // computeSRIHash computes the SRI hash of a file or directory
 func computeSRIHash(path, hashAlgorithm string) (string, error) {
@@ -202,6 +220,64 @@ func normalizeToSRI(hash, hashAlgorithm string) string {
 	return strings.TrimSpace(string(output))
 }
 
+// initializeProcessing creates and returns a new ProcessingContext
+func initializeProcessing(rebuild, failOnHashMismatch bool) *ProcessingContext {
+	return &ProcessingContext{
+		visited:            &sync.Map{},
+		processedPaths:     &sync.Map{},
+		output:             make(chan FOD, OutputChannelBuffer),
+		rebuildQueue:       make(chan FOD, RebuildQueueBuffer),
+		wg:                 &sync.WaitGroup{},
+		rebuild:            rebuild,
+		failOnHashMismatch: failOnHashMismatch,
+		hashMismatchFound:  &sync.Map{},
+	}
+}
+
+// startOutputWriter starts the goroutine that writes FODs to stdout
+func startOutputWriter(ctx *ProcessingContext) chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for fod := range ctx.output {
+			output, _ := json.Marshal(fod)
+			fmt.Println(string(output))
+		}
+	}()
+	return done
+}
+
+// startRebuildWorkers starts the worker pool for rebuilding FODs
+func startRebuildWorkers(ctx *ProcessingContext, maxParallel int) chan struct{} {
+	rebuildDone := make(chan struct{})
+	if !ctx.rebuild {
+		close(rebuildDone)
+		return rebuildDone
+	}
+
+	go func() {
+		defer close(rebuildDone)
+
+		// Create worker pool
+		workerWg := &sync.WaitGroup{}
+		for i := 0; i < maxParallel; i++ {
+			workerWg.Add(1)
+			go func() {
+				defer workerWg.Done()
+				for fod := range ctx.rebuildQueue {
+					rebuildFOD(&fod, ctx)
+					// Send updated FOD to output
+					ctx.output <- fod
+				}
+			}()
+		}
+
+		workerWg.Wait()
+	}()
+
+	return rebuildDone
+}
+
 func evaluateNixExpression(expr string, isFlake bool) (map[string]string, error) {
 	// Use nix-eval-jobs under the hood
 	var cmd *exec.Cmd
@@ -263,6 +339,11 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 	failOnHashMismatch, _ := cmd.Flags().GetBool("fail-on-hash-mismatch")
 	maxParallel, _ := cmd.Flags().GetInt("max-parallel")
 
+	// Set default max-parallel to CPU count if not specified
+	if maxParallel == DefaultMaxParallel {
+		maxParallel = runtime.NumCPU()
+	}
+
 	// Validate flag combinations
 	if failOnHashMismatch && !rebuild {
 		return fmt.Errorf("--fail-on-hash-mismatch can only be used with --rebuild")
@@ -300,27 +381,12 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 
 	log.Printf("Processing %d derivation paths", len(drvPaths))
 
-	// Set up processing context
-	ctx := &ProcessingContext{
-		visited:            &sync.Map{},
-		processedPaths:     &sync.Map{},
-		output:             make(chan FOD, 1000),
-		wg:                 &sync.WaitGroup{},
-		rebuild:            rebuild,
-		failOnHashMismatch: failOnHashMismatch,
-		hashMismatchFound:  &sync.Map{},
-		rebuildSemaphore:   make(chan struct{}, maxParallel),
-	}
+	// Initialize processing context
+	ctx := initializeProcessing(rebuild, failOnHashMismatch)
 
-	// Start output writer goroutine
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for fod := range ctx.output {
-			output, _ := json.Marshal(fod)
-			fmt.Println(string(output))
-		}
-	}()
+	// Start workers
+	done := startOutputWriter(ctx)
+	rebuildDone := startRebuildWorkers(ctx, maxParallel)
 
 	// Process all derivation paths in parallel
 	for name, drvPath := range drvPaths {
@@ -337,18 +403,25 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 
 	// Wait for all processing to complete
 	ctx.wg.Wait()
+
+	// Close rebuild queue and wait for workers to finish
+	if rebuild {
+		close(ctx.rebuildQueue)
+		<-rebuildDone
+	}
+
 	close(ctx.output)
 	<-done
 
 	log.Printf("Processing complete")
-	
+
 	// Check if we should fail on hash mismatches
 	if failOnHashMismatch {
 		if _, found := ctx.hashMismatchFound.Load("found"); found {
 			return fmt.Errorf("hash mismatch detected - exiting with error as requested")
 		}
 	}
-	
+
 	return nil
 }
 
@@ -383,7 +456,7 @@ patches, and other fixed content that needs to be downloaded from external sourc
 	rootCmd.Flags().Bool("expr", false, "Treat the argument as a Nix expression")
 	rootCmd.Flags().Bool("rebuild", false, "Rebuild FODs to verify their hashes")
 	rootCmd.Flags().Bool("fail-on-hash-mismatch", false, "Exit with error code if hash mismatches are found (requires --rebuild)")
-	rootCmd.Flags().Int("max-parallel", 1, "Maximum number of parallel rebuilds (default: 1)")
+	rootCmd.Flags().Int("max-parallel", DefaultMaxParallel, "Maximum number of parallel rebuilds (default: CPU count)")
 
 	// Execute with fang for fancy output
 	if err := fang.Execute(context.Background(), rootCmd); err != nil {
