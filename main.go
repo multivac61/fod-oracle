@@ -128,8 +128,8 @@ func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
 func rebuildFOD(fod *FOD, ctx *ProcessingContext) {
 	log.Printf("Rebuilding FOD: %s", fod.DrvPath)
 
-	// Use nix-build to rebuild the derivation
-	cmd := exec.Command("nix-build", fod.DrvPath, "--no-out-link")
+	// Use nix-build to rebuild the derivation from source (no cache)
+	cmd := exec.Command("nix-build", fod.DrvPath, "--no-out-link", "--no-substitute")
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
