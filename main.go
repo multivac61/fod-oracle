@@ -157,46 +157,6 @@ func rebuildFOD(fod *FOD, ctx *ProcessingContext) {
 	log.Printf("FOD rebuild successful: %s", fod.DrvPath)
 }
 
-// computeSRIHash computes the SRI hash of a file or directory
-func computeSRIHash(path, hashAlgorithm string) (string, error) {
-	// Extract the algorithm from the hash algorithm string
-	algo := hashAlgorithm
-	if strings.HasPrefix(algo, "r:") {
-		// Recursive hash for directories
-		algo = strings.TrimPrefix(algo, "r:")
-		cmd := exec.Command("nix-hash", "--type", algo, "--base32", path)
-		output, err := cmd.Output()
-		if err != nil {
-			return "", fmt.Errorf("failed to compute recursive hash: %v", err)
-		}
-		nixHash := strings.TrimSpace(string(output))
-
-		// Convert nix hash to SRI format
-		cmd = exec.Command("nix", "hash", "to-sri", "--type", algo, nixHash)
-		sriOutput, err := cmd.Output()
-		if err != nil {
-			return "", fmt.Errorf("failed to convert to SRI: %v", err)
-		}
-		return strings.TrimSpace(string(sriOutput)), nil
-	} else {
-		// Regular file hash
-		cmd := exec.Command("nix-hash", "--type", algo, "--base32", path)
-		output, err := cmd.Output()
-		if err != nil {
-			return "", fmt.Errorf("failed to compute file hash: %v", err)
-		}
-		nixHash := strings.TrimSpace(string(output))
-
-		// Convert nix hash to SRI format
-		cmd = exec.Command("nix", "hash", "to-sri", "--type", algo, nixHash)
-		sriOutput, err := cmd.Output()
-		if err != nil {
-			return "", fmt.Errorf("failed to convert to SRI: %v", err)
-		}
-		return strings.TrimSpace(string(sriOutput)), nil
-	}
-}
-
 // normalizeToSRI converts a hash to SRI format if it isn't already
 func normalizeToSRI(hash, hashAlgorithm string) string {
 	// If it's already SRI format, return as-is
