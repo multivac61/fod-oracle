@@ -127,35 +127,63 @@ func processDerivation(drvPath, attrName string, ctx *ProcessingContext) {
 }
 
 // rebuildFOD attempts to rebuild a FOD to verify it works
+// rebuildFOD attempts to rebuild a FOD from source to verify it and its dependencies.
+// It explicitly disables binary caches to ensure a local, from-source build.
 func rebuildFOD(fod *FOD, ctx *ProcessingContext) {
-	log.Printf("Rebuilding FOD: %s", fod.DrvPath)
+	log.Printf("Verifying FOD from source (no cache): %s", fod.DrvPath)
 
-	// Use nix-build to rebuild the derivation from source (no cache)
-	cmd := exec.CommandContext(ctx.ctx, "nix-build", fod.DrvPath, "--no-out-link", "--no-substitute")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		fod.RebuildStatus = "failure"
-		fod.ErrorMessage = fmt.Sprintf("Build failed: %v\nOutput: %s", err, string(output))
-
-		// Check if it's a hash mismatch and try to extract actual hash
-		if strings.Contains(string(output), "hash mismatch") {
+	// --- Stage 1: Build dependencies from source ---
+	// We use `nix-build` instead of `nix-store --realise` because it provides
+	// better build output for debugging. We add `--no-out-link` to avoid polluting
+	// the current directory and `--no-substitute` to force a local build.
+	// We build the FOD derivation itself, which will force all of its dependencies
+	// to be built first. We are NOT using --check here yet.
+	log.Printf("Stage 1: Building dependencies from source for %s", fod.DrvPath)
+	buildDepsCmd := exec.CommandContext(ctx.ctx, "nix-build", fod.DrvPath, "--no-out-link", "--no-substitute")
+	if output, err := buildDepsCmd.CombinedOutput(); err != nil {
+		// If this stage fails, it could be a dependency build failure OR
+		// a hash mismatch in the target FOD if Nix got that far.
+		// We must check the output to distinguish them.
+		errStr := string(output)
+		if strings.Contains(errStr, "hash mismatch") {
+			fod.RebuildStatus = "verification_failure"
+			fod.ErrorMessage = fmt.Sprintf("Verification failed during build: %v\nOutput: %s", err, errStr)
 			fod.HashMismatch = true
 			ctx.hashMismatchFound.Store("found", true)
 
-			// Simple regex to find "got: sha256-..." pattern
-			re := regexp.MustCompile(`got:\s*([a-zA-Z0-9-]+)`)
-			if matches := re.FindStringSubmatch(string(output)); len(matches) > 1 {
+			re := regexp.MustCompile(`got:\s*([a-zA-Z0-9-/+=]+)`) // Expanded regex for base64 SRI hashes
+			if matches := re.FindStringSubmatch(errStr); len(matches) > 1 {
 				fod.ActualHash = matches[1]
 			}
+		} else {
+			fod.RebuildStatus = "dependency_failure"
+			fod.ErrorMessage = fmt.Sprintf("Failed to build dependencies from source: %v\nOutput: %s", err, errStr)
 		}
 		return
 	}
 
-	// Build succeeded - hash was verified by Nix
+	// --- Stage 2: Re-run with --check to verify the FOD hash specifically ---
+	// At this point, all dependencies AND the FOD itself have been successfully built
+	// and are in the local store. The first build already verified the hash implicitly.
+	// Running with --check again is a redundant but definitive confirmation.
+	// It's extremely fast because everything is already built.
+	log.Printf("Stage 2: Running final verification check for %s", fod.DrvPath)
+	checkCmd := exec.CommandContext(ctx.ctx, "nix-build", fod.DrvPath, "--no-out-link", "--no-substitute", "--check")
+	if output, err := checkCmd.CombinedOutput(); err != nil {
+		// A failure here is rare but would definitively be a verification issue.
+		fod.RebuildStatus = "verification_failure"
+		fod.ErrorMessage = fmt.Sprintf("Post-build verification check failed: %v\nOutput: %s", err, string(output))
+		if strings.Contains(string(output), "hash mismatch") {
+			fod.HashMismatch = true
+			ctx.hashMismatchFound.Store("found", true)
+		}
+		return
+	}
+
+	// If we reach here, the entire process was successful.
 	fod.RebuildStatus = "success"
 	fod.HashMismatch = false
-
-	log.Printf("FOD rebuild successful: %s", fod.DrvPath)
+	log.Printf("FOD and its dependencies successfully built from source and verified: %s", fod.DrvPath)
 }
 
 // normalizeToSRI converts a hash to SRI format if it isn't already
