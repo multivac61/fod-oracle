@@ -71,25 +71,17 @@ FLAGS
 
 
 
-## Examples
-
-```console
-$ fod-oracle 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'
-{"drv_path":"/nix/store/z7rvbcngls4p928an3ajiawypmhd9rw1-bash52-028.drv","output_path":"/nix/store/m2vybc6frn326f6yxlhpkbvi7grjzna2-bash52-028","hash_algorithm":"sha256","hash":"sha256-YEJ4C6KJPayko/D5tlcoWSzXu21M6+BzhVpqrU1jqsE="}
-{"drv_path":"/nix/store/jxaa5p13rvgwbxm14yqmfxnj3rfj322f-bash52-037.drv","output_path":"/nix/store/yp6bfms6q369y93j622mqq6i6b02xwbq-bash52-037","hash_algorithm":"sha256","hash":"sha256-iiwcO1El2a5bR4gvfS3flkiAX4xnwTql6n7+rEdc2pQ="}
-{"drv_path":"/nix/store/bsf32582y9rl8wy0dmi6h1lfd0f3qklh-lzip-1.25.tar.gz.drv","output_path":"/nix/store/8jaj1xfcj1i3sl6m8zh2wn8k0rzxq9nh-lzip-1.25.tar.gz","hash_algorithm":"sha256","hash":"sha256-CUGKbY+4P1ET9b2FbglwPfXTe64DCMZo0PNG49PwpW8="}
-{"drv_path":"/nix/store/v6b5sjrlhljhrvk4dy9f786riml2nn8k-hello-2.12.2.tar.gz.drv","output_path":"/nix/store/dw402azxjrgrzrk6j0p66wkqrab5mwgw-hello-2.12.2.tar.gz","hash_algorithm":"sha256","hash":"sha256-WpqZbcKSzCTc9BHO6H6S9qrluNE72caBm0x6nc4IGKs="}
-...
-```
-
+## Example
 
 ```console
 $ fod-oracle 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello' --rebuild
-{"drv_path":"/nix/store/2k5fih5nlvvwafb9qivnvxfiv1170ihb-source.drv","output_path":"/nix/store/vyxhyk3i20rzdq4clbzpl31kxs8yprmm-source","hash_algorithm":"r:sha256","hash":"sha256-7Niq+Xxq/r86qOeJl6/gNdH1XKm6m0fPhbPmgazZFkU=","rebuild_status":"success","actual_hash":"sha256-7Niq+Xxq/r86qOeJl6/gNdH1XKm6m0fPhbPmgazZFkU="}
-{"drv_path":"/nix/store/h46szk9s9lmwygw3bkif0dwr51xbycjx-source.drv","output_path":"/nix/store/j27ci7p95zf84mb5sqyjjmcpd1sfazkp-source","hash_algorithm":"r:sha256","hash":"sha256-bfFmDfRBSvoWMdQYVstsJRbcq+15lDjVFqk+0XYWpy8=","rebuild_status":"success","actual_hash":"sha256-bfFmDfRBSvoWMdQYVstsJRbcq+15lDjVFqk+0XYWpy8="}
-{"drv_path":"/nix/store/qrhjpcmqb46fzcfjfdbmjbibv787ysmh-xnu-src.drv","output_path":"/nix/store/ryh5cxpq72p3b8jjg16s10cw0nl5k8dv-xnu-src","hash_algorithm":"r:sha256","hash":"sha256-uHmAOm6k9ZXWfyqHiDSpm+tZqUbERlr6rXSJ4xNACkM=","rebuild_status":"success","actual_hash":"sha256-uHmAOm6k9ZXWfyqHiDSpm+tZqUbERlr6rXSJ4xNACkM="}
-{"drv_path":"/nix/store/36mp6b0ybqy6z3jhk36lnd8gpkdsw9vl-macOS-SDK-11.3.drv","output_path":"/nix/store/iak05hjjbnrzfdavj463scmf9cndidlf-macOS-SDK-11.3","hash_algorithm":"r:sha256","hash":"sha256-/go8utcx3jprf6c8V/DUbXwsmNYSFchOAai1OaJs3Bg=","rebuild_status":"success","actual_hash":"sha256-/go8utcx3jprf6c8V/DUbXwsmNYSFchOAai1OaJs3Bg="}
-{"drv_path":"/nix/store/2srmqir9grsxxcjfknxxxlf1y1ysmv9v-macOS-SDK-14.4.drv","output_path":"/nix/store/c3xfmn0gi4zss7yzgh2k969xcjjyv5p0-macOS-SDK-14.4","hash_algorithm":"r:sha256","hash":"sha256-QozDiwY0Czc0g45vPD7G4v4Ra+3DujCJbSads3fJjjM=","rebuild_status":"success","actual_hash":"sha256-QozDiwY0Czc0g45vPD7G4v4Ra+3DujCJbSads3fJjjM="}
+{"drv_path":"/nix/store/cxh8cwlp0z4a7xl6bk7zsqr7ci1hzdq6-make-4.4.1.tar.gz.drv","output_path":"/nix/store/0avnvyc7pkcr4pjqws7hwpy87m6wlnjc-make-4.4.1.tar.gz","hash_algorithm":"sha256","hash":"sha256-3Rb7HWe/q3mnL16DkHNcSePo5wtJRaFasfgd23hlj7M="}
+{"drv_path":"/nix/store/rslimz8ksg82kp85hfmjrinhpi3s8mzn-bash52-032.drv","output_path":"/nix/store/mr1mf5qdyw8v3rxy0w0pca94h5cmmvgr-bash52-032","hash_algorithm":"sha256","hash":"sha256-e5x32uypP/cReB11NyNBZug+2YNc4e59zVdCMZw3KhY="}
+{"drv_path":"/nix/store/z2rvjzfm2crd6hs6qfdwwq4bhk27zw9r-perl-5.40.0.tar.gz.drv","output_path":"/nix/store/4b4l8a41cvmz9z871gkc4jjpifxs8n8n-perl-5.40.0.tar.gz","hash_algorithm":"sha256","hash":"sha256-x0A0jzVzljJ6l5XT6DI7r9D+ilx4NfwcuroMyN/nFh8="}
+{"drv_path":"/nix/store/lrxrk69f3d3rpxf43sfibv3cfwwlc2ra-bash52-026.drv","output_path":"/nix/store/yzd1kmz6qlk3dxa82lwfbgqqxy2c4m1x-bash52-026","hash_algorithm":"sha256","hash":"sha256-lu4fVJqgtTBSHja9wLp2YWAs+u5An3AjysdE3UKFLqw="}
+{"drv_path":"/nix/store/ag9cnvb4pcgcj0rbkzva6qdz54fnr8fg-bash52-012.drv","output_path":"/nix/store/x1sqwqn02c5mnpi8hbqlxpbm3rahq5dm-bash52-012","hash_algorithm":"sha256","hash":"sha256-L7EHzh+46T82mXyLCydD/BypikVMfMWj/KvsUz9n1Cw="}
+{"drv_path":"/nix/store/mag3pq29n9f6jw0rb17crny8ilm4kfjy-diffutils-3.12.tar.xz.drv","output_path":"/nix/store/h8xhahhcdawxq5xg0niqi044l7fyvppq-diffutils-3.12.tar.xz","hash_algorithm":"sha256","hash":"sha256-fIt/n8hgkUH96pzs6FJJ0whiQ5H/Yd7a9Sj8szdyff0="}
+...
 ...
 ```
 
