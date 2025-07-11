@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"runtime"
 	"strings"
@@ -42,6 +43,7 @@ type FOD struct {
 
 // ProcessingContext holds the context for processing derivations
 type ProcessingContext struct {
+	ctx                context.Context // Context for cancellation
 	visited            *sync.Map
 	processedPaths     *sync.Map
 	output             chan FOD
@@ -129,9 +131,8 @@ func rebuildFOD(fod *FOD, ctx *ProcessingContext) {
 	log.Printf("Rebuilding FOD: %s", fod.DrvPath)
 
 	// Use nix-build to rebuild the derivation from source (no cache)
-	cmd := exec.Command("nix-build", fod.DrvPath, "--no-out-link", "--no-substitute")
+	cmd := exec.CommandContext(ctx.ctx, "nix-build", fod.DrvPath, "--no-out-link", "--no-substitute")
 	output, err := cmd.CombinedOutput()
-
 	if err != nil {
 		fod.RebuildStatus = "failure"
 		fod.ErrorMessage = fmt.Sprintf("Build failed: %v\nOutput: %s", err, string(output))
@@ -165,10 +166,7 @@ func normalizeToSRI(hash, hashAlgorithm string) string {
 	}
 
 	// Extract the algorithm
-	algo := hashAlgorithm
-	if strings.HasPrefix(algo, "r:") {
-		algo = strings.TrimPrefix(algo, "r:")
-	}
+	algo := strings.TrimPrefix(hashAlgorithm, "r:")
 
 	// Convert nix hash to SRI format using nix command
 	cmd := exec.Command("nix", "hash", "to-sri", "--type", algo, hash)
@@ -181,8 +179,9 @@ func normalizeToSRI(hash, hashAlgorithm string) string {
 }
 
 // initializeProcessing creates and returns a new ProcessingContext
-func initializeProcessing(rebuild, failOnHashMismatch bool) *ProcessingContext {
+func initializeProcessing(ctx context.Context, rebuild, failOnHashMismatch bool) *ProcessingContext {
 	return &ProcessingContext{
+		ctx:                ctx,
 		visited:            &sync.Map{},
 		processedPaths:     &sync.Map{},
 		output:             make(chan FOD, OutputChannelBuffer),
@@ -220,7 +219,7 @@ func startRebuildWorkers(ctx *ProcessingContext, maxParallel int) chan struct{} 
 
 		// Create worker pool
 		workerWg := &sync.WaitGroup{}
-		for i := 0; i < maxParallel; i++ {
+		for range maxParallel {
 			workerWg.Add(1)
 			go func() {
 				defer workerWg.Done()
@@ -238,13 +237,13 @@ func startRebuildWorkers(ctx *ProcessingContext, maxParallel int) chan struct{} 
 	return rebuildDone
 }
 
-func evaluateNixExpression(expr string, isFlake bool) (map[string]string, error) {
+func evaluateNixExpression(ctx context.Context, expr string, isFlake bool) (map[string]string, error) {
 	// Use nix-eval-jobs under the hood
 	var cmd *exec.Cmd
 	if isFlake {
-		cmd = exec.Command("nix-eval-jobs", "--flake", expr)
+		cmd = exec.CommandContext(ctx, "nix-eval-jobs", "--flake", expr)
 	} else {
-		cmd = exec.Command("nix-eval-jobs", "--expr", expr)
+		cmd = exec.CommandContext(ctx, "nix-eval-jobs", "--expr", expr)
 	}
 
 	stdout, err := cmd.StdoutPipe()
@@ -292,6 +291,9 @@ func evaluateNixExpression(expr string, isFlake bool) (map[string]string, error)
 }
 
 func runFODOracle(cmd *cobra.Command, args []string) error {
+	// Set up context with signal handling for graceful shutdown
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
+	defer stop()
 	debug, _ := cmd.Flags().GetBool("debug")
 	isFlake, _ := cmd.Flags().GetBool("flake")
 	isExpr, _ := cmd.Flags().GetBool("expr")
@@ -334,7 +336,7 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 	log.Printf("Evaluating expression: %s (flake: %v, rebuild: %v)", expr, isFlake, rebuild)
 
 	// Evaluate the Nix expression to get derivation paths
-	drvPaths, err := evaluateNixExpression(expr, isFlake)
+	drvPaths, err := evaluateNixExpression(ctx, expr, isFlake)
 	if err != nil {
 		return fmt.Errorf("error evaluating expression: %v", err)
 	}
@@ -342,11 +344,11 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 	log.Printf("Processing %d derivation paths", len(drvPaths))
 
 	// Initialize processing context
-	ctx := initializeProcessing(rebuild, failOnHashMismatch)
+	pCtx := initializeProcessing(ctx, rebuild, failOnHashMismatch)
 
 	// Start workers
-	done := startOutputWriter(ctx)
-	rebuildDone := startRebuildWorkers(ctx, maxParallel)
+	done := startOutputWriter(pCtx)
+	rebuildDone := startRebuildWorkers(pCtx, maxParallel)
 
 	// Process all derivation paths in parallel
 	for name, drvPath := range drvPaths {
@@ -355,29 +357,29 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		if _, loaded := ctx.visited.LoadOrStore(drvPath, true); !loaded {
-			ctx.wg.Add(1)
-			go processDerivation(drvPath, name, ctx)
+		if _, loaded := pCtx.visited.LoadOrStore(drvPath, true); !loaded {
+			pCtx.wg.Add(1)
+			go processDerivation(drvPath, name, pCtx)
 		}
 	}
 
 	// Wait for all processing to complete
-	ctx.wg.Wait()
+	pCtx.wg.Wait()
 
 	// Close rebuild queue and wait for workers to finish
 	if rebuild {
-		close(ctx.rebuildQueue)
+		close(pCtx.rebuildQueue)
 		<-rebuildDone
 	}
 
-	close(ctx.output)
+	close(pCtx.output)
 	<-done
 
 	log.Printf("Processing complete")
 
 	// Check if we should fail on hash mismatches
 	if failOnHashMismatch {
-		if _, found := ctx.hashMismatchFound.Load("found"); found {
+		if _, found := pCtx.hashMismatchFound.Load("found"); found {
 			return fmt.Errorf("hash mismatch detected - exiting with error as requested")
 		}
 	}
