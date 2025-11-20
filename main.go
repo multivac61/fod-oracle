@@ -325,14 +325,45 @@ func startRebuildWorkers(ctx *ProcessingContext, maxParallel int) chan struct{} 
 	return rebuildDone
 }
 
-func evaluateNixExpression(ctx context.Context, expr string, isFlake bool) (map[string]string, error) {
+func evaluateNixExpression(ctx context.Context, expr string, isFlake bool, impure bool, overrideInputs []string) (map[string]string, error) {
 	// Use nix-eval-jobs under the hood
-	var cmd *exec.Cmd
+	var args []string
 	if isFlake {
-		cmd = exec.CommandContext(ctx, "nix-eval-jobs", "--flake", expr)
+		args = append(args, "--flake", expr)
 	} else {
-		cmd = exec.CommandContext(ctx, "nix-eval-jobs", "--expr", expr)
+		args = append(args, "--expr", expr)
 	}
+
+	// Add impure flag if requested
+	if impure {
+		args = append(args, "--impure")
+	}
+
+	// Add override-input flags
+	// Each override should be in the format "input-name=flake-url" or "input-name flake-url"
+	for _, override := range overrideInputs {
+		var inputName, flakeURL string
+
+		// Try splitting by = first
+		if strings.Contains(override, "=") {
+			parts := strings.SplitN(override, "=", 2)
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				return nil, fmt.Errorf("invalid --override-input format: %q (expected 'input-name=flake-url' or 'input-name flake-url')", override)
+			}
+			inputName, flakeURL = parts[0], parts[1]
+		} else {
+			// Fall back to splitting by whitespace
+			parts := strings.Fields(override)
+			if len(parts) != 2 {
+				return nil, fmt.Errorf("invalid --override-input format: %q (expected 'input-name=flake-url' or 'input-name flake-url')", override)
+			}
+			inputName, flakeURL = parts[0], parts[1]
+		}
+
+		args = append(args, "--override-input", inputName, flakeURL)
+	}
+
+	cmd := exec.CommandContext(ctx, "nix-eval-jobs", args...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -392,7 +423,9 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 	isExpr, _ := cmd.Flags().GetBool("expr")
 	rebuild, _ := cmd.Flags().GetBool("rebuild")
 	strictRebuild, _ := cmd.Flags().GetBool("strict-rebuild")
+	impure, _ := cmd.Flags().GetBool("impure")
 	maxParallel, _ := cmd.Flags().GetInt("max-parallel")
+	overrideInputs, _ := cmd.Flags().GetStringArray("override-input")
 
 	// Set default max-parallel to CPU count if not specified
 	if maxParallel == DefaultMaxParallel {
@@ -426,12 +459,19 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	log.Printf("Evaluating expression: %s (flake: %v, rebuild: %v)", expr, isFlake, rebuild)
+	log.Printf("Evaluating expression: %s (flake: %v, rebuild: %v, impure: %v)", expr, isFlake, rebuild, impure)
 
 	// Evaluate the Nix expression to get derivation paths
-	drvPaths, err := evaluateNixExpression(ctx, expr, isFlake)
+	drvPaths, err := evaluateNixExpression(ctx, expr, isFlake, impure, overrideInputs)
 	if err != nil {
 		return fmt.Errorf("error evaluating expression: %v", err)
+	}
+
+	if len(drvPaths) == 0 {
+		if !impure {
+			return fmt.Errorf("no derivation paths found - this might be due to unfree packages (try --impure with NIXPKGS_ALLOW_UNFREE=1) or the expression evaluating to an empty set")
+		}
+		return fmt.Errorf("no derivation paths found - the expression might be evaluating to an empty set")
 	}
 
 	log.Printf("Processing %d derivation paths", len(drvPaths))
@@ -487,7 +527,38 @@ func runFODOracle(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// preprocessArgs handles --override-input flags that take TWO arguments
+// and combines them into a single arg with = separator for cobra to parse
+func preprocessArgs(args []string) []string {
+	var processed []string
+	i := 0
+	for i < len(args) {
+		if args[i] == "--override-input" && i+2 < len(args) {
+			// Consume the next two args and combine them
+			inputName := args[i+1]
+			flakeURL := args[i+2]
+
+			// If inputName already contains =, it's already in the right format
+			if strings.Contains(inputName, "=") {
+				processed = append(processed, args[i], inputName)
+				i += 2
+			} else {
+				// Combine into input-name=flake-url format
+				processed = append(processed, args[i], inputName+"="+flakeURL)
+				i += 3
+			}
+		} else {
+			processed = append(processed, args[i])
+			i++
+		}
+	}
+	return processed
+}
+
 func main() {
+	// Preprocess args to handle --override-input with two values
+	os.Args = preprocessArgs(os.Args)
+
 	rootCmd := &cobra.Command{
 		Use:   "fod-oracle [flags] <expression>",
 		Short: "Find Fixed Output Derivations in Nix expressions",
@@ -508,7 +579,15 @@ patches, and other fixed content that needs to be downloaded from external sourc
   fod-oracle --expr 'import <nixpkgs> {}.hello'
 
   # Enable debug output
-  fod-oracle --debug 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'`,
+  fod-oracle --debug 'github:NixOS/nixpkgs#legacyPackages.x86_64-linux.hello'
+
+  # Evaluate unfree packages (requires --impure)
+  NIXPKGS_ALLOW_UNFREE=1 fod-oracle --impure 'github:NixOS/nixpkgs#legacyPackages.aarch64-darwin.spotify'
+
+  # Override flake inputs (useful for testing PRs with unfree packages)
+  NIXPKGS_ALLOW_UNFREE=1 fod-oracle --impure \
+    'github:numtide/nixpkgs-unfree#legacyPackages.aarch64-darwin.spotify' \
+    --override-input nixpkgs github:NixOS/nixpkgs/pull/443564/head`,
 		Args: cobra.ExactArgs(1),
 		RunE: runFODOracle,
 	}
@@ -516,9 +595,11 @@ patches, and other fixed content that needs to be downloaded from external sourc
 	rootCmd.Flags().Bool("debug", false, "Enable debug output to stderr")
 	rootCmd.Flags().Bool("flake", false, "Evaluate a flake expression")
 	rootCmd.Flags().Bool("expr", false, "Treat the argument as a Nix expression")
+	rootCmd.Flags().Bool("impure", false, "Allow impure evaluation (required for NIXPKGS_ALLOW_UNFREE and other environment variables)")
 	rootCmd.Flags().Bool("rebuild", false, "Rebuild FODs to verify their hashes")
 	rootCmd.Flags().Bool("strict-rebuild", false, "Exit with error code if any rebuild fails for any reason (requires --rebuild)")
 	rootCmd.Flags().Int("max-parallel", DefaultMaxParallel, "Maximum number of parallel rebuilds (default: CPU count)")
+	rootCmd.Flags().StringArray("override-input", []string{}, "Override flake inputs (format: 'input-name flake-url' or 'input-name=flake-url', can be specified multiple times)")
 
 	// Execute with fang for fancy output
 	if err := fang.Execute(context.Background(), rootCmd); err != nil {
